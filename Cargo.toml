@@ -14,6 +14,8 @@ gpui-kit = "0.7"
 tray-icon = "0.26"
 async-channel = "2"
 rust-embed = "8.7"
+# 和 gpui 用同一个版本，不多编译一份；只用来把图标渲染成菜单栏图标。
+resvg = { version = "0.46", default-features = false }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", features = ["NSScreen", "NSView", "NSWindow", "NSResponder"] }
 objc2-foundation = { version = "0.3", features = ["NSGeometry"] }

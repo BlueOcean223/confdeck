@@ -127,20 +127,45 @@ fn screen_scale() -> f64 {
     1.0
 }
 
-/// 18pt 菜单栏图标（36px，供 Retina 使用），三张叠起来的卡片。
-/// 在 macOS 上作为 template 图标只用 alpha 通道，系统按菜单栏的深浅色自动着色。
+/// 菜单栏图标：把应用图标 `confdeck.svg` 渲染成 36px（18pt，供 Retina 使用）。
+/// 和窗口里的图标用同一个文件。在 macOS 上作为 template 图标只用 alpha 通道，
+/// 系统按菜单栏的深浅色自动着色。
 fn icon() -> Icon {
     const SIZE: u32 = 36;
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let mut fill = |x0: u32, y0: u32, x1: u32, y1: u32| {
-        for y in y0..y1 {
-            for x in x0..x1 {
-                rgba[((y * SIZE + x) * 4 + 3) as usize] = 255;
-            }
+    Icon::from_rgba(render_logo(SIZE), SIZE, SIZE).expect("icon size matches buffer")
+}
+
+/// 渲染成 `size`×`size` 的 RGBA（预乘 alpha；图标是纯黑的，预乘与否结果一样）。
+fn render_logo(size: u32) -> Vec<u8> {
+    use resvg::{tiny_skia, usvg};
+
+    let svg = crate::assets::Assets
+        .load("icons/confdeck.svg")
+        .ok()
+        .flatten()
+        .expect("confdeck.svg is embedded");
+    let tree = usvg::Tree::from_data(&svg, &usvg::Options::default()).expect("confdeck.svg parses");
+    let mut pixmap = tiny_skia::Pixmap::new(size, size).expect("size is not zero");
+    let scale = size as f32 / tree.size().width();
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    pixmap.take()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_logo;
+
+    #[test]
+    fn logo_renders_pixel_exact() {
+        // 18×18 的点阵渲染成 36px，每格正好 2×2 个像素，不该有半透明的边。
+        let rgba = render_logo(36);
+        let alpha: Vec<u8> = rgba.chunks(4).map(|px| px[3]).collect();
+        assert!(alpha.iter().all(|&a| a == 0 || a == 255), "found anti-aliased pixels");
+        // confdeck.svg 的注释里写着 121 格。
+        assert_eq!(alpha.iter().filter(|&&a| a == 255).count(), 121 * 4);
+        // 镂空：贴纸中间、防滑纹的缝、金手指之间的缝。
+        for (cx, cy) in [(6, 6), (5, 2), (7, 15)] {
+            assert_eq!(alpha[cy * 2 * 36 + cx * 2], 0, "cell ({cx}, {cy}) should be cut out");
         }
-    };
-    fill(11, 6, 25, 9);
-    fill(8, 11, 28, 14);
-    fill(5, 16, 31, 30);
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("icon size matches buffer")
+    }
 }
