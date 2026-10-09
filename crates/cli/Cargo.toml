@@ -1,0 +1,13 @@
+[package]
+name = "confdeck-cli"
+description = "confdeck 命令行"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "confdeck"
+path = "src/main.rs"
+
+[dependencies]
+confdeck-core.workspace = true

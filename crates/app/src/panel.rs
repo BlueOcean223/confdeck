@@ -1,0 +1,359 @@
+//! 菜单栏面板：左键点托盘图标时，在图标正下方弹出（照 magpie 的 quick panel）。
+//! 毛玻璃底、圆角；失去焦点或按 Esc 就关掉。
+
+use std::time::{Duration, Instant};
+
+use gpui_kit::component::*;
+use gpui_kit::*;
+
+use crate::data::Store;
+use crate::main_window;
+use crate::picker::{Picker, PickerEvent};
+use crate::theme::Theme;
+use crate::ui;
+
+actions!(panel, [Dismiss]);
+
+pub const WIDTH: f32 = 440.;
+
+/// 面板离托盘图标的距离（magpie 的 `WindowOffset(6)`）。
+const OFFSET: f32 = 6.;
+const PADDING: f32 = 12.;
+const GAP: f32 = 10.;
+const HEADER: f32 = 30.;
+const ROW: f32 = 40.;
+const LINKS: f32 = 20.;
+
+#[derive(Default)]
+struct PanelState {
+    handle: Option<WindowHandle<Panel>>,
+    closed_at: Option<Instant>,
+}
+
+impl Global for PanelState {}
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("escape", Dismiss, Some("Panel"))]);
+}
+
+/// 面板开着时返回它。
+#[cfg(debug_assertions)]
+pub fn handle(cx: &App) -> Option<AnyWindowHandle> {
+    cx.try_global::<PanelState>()
+        .and_then(|state| state.handle)
+        .map(Into::into)
+}
+
+/// 面板开着就关掉，关着就在 `icon`（托盘图标在屏幕上的位置）下方打开。
+pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
+    let state = cx.default_global::<PanelState>();
+    let open = state.handle.take();
+    // 面板开着时点托盘图标，面板会先因失焦关掉，紧接着才收到这次点击；这次就不再打开。
+    let just_closed = state
+        .closed_at
+        .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
+
+    if let Some(handle) = open
+        && handle.update(cx, |_, window, _| window.remove_window()).is_ok()
+    {
+        return;
+    }
+    if just_closed {
+        return;
+    }
+
+    let height = base_height(store.read(cx));
+    let origin = point(icon.center().x - px(WIDTH / 2.), icon.bottom() + px(OFFSET));
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            origin,
+            size(px(WIDTH), px(height)),
+        ))),
+        titlebar: None,
+        kind: WindowKind::PopUp,
+        focus: true,
+        show: true,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        window_background: WindowBackgroundAppearance::Blurred,
+        ..Default::default()
+    };
+    // 和 Wails 一样先激活应用再显示面板。不激活的话，应用在后台、主窗口又开着时，
+    // gpui 为绕开 Cocoa 的一个问题会立刻收走面板刚拿到的焦点，接着 AppKit 抛异常崩溃。
+    cx.activate(true);
+    match cx.open_window(options, |window, cx| cx.new(|cx| Panel::new(store, window, cx))) {
+        Ok(handle) => cx.global_mut::<PanelState>().handle = Some(handle),
+        Err(err) => eprintln!("failed to open panel: {err:#}"),
+    }
+}
+
+fn shown_agents(store: &Store) -> Vec<usize> {
+    (0..store.agents.len())
+        .filter(|&i| store.agents[i].installed && store.agents[i].managed)
+        .collect()
+}
+
+/// 不开选择器时的面板高度：顶栏、每个 agent 一行、底部一行链接。
+fn base_height(store: &Store) -> f32 {
+    let rows = shown_agents(store).len() as f32;
+    PADDING * 2. + HEADER + GAP + rows * ROW + GAP + LINKS
+}
+
+/// 第 `n` 行底边到窗口顶部的距离。
+fn row_bottom(n: usize) -> f32 {
+    PADDING + HEADER + GAP + (n as f32 + 1.) * ROW
+}
+
+struct OpenPicker {
+    agent: usize,
+    row: usize,
+    picker: Entity<Picker>,
+    _subscriptions: Vec<Subscription>,
+}
+
+pub struct Panel {
+    store: Entity<Store>,
+    focus_handle: FocusHandle,
+    picker: Option<OpenPicker>,
+    just_closed: Option<usize>,
+    /// 窗口现在的高度，没变就不去改原生窗口。
+    height: f32,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl Panel {
+    fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
+        #[cfg(target_os = "macos")]
+        {
+            crate::mac::round_corners(window, 12.);
+            // 第一帧画完后形状才确定，再按圆角重算一次阴影。
+            window.on_next_frame(|window, _| crate::mac::round_corners(window, 12.));
+        }
+        let height = base_height(store.read(cx));
+        let _subscriptions = vec![
+            cx.observe_in(&store, window, |this, _, window, cx| {
+                this.fit_height(window, cx);
+                cx.notify();
+            }),
+            cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
+            cx.observe_window_activation(window, |_, window, cx| {
+                if !window.is_window_active() {
+                    close(window, cx);
+                }
+            }),
+        ];
+        Self {
+            store,
+            focus_handle,
+            picker: None,
+            just_closed: None,
+            height,
+            _subscriptions,
+        }
+    }
+
+    /// 窗口高度跟着内容走：平时刚好装下列表；开着选择器时往下长，刚好装下选择器。
+    fn fit_height(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let base = base_height(self.store.read(cx));
+        let height = match &self.picker {
+            Some(open) => {
+                let picker = open.picker.read(cx).height(cx);
+                base.max(row_bottom(open.row) + 4. + picker + PADDING)
+            }
+            None => base,
+        };
+        if height != self.height {
+            self.height = height;
+            #[cfg(target_os = "macos")]
+            crate::mac::set_height_keep_top(window, height as f64, cx);
+        }
+    }
+
+    fn open_picker(&mut self, agent: usize, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let picker = cx.new(|cx| Picker::new(store, agent, true, window, cx));
+        let _subscriptions = vec![
+            cx.subscribe_in(
+                &picker,
+                window,
+                move |this, _, event: &PickerEvent, window, cx| {
+                    if let PickerEvent::Picked(option) = event {
+                        let option = *option;
+                        this.store.update(cx, |s, cx| s.set_provider(agent, option, cx));
+                    }
+                    this.close_picker(window, cx);
+                },
+            ),
+            // 过滤后选项变少，窗口跟着缩短。
+            cx.observe_in(&picker, window, |this, _, window, cx| this.fit_height(window, cx)),
+        ];
+        self.picker = Some(OpenPicker {
+            agent,
+            row,
+            picker,
+            _subscriptions,
+        });
+        self.fit_height(window, cx);
+        cx.notify();
+    }
+
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.fit_height(window, cx);
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn header(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.clone();
+        div()
+            .h_flex()
+            .items_center()
+            .h(px(HEADER))
+            .pl(px(4.))
+            .gap(px(2.))
+            .child(ui::icon("confdeck", 18., t.fg).mr(px(6.)))
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("confdeck"),
+            )
+            .child(div().flex_1())
+            .child(ui::icon_button("refresh", t, "rotate-cw"))
+            .child(
+                ui::icon_button("open-main", t, "square-arrow-out-up-right").on_click(
+                    cx.listener(move |_, _, window, cx| {
+                        close(window, cx);
+                        main_window::show(store.clone(), cx);
+                    }),
+                ),
+            )
+            .child(ui::icon_button("settings", t, "settings"))
+    }
+
+    fn agent_row(&self, i: usize, n: usize, store: &Store, t: &Theme, cx: &Context<Self>) -> Div {
+        let agent = &store.agents[i];
+        let open = self.picker.as_ref().is_some_and(|p| p.agent == i);
+        let (logo, label) = store.provider_label(i);
+
+        ui::row(t, true, n == 0)
+            .child(ui::logo(agent.logo, 18., t))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .font_weight(FontWeight::MEDIUM)
+                    .truncate()
+                    .child(agent.name),
+            )
+            // 宽度随内容，靠右对齐；名字太长时截断（magpie 面板里的下拉框也是这样）。
+            .child(
+                div().flex_none().max_w(px(230.)).child(
+                    ui::select_pill(ElementId::named_usize("pick", i), t, true, logo, label, open)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if this.just_closed == Some(i) {
+                                return;
+                            }
+                            if this.picker.as_ref().is_some_and(|p| p.agent == i) {
+                                this.close_picker(window, cx);
+                            } else {
+                                this.open_picker(i, n, window, cx);
+                            }
+                        })),
+                ),
+            )
+    }
+}
+
+/// 关掉面板。不能在 AppKit 的窗口回调（比如失焦）里同步关窗口，会抛 NSRangeException
+/// 让整个应用崩溃，所以放到下一轮主线程任务里关。
+fn close(window: &mut Window, cx: &mut App) {
+    let state = cx.default_global::<PanelState>();
+    state.handle = None;
+    state.closed_at = Some(Instant::now());
+    let handle = window.window_handle();
+    cx.spawn(async move |cx| {
+        cx.update(|cx| handle.update(cx, |_, window, _| window.remove_window()).ok());
+    })
+    .detach();
+}
+
+impl Render for Panel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = Theme::panel(window.appearance());
+        let store = self.store.read(cx);
+        let shown = shown_agents(store);
+
+        let mut list = ui::list(&t, true);
+        for (n, &i) in shown.iter().enumerate() {
+            list = list.child(self.agent_row(i, n, store, &t, cx));
+        }
+        let open_store = self.store.clone();
+
+        // 选择器盖在列表上，从打开它的那一行下面展开，宽度和面板一样（左右各留 8）。
+        let picker = self.picker.as_ref().map(|open| {
+            deferred(
+                anchored()
+                    .position(point(px(8.), px(row_bottom(open.row) + 4.)))
+                    .child(
+                        div()
+                            .w(px(WIDTH - 16.))
+                            .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
+                                this.just_closed = this.picker.as_ref().map(|p| p.agent);
+                                this.close_picker(window, cx);
+                            }))
+                            .child(open.picker.clone()),
+                    ),
+            )
+            .with_priority(1)
+        });
+
+        div()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .key_context("Panel")
+            .on_action(cx.listener(|_, _: &Dismiss, window, cx| close(window, cx)))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.just_closed = None),
+            )
+            .rounded(px(12.))
+            // 半透明的底叠在毛玻璃上（magpie 是 93% 的 --bg）。
+            .bg(t.bg.opacity(0.93))
+            .text_color(t.fg)
+            .text_size(px(13.))
+            .child(
+                div()
+                    .v_flex()
+                    .gap(px(GAP))
+                    .p(px(PADDING))
+                    .child(self.header(&t, cx))
+                    .child(list)
+                    .child(
+                        div()
+                            .h_flex()
+                            .justify_end()
+                            .gap(px(16.))
+                            .pr(px(4.))
+                            .child(
+                                ui::text_button("open", &t)
+                                    .child("打开 confdeck")
+                                    .on_click(move |_, window, cx| {
+                                        close(window, cx);
+                                        main_window::show(open_store.clone(), cx);
+                                    }),
+                            )
+                            .child(
+                                ui::text_button("quit", &t)
+                                    .child("退出")
+                                    .on_click(|_, _, cx| cx.quit()),
+                            ),
+                    ),
+            )
+            .children(picker)
+    }
+}
