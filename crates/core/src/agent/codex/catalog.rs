@@ -5,7 +5,8 @@
 //! 跑 `codex debug models --bundled`，克隆一个普通 Responses 的内置模型（不是 code mode、不走 Responses Lite 的，
 //! 0.153.4 上是 gpt-5.5），把提示词里的「based on GPT-5」换成这家的模型名。工具设置用 Codex 对不认识的模型的那一套：
 //! 不声明 freeform `apply_patch`（第三方网关不一定支持这种工具），模型经 `exec_command` 调 `apply_patch` 照样能改文件。
-//! 找不到 `codex`、跑不成、挑不出模板时不写目录，和以前一样。核实过程见 notes/codex-catalog-prompt.md。
+//! 找不到 `codex`、跑不成、挑不出模板时不写目录，和以前一样，原因（[`Skipped`]）交给界面说一声。
+//! Codex 升级以后由 [`crate::apply::refresh_codex_catalog`] 重写。核实过程见 notes/codex-catalog-prompt.md。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -41,10 +42,24 @@ pub fn live_file(home: &Path) -> LiveFile {
     }
 }
 
-/// 生成这家供应商的目录文件内容；找不到 `codex`、跑不成、挑不出模板时为 `None`。
-pub fn generate(home: &Path, models: &[&Model]) -> Option<Vec<u8>> {
-    let codex = locate(home)?;
-    build(&bundled(&codex)?, models)
+/// 没写成目录的原因。界面要说一声：`/model` 列的还是 GPT 模型，这家的模型按 272K 窗口算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Skipped {
+    #[error("没找到 codex")]
+    NotFound,
+    /// 超时、退出码不是 0、输出不是 JSON。太旧的 Codex 没有这条命令。
+    #[error("codex debug models --bundled 没跑成")]
+    Failed,
+    /// Codex 改了内置模型的格式，或者不再有普通 Responses 的模型。
+    #[error("Codex 内置的模型里挑不出能照着写的")]
+    NoTemplate,
+}
+
+/// 生成这家供应商的目录文件内容。
+pub fn generate(home: &Path, models: &[&Model]) -> Result<Vec<u8>, Skipped> {
+    let codex = locate(home).ok_or(Skipped::NotFound)?;
+    let bundled = bundled(&codex).ok_or(Skipped::Failed)?;
+    build(&bundled, models).ok_or(Skipped::NoTemplate)
 }
 
 /// 用 `codex debug models --bundled` 的输出生成目录文件内容。挑不出模板时为 `None`。
@@ -218,6 +233,7 @@ fn locate(home: &Path) -> Option<PathBuf> {
 }
 
 /// 先找 `PATH`，再找常见的安装位置：从 Finder 启动的应用拿到的 `PATH` 只有系统目录。
+/// mise、asdf 的 shim 按当前目录选 Node 版本，在这里用的是全局的那个。
 fn search(home: &Path, path: Option<&std::ffi::OsStr>, system: &[&str]) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = path.map(env::split_paths).into_iter().flatten().collect();
     dirs.extend(
@@ -226,6 +242,9 @@ fn search(home: &Path, path: Option<&std::ffi::OsStr>, system: &[&str]) -> Optio
             ".npm-global/bin",
             ".bun/bin",
             ".volta/bin",
+            "Library/pnpm",
+            ".local/share/mise/shims",
+            ".asdf/shims",
             ".cargo/bin",
         ]
         .iter()
@@ -309,6 +328,11 @@ pub(crate) mod tests {
         fs::write(&script, format!("#!/bin/sh\ncat '{}'\n", data.display())).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         FAKE_CODEX.with(|fake| *fake.borrow_mut() = Some(script));
+    }
+
+    /// 这个测试线程里又找不到 `codex` 了。
+    pub(crate) fn no_codex() {
+        FAKE_CODEX.with(|fake| *fake.borrow_mut() = None);
     }
 
     /// 照 0.153.4 的内置目录缩出来的三个模型：code mode 的、普通的、更旧的。
@@ -443,6 +467,16 @@ pub(crate) mod tests {
     #[test]
     fn a_script_stands_in_for_codex() {
         let dir = tempfile::tempdir().unwrap();
+        assert_eq!(generate(dir.path(), &[&model("m")]), Err(Skipped::NotFound));
+
+        use_codex(dir.path(), &json!("not a catalog"));
+        assert_eq!(
+            generate(dir.path(), &[&model("m")]),
+            Err(Skipped::NoTemplate)
+        );
+        fs::write(dir.path().join("bundled.json"), "Usage: codex debug ...").unwrap();
+        assert_eq!(generate(dir.path(), &[&model("m")]), Err(Skipped::Failed));
+
         use_codex(dir.path(), &sample());
         let out = generate(dir.path(), &[&model("m")]).unwrap();
         assert_eq!(entries(&out)[0]["slug"], "m");

@@ -3,9 +3,11 @@
 //! 单选 agent 用 [`switch`]（`None` 是「默认」）；多选 agent 用 [`enable`] / [`disable`]，
 //! 勾一下写一次。改了供应商用 [`save_provider`]：存好以后把改动写进所有在用它的 agent；
 //! 删掉用 [`delete_provider`]，之前用 [`used_by`] 列出在用的 agent 请用户确认。
+//! 启动时调 [`refresh_codex_catalog`]：Codex 升级以后，模型目录里的提示词要跟着换。
 
 use std::path::{Path, PathBuf};
 
+use crate::agent::codex::catalog::Skipped;
 use crate::agent::{AdaptError, AgentKind, Mode, claude, codex, grok, opencode, pi};
 use crate::current::{self, Current};
 use crate::engine::{Engine, EngineError, LiveFile, Outcome};
@@ -45,16 +47,26 @@ pub fn live_files(home: &Path, agent: AgentKind) -> Vec<LiveFile> {
     }
 }
 
+/// [`switch`] 的结果。
+#[derive(Debug)]
+pub struct Switched {
+    /// agent 的配置文件写了没有。
+    pub outcome: Outcome,
+    /// Codex 切到第三方时的模型目录文件：写了，或者没写成的原因。没写成时界面要说一声：
+    /// `/model` 列的还是 GPT 模型，这家的模型按 272K 窗口算。别的 agent、Codex 切回默认时为 `None`。
+    pub catalog: Option<Result<Outcome, Skipped>>,
+}
+
 /// 单选 agent 换供应商；`None` 还原成 agent 自带的登录。写完记下选了哪家（只存在本机）。
 pub fn switch(
     engine: &Engine,
     home: &Path,
     agent: AgentKind,
     provider: Option<&Provider>,
-) -> Result<Outcome, ApplyError> {
-    let outcome = write_switch(engine, home, agent, provider)?;
+) -> Result<Switched, ApplyError> {
+    let switched = write_switch(engine, home, agent, provider)?;
     engine.set_selection(agent.id(), provider.map(|provider| provider.id.as_str()))?;
-    Ok(outcome)
+    Ok(switched)
 }
 
 fn write_switch(
@@ -62,34 +74,82 @@ fn write_switch(
     home: &Path,
     agent: AgentKind,
     provider: Option<&Provider>,
-) -> Result<Outcome, ApplyError> {
+) -> Result<Switched, ApplyError> {
+    let only = |outcome| Switched {
+        outcome,
+        catalog: None,
+    };
     match agent {
         AgentKind::ClaudeCode => {
             let patch = claude::patch(provider, &engine.owned(agent.id()))?;
             let outcome = engine.write(&claude::live_file(home), &patch)?;
             engine.set_owned(agent.id(), &claude::raw_entries(provider)?)?;
-            Ok(outcome)
+            Ok(only(outcome))
         }
         AgentKind::Codex => {
             let config = codex::live_file(home);
             let patch = codex::patch(provider, codex_login(home)?)?;
             let catalog = match provider {
-                Some(provider) => codex::catalog::generate(home, &codex::catalog_models(provider)?),
-                None => None,
+                Some(provider) => {
+                    codex::catalog::generate(home, &codex::catalog_models(provider)?).map(Some)
+                }
+                None => Ok(None),
             };
-            let Some(catalog) = catalog else {
-                return Ok(engine.write(&config, &patch)?);
+            let catalog = match catalog {
+                Ok(Some(catalog)) => catalog,
+                Ok(None) => return Ok(only(engine.write(&config, &patch)?)),
+                Err(skipped) => {
+                    return Ok(Switched {
+                        outcome: engine.write(&config, &patch)?,
+                        catalog: Some(Err(skipped)),
+                    });
+                }
             };
             // 先试着改 config.toml：改不了（解析不了、profile 盖过了路由）就什么都不写。
             // 再先写目录、后改指针：指针指着不存在的文件，Codex 起不来。
             let patch = patch.with_catalog();
             patch.apply(&config.path, engine.read(&config)?.bytes.as_deref())?;
-            engine.write(&codex::catalog::live_file(home), &patch::Whole(catalog))?;
-            Ok(engine.write(&config, &patch)?)
+            let written = engine.write(&codex::catalog::live_file(home), &patch::Whole(catalog))?;
+            Ok(Switched {
+                outcome: engine.write(&config, &patch)?,
+                catalog: Some(Ok(written)),
+            })
         }
-        AgentKind::GrokBuild => Ok(engine.write(&grok::live_file(home), &grok::patch(provider)?)?),
+        AgentKind::GrokBuild => Ok(only(
+            engine.write(&grok::live_file(home), &grok::patch(provider)?)?,
+        )),
         AgentKind::Pi | AgentKind::Opencode => Err(ApplyError::WrongMode { agent }),
     }
+}
+
+/// 照本机现在的 Codex 重写模型目录，启动时调一次。目录里的提示词是切换时从本机 Codex 取的，
+/// Codex 升级以后还是旧的；confdeck 升级也可能改了生成的内容。
+///
+/// `config.toml` 指着 confdeck 的目录、认得出是哪家（地址对得上就行，Key 不一致也算）才写。
+/// 生成的和文件里一样就不写，所以每次启动都跑一遍（约 50 毫秒），不用记 Codex 的版本。
+/// 返回 `None` 是不用写；`Some(Err(_))` 是这次没生成出来（比如 `codex` 卸了），旧目录留着照样能用。
+pub fn refresh_codex_catalog(
+    engine: &Engine,
+    home: &Path,
+    providers: &[Provider],
+) -> Result<Option<Result<Outcome, Skipped>>, ApplyError> {
+    let config = codex::live_file(home);
+    if !codex::uses_catalog(&config.path, engine.read(&config)?.bytes.as_deref()) {
+        return Ok(None);
+    }
+    let id = match current::current(engine, home, AgentKind::Codex, providers)? {
+        Current::Provider(id) | Current::KeyMismatch { provider: id } => id,
+        Current::Default | Current::Custom { .. } => return Ok(None),
+    };
+    let Some(provider) = providers.iter().find(|provider| provider.id == id) else {
+        return Ok(None);
+    };
+    let catalog = match codex::catalog::generate(home, &codex::catalog_models(provider)?) {
+        Ok(catalog) => catalog,
+        Err(skipped) => return Ok(Some(Err(skipped))),
+    };
+    let file = codex::catalog::live_file(home);
+    Ok(Some(Ok(engine.write(&file, &patch::Whole(catalog))?)))
 }
 
 /// 多选 agent 勾上一家供应商（已有就整项更新）。
@@ -354,7 +414,7 @@ fn write_changes(
     // Codex 的模型列表在目录文件里，先重写目录（找不到 `codex` 就留着旧的）。
     if agent == AgentKind::Codex
         && codex::uses_catalog(&file.path, engine.read(&file)?.bytes.as_deref())
-        && let Some(catalog) = codex::catalog::generate(home, &codex::catalog_models(after)?)
+        && let Ok(catalog) = codex::catalog::generate(home, &codex::catalog_models(after)?)
     {
         engine.write(&codex::catalog::live_file(home), &patch::Whole(catalog))?;
     }
@@ -420,13 +480,16 @@ mod tests {
             AgentKind::ClaudeCode,
             Some(&relay()),
         )
-        .unwrap();
+        .unwrap()
+        .outcome;
         assert_eq!(outcome.backup.unwrap().reason, Reason::Original);
         let value: Value = serde_json::from_str(&home.read(".claude/settings.json")).unwrap();
         assert_eq!(value["env"]["ANTHROPIC_BASE_URL"], "https://relay.example");
         assert_eq!(value["permissions"]["allow"][0], "Bash");
 
-        let outcome = switch(&home.engine, home.path(), AgentKind::ClaudeCode, None).unwrap();
+        let outcome = switch(&home.engine, home.path(), AgentKind::ClaudeCode, None)
+            .unwrap()
+            .outcome;
         assert!(outcome.changed && outcome.backup.is_none());
         let value: Value = serde_json::from_str(&home.read(".claude/settings.json")).unwrap();
         assert_eq!(
@@ -527,9 +590,11 @@ mod tests {
     #[test]
     fn codex_follows_the_login_on_disk() {
         let home = Home::new();
-        let outcome = switch(&home.engine, home.path(), AgentKind::Codex, Some(&relay())).unwrap();
+        let switched = switch(&home.engine, home.path(), AgentKind::Codex, Some(&relay())).unwrap();
+        // 测试里找不到 `codex`：不写目录，告诉界面为什么。
+        assert_eq!(switched.catalog, Some(Err(Skipped::NotFound)));
         assert!(
-            outcome.backup.is_none(),
+            switched.outcome.backup.is_none(),
             "a new file has nothing to back up"
         );
         assert!(
@@ -599,6 +664,56 @@ mod tests {
             !home
                 .read(".codex/config.toml")
                 .contains("model_catalog_json")
+        );
+    }
+
+    #[test]
+    fn the_codex_catalog_follows_the_installed_codex() {
+        use codex::catalog::tests::{no_codex, sample, use_codex};
+        let home = Home::new();
+        let providers = vec![relay()];
+        let refresh = || refresh_codex_catalog(&home.engine, home.path(), &providers).unwrap();
+        let prompt = |home: &Home| -> String {
+            let catalog: Value =
+                serde_json::from_str(&home.read(".codex/confdeck-models.json")).unwrap();
+            catalog["models"][0]["base_instructions"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // 没指着 confdeck 的目录：不用写。
+        assert_eq!(refresh(), None);
+
+        use_codex(home.path(), &sample());
+        switch(&home.engine, home.path(), AgentKind::Codex, Some(&relay())).unwrap();
+        assert!(matches!(
+            refresh(),
+            Some(Ok(Outcome { changed: false, .. }))
+        ));
+
+        // Codex 升级，内置的提示词变了：目录跟着重写。
+        let mut upgraded = sample();
+        upgraded["models"][1]["base_instructions"] =
+            "You are Codex, based on GPT-5. Plan first.".into();
+        use_codex(home.path(), &upgraded);
+        assert!(matches!(refresh(), Some(Ok(Outcome { changed: true, .. }))));
+        assert_eq!(
+            prompt(&home),
+            "You are Codex, based on glm-4.5-air. Plan first."
+        );
+
+        // 找不到 `codex` 了：旧目录留着。
+        no_codex();
+        assert_eq!(refresh(), Some(Err(Skipped::NotFound)));
+        assert_eq!(
+            prompt(&home),
+            "You are Codex, based on glm-4.5-air. Plan first."
+        );
+
+        // 认不出是哪家：不写。
+        assert_eq!(
+            refresh_codex_catalog(&home.engine, home.path(), &[]).unwrap(),
+            None
         );
     }
 
