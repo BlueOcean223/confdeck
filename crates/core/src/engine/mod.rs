@@ -30,7 +30,7 @@ use chrono::Local;
 use crate::backup::{self, Backup, Reason, Shelf};
 use crate::data::DataDir;
 use crate::fsx::{self, Digest, Mode};
-use crate::patch::{Format, KeyPath, LivePatch, PatchError};
+use crate::patch::{self, Format, KeyPath, LivePatch, PatchError};
 use state::{Owned, State};
 
 /// 第 6 步发现被外部改了以后最多重来几次。
@@ -236,13 +236,14 @@ impl Engine {
     }
 
     /// 整份替换（「原始文件」页保存）。`base` 是打开编辑器时读到的内容；文件在这之后被改过就报冲突，
-    /// 不覆盖。新内容的格式由调用方校验。
+    /// 不覆盖。新内容按文件的格式解析不了就报错（带行列），不写，见 [`patch::check`]。
     pub fn replace(
         &self,
         file: &LiveFile,
         bytes: &[u8],
         base: &Snapshot,
     ) -> Result<Outcome, EngineError> {
+        patch::check(file.format, &file.path, bytes)?;
         self.commit(file, Kind::Edit, &mut |_, current| {
             if current != base.digest.as_ref() {
                 return Err(EngineError::Conflict {
@@ -495,6 +496,19 @@ mod tests {
         // 文件是 confdeck 新建的，没有原件。
         assert_eq!(outcome.backup.unwrap().reason, Reason::BeforeEdit);
         assert_eq!(text(&s), "{\"edited\": true}\n");
+
+        // 解析不了的内容不写，也不备份。
+        let current = s.engine.read(&s.file).unwrap();
+        let err = s
+            .engine
+            .replace(&s.file, b"{\"edited\": true,}", &current)
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Patch(PatchError::Parse { line: 1, .. })),
+            "{err:?}"
+        );
+        assert_eq!(text(&s), "{\"edited\": true}\n");
+        assert_eq!(backups(&s).len(), 1);
 
         // 用旧的 base 再保存一次：文件已经变了，报冲突，不覆盖。
         let err = s.engine.replace(&s.file, b"{}", &base).unwrap_err();

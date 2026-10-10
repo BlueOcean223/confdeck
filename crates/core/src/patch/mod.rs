@@ -109,6 +109,9 @@ pub enum PatchError {
         key_path: KeyPath,
         expected: &'static str,
     },
+    /// 要整份写进去的 JSON 是空的。
+    #[error("{path} 的新内容是空的，JSON 文件至少要写 {{}}，没有写入")]
+    Empty { path: PathBuf },
     /// 文件里另有设置盖过了要写的值，写了也不生效，比如 Codex 生效的 profile 自己选了路由。
     #[error("{path} 里 {by} 改了 {key}，写进去也不生效，没有写入")]
     Overridden {
@@ -116,6 +119,23 @@ pub enum PatchError {
         by: String,
         key: String,
     },
+}
+
+/// 「原始文件」页保存前的格式校验：解析得了，JSON 的顶层是对象。JSON 文件不能是空的：
+/// confdeck 读的时候当成 `{}`，agent 不一定（`JSON.parse("")` 直接报错）。TOML 的空文件本来就合法。
+pub fn check(format: Format, path: &Path, bytes: &[u8]) -> Result<(), PatchError> {
+    match format {
+        Format::Json | Format::Json5 => {
+            let text = decode_utf8(path, bytes)?;
+            if text.trim_start_matches('\u{feff}').trim().is_empty() {
+                return Err(PatchError::Empty {
+                    path: path.to_path_buf(),
+                });
+            }
+            json::parse(path, Some(bytes), format == Format::Json5).map(drop)
+        }
+        Format::Toml => toml::parse(path, Some(bytes)).map(drop),
+    }
 }
 
 /// 整份写成这些字节：confdeck 自己的文件（Codex 的模型目录），不用保留别的内容。
@@ -162,6 +182,23 @@ mod tests {
         assert_eq!(line_column(text, 0), (1, 1));
         assert_eq!(line_column(text, 4), (2, 2));
         assert_eq!(line_column(text, text.len()), (3, 2));
+    }
+
+    #[test]
+    fn check_refuses_what_the_agent_could_not_read() {
+        let path = Path::new("x.json");
+        assert!(check(Format::Json, path, b"{\"a\": 1}\n").is_ok());
+        assert!(check(Format::Json5, path, b"{a: 1, // note\n}").is_ok());
+        assert!(check(Format::Toml, path, b"").is_ok());
+
+        let err = check(Format::Json, path, b"{\n  \"a\": 1,\n}").unwrap_err();
+        assert!(matches!(err, PatchError::Parse { line: 3, .. }), "{err:?}");
+        let err = check(Format::Json5, path, b"[1, 2]").unwrap_err();
+        assert!(matches!(err, PatchError::Shape { .. }), "{err:?}");
+        let err = check(Format::Json, path, b"\xef\xbb\xbf \n").unwrap_err();
+        assert!(matches!(err, PatchError::Empty { .. }), "{err:?}");
+        let err = check(Format::Toml, path, b"[a]\nx = 1\n[a]\n").unwrap_err();
+        assert!(matches!(err, PatchError::Parse { line: 3, .. }), "{err:?}");
     }
 
     #[test]
