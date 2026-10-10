@@ -8,6 +8,8 @@ use serde_json::Value;
 
 use super::slots::{self, Slot, Strength};
 use super::{AdaptError, AgentKind, choose_protocol, require_key};
+use crate::engine::LiveFile;
+use crate::fsx::Mode;
 use crate::patch::KeyPath;
 use crate::patch::json::{ClearScope, JsonPatch};
 use crate::provider::Provider;
@@ -16,6 +18,15 @@ const AGENT: AgentKind = AgentKind::ClaudeCode;
 
 pub fn settings_path(home: &Path) -> PathBuf {
     home.join(".claude").join("settings.json")
+}
+
+/// 里面有 Key，按 0600 写。
+pub fn live_file(home: &Path) -> LiveFile {
+    LiveFile {
+        owner: AGENT.id(),
+        path: settings_path(home),
+        mode: Mode::Private,
+    }
 }
 
 /// Claude Code 的协议选择器。
@@ -127,6 +138,7 @@ pub fn patch(provider: Option<&Provider>) -> Result<JsonPatch, AdaptError> {
                 is_floor: is_floor_env,
             },
         ],
+        drop_if_emptied: vec![KeyPath::new(&["env"])],
         ..JsonPatch::default()
     };
     let Some(provider) = provider else {

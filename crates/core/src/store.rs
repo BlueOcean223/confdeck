@@ -2,14 +2,19 @@
 //!
 //! 整个文件由程序重写，格式固定（两格缩进、末尾换行）。里面有 Key，所以权限是 0600，
 //! 写入先写临时文件再改名，写到一半断电也不会留下半个文件。读不了的文件报错，不覆盖。
+//! 每次保存前把旧内容备份一份（提案 08），和上一份相同的不重复存。
 
 use std::collections::HashSet;
-use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::PathBuf;
 
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 
+use crate::backup::{self, Reason, Shelf};
+use crate::data::DataDir;
+use crate::engine::{Engine, EngineError};
+use crate::fsx::{self, Mode};
 use crate::provider::{Provider, ProviderError};
 
 pub const VERSION: u32 = 1;
@@ -39,48 +44,49 @@ pub enum StoreError {
         path: PathBuf,
         source: ProviderError,
     },
+    #[error(transparent)]
+    Lock(EngineError),
 }
 
-/// 默认的数据文件位置：`~/.confdeck/providers.json`。
-pub fn default_path() -> Option<PathBuf> {
-    std::env::home_dir().map(|home| home.join(".confdeck").join("providers.json"))
+pub fn shelf() -> Shelf {
+    Shelf::new("confdeck", "providers.json")
 }
 
 /// 读供应商列表。文件不存在时是空列表。
-pub fn load(path: &Path) -> Result<Vec<Provider>, StoreError> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
+pub fn load(data: &DataDir) -> Result<Vec<Provider>, StoreError> {
+    let path = data.providers();
+    let io_error = |source| StoreError::Io {
+        path: path.clone(),
+        source,
     };
-    let file: ProvidersFile = serde_json::from_str(&text).map_err(|err| StoreError::Parse {
-        path: path.to_path_buf(),
+    let Some(bytes) = fsx::read_optional(&path).map_err(io_error)? else {
+        return Ok(Vec::new());
+    };
+    let file: ProvidersFile = serde_json::from_slice(&bytes).map_err(|err| StoreError::Parse {
+        path: path.clone(),
         line: err.line(),
         column: err.column(),
         message: err.to_string(),
     })?;
     if file.version > VERSION {
         return Err(StoreError::Version {
-            path: path.to_path_buf(),
+            path,
             found: file.version,
         });
     }
     validate(&file.providers).map_err(|source| StoreError::Invalid {
-        path: path.to_path_buf(),
+        path: path.clone(),
         source,
     })?;
     Ok(file.providers)
 }
 
-/// 写供应商列表。先校验，校验不过不写。
-pub fn save(path: &Path, providers: &[Provider]) -> Result<(), StoreError> {
+/// 写供应商列表。先校验，校验不过不写；内容有变化时先备份旧内容。
+pub fn save(engine: &Engine, providers: &[Provider]) -> Result<(), StoreError> {
+    let data = engine.data();
+    let path = data.providers();
     validate(providers).map_err(|source| StoreError::Invalid {
-        path: path.to_path_buf(),
+        path: path.clone(),
         source,
     })?;
     let file = ProvidersFile {
@@ -89,10 +95,21 @@ pub fn save(path: &Path, providers: &[Provider]) -> Result<(), StoreError> {
     };
     let mut bytes = serde_json::to_vec_pretty(&file).expect("providers always serialize");
     bytes.push(b'\n');
-    write_private(path, &bytes).map_err(|source| StoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+
+    let _lock = engine.lock().map_err(StoreError::Lock)?;
+    let io_error = |path: PathBuf| move |source| StoreError::Io { path, source };
+    let old = fsx::read_optional(&path).map_err(io_error(path.clone()))?;
+    match old {
+        Some(old) if old == bytes => return Ok(()),
+        Some(old) => {
+            let shelf = shelf();
+            let now = Local::now().naive_local();
+            backup::take(data, &shelf, &old, Reason::BeforeSave, now)
+                .map_err(io_error(shelf.dir(data)))?;
+        }
+        None => {}
+    }
+    fsx::write_atomic(&path, &bytes, Mode::Private).map_err(io_error(path.clone()))
 }
 
 fn validate(providers: &[Provider]) -> Result<(), ProviderError> {
@@ -108,63 +125,36 @@ fn validate(providers: &[Provider]) -> Result<(), ProviderError> {
     Ok(())
 }
 
-/// 原子地写一个只有自己能读的文件：同目录下的临时文件 → fsync → 改名。
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "路径没有文件名"))?;
-    let mut tmp_name = name.to_os_string();
-    tmp_name.push(format!(".tmp-{}", std::process::id()));
-    let tmp = dir.join(tmp_name);
-
-    let result = (|| {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::provider::tests::relay;
 
+    fn setup() -> (tempfile::TempDir, Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(DataDir::new(dir.path().join(".confdeck")));
+        (dir, engine)
+    }
+
     #[test]
     fn missing_file_is_an_empty_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let providers = load(&dir.path().join("providers.json")).unwrap();
-        assert!(providers.is_empty());
+        let (_dir, engine) = setup();
+        assert!(load(engine.data()).unwrap().is_empty());
     }
 
     #[test]
     fn save_then_load_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested").join("providers.json");
+        let (_dir, engine) = setup();
         let mut second = relay();
         second.id = "second".into();
         let providers = vec![relay(), second];
 
-        save(&path, &providers).unwrap();
-        assert_eq!(load(&path).unwrap(), providers);
+        save(&engine, &providers).unwrap();
+        assert_eq!(load(engine.data()).unwrap(), providers);
 
-        let text = fs::read_to_string(&path).unwrap();
+        let text = fs::read_to_string(engine.data().providers()).unwrap();
         assert!(
             text.starts_with("{\n  \"version\": 1,\n  \"providers\": [\n"),
             "{text}"
@@ -172,49 +162,70 @@ mod tests {
         assert!(text.ends_with("}\n"));
     }
 
+    #[test]
+    fn each_change_keeps_the_previous_version() {
+        let (_dir, engine) = setup();
+        let shelf = shelf();
+        save(&engine, &[relay()]).unwrap();
+        assert!(
+            backup::list(engine.data(), &shelf).unwrap().is_empty(),
+            "nothing to back up yet"
+        );
+
+        let first = fs::read(engine.data().providers()).unwrap();
+        let mut renamed = relay();
+        renamed.name = "Relay 2".into();
+        save(&engine, &[renamed.clone()]).unwrap();
+        // 内容没变的保存不写也不备份。
+        save(&engine, &[renamed]).unwrap();
+
+        let backups = backup::list(engine.data(), &shelf).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].reason, Reason::BeforeSave);
+        assert_eq!(fs::read(&backups[0].path).unwrap(), first);
+    }
+
     #[cfg(unix)]
     #[test]
-    fn saved_file_is_private_and_leaves_no_temp_file() {
+    fn saved_file_is_private() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("providers.json");
+        let (_dir, engine) = setup();
+        let path = engine.data().providers();
+        fs::create_dir_all(engine.data().root()).unwrap();
         fs::write(&path, "{\"version\": 1}").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-        save(&path, &[relay()]).unwrap();
+        save(&engine, &[relay()]).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        let names: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from("providers.json")]);
     }
 
     #[test]
     fn broken_file_is_reported_and_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("providers.json");
+        let (_dir, engine) = setup();
+        let path = engine.data().providers();
         let broken = "{\n  \"version\": 1,\n  \"providers\": [\n    {\"id\": \n";
+        fs::create_dir_all(engine.data().root()).unwrap();
         fs::write(&path, broken).unwrap();
 
-        let err = load(&path).expect_err("must refuse");
+        let err = load(engine.data()).expect_err("must refuse");
         assert!(matches!(err, StoreError::Parse { line: 5, .. }), "{err:?}");
         assert_eq!(fs::read_to_string(&path).unwrap(), broken);
     }
 
     #[test]
     fn newer_versions_and_duplicate_ids_are_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("providers.json");
+        let (_dir, engine) = setup();
+        let path = engine.data().providers();
+        fs::create_dir_all(engine.data().root()).unwrap();
         fs::write(&path, "{\"version\": 2, \"providers\": []}").unwrap();
         assert!(matches!(
-            load(&path),
+            load(engine.data()),
             Err(StoreError::Version { found: 2, .. })
         ));
 
-        let err = save(&path, &[relay(), relay()]).expect_err("must refuse");
+        let err = save(&engine, &[relay(), relay()]).expect_err("must refuse");
         assert!(
             matches!(
                 err,

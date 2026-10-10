@@ -1,4 +1,4 @@
-//! 适配器：把一家供应商翻译成某个 agent 的配置补丁。只算补丁，不读写磁盘。
+//! 适配器：把一家供应商翻译成某个 agent 的配置补丁。只算补丁，不读写磁盘（写入见 [`crate::apply`]）。
 //!
 //! 每个 agent 的配置里，「关键字段」（请求发到哪、凭什么鉴权、哪个模型、说哪种协议）
 //! 完全归供应商所有：切换时一律清空，再写目标供应商的值。其余键归用户，confdeck 不写也不删。
@@ -39,6 +39,17 @@ impl AgentKind {
         Self::GrokBuild,
         Self::Opencode,
     ];
+
+    /// 和 serde 的写法一样，用在备份目录名等地方。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::GrokBuild => "grok-build",
+            Self::Opencode => "opencode",
+        }
+    }
 
     pub fn mode(self) -> Mode {
         match self {
@@ -217,6 +228,8 @@ mod tests {
             names,
             ["claude-code", "codex", "pi", "grok-build", "opencode"]
         );
+        let ids: Vec<&str> = AgentKind::ALL.iter().map(|agent| agent.id()).collect();
+        assert_eq!(ids, names);
     }
 
     #[test]

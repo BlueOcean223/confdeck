@@ -33,11 +33,23 @@ pub struct JsonPatch {
     pub remove: Vec<KeyPath>,
     /// 目标值：已存在就原位改值，不存在就追加到父对象末尾（父对象缺失时一并创建）。
     pub set: Vec<(KeyPath, Value)>,
+    /// 这些对象被上面几步删空了，就连对象本身一起删掉（比如切回默认后不留一个空的 `env`）。
+    /// 原来就是空的不动。
+    pub drop_if_emptied: Vec<KeyPath>,
 }
 
 impl JsonPatch {
     pub fn apply_to(&self, path: &Path, doc: &mut Value) -> Result<(), PatchError> {
         let targets: HashSet<&KeyPath> = self.set.iter().map(|(key_path, _)| key_path).collect();
+        let had_content: Vec<&KeyPath> = self
+            .drop_if_emptied
+            .iter()
+            .filter(|key_path| {
+                value_at(doc, key_path)
+                    .and_then(Value::as_object)
+                    .is_some_and(|map| !map.is_empty())
+            })
+            .collect();
 
         for scope in &self.clear {
             let Some(map) = object_at_mut(path, doc, &scope.parent.0)? else {
@@ -70,6 +82,18 @@ impl JsonPatch {
                 Some(slot) => *slot = value.clone(),
                 None => {
                     map.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        for key_path in had_content {
+            let emptied = value_at(doc, key_path)
+                .and_then(Value::as_object)
+                .is_some_and(Map::is_empty);
+            if emptied {
+                let (parent, key) = split(key_path);
+                if let Some(map) = object_at_mut(path, doc, parent)? {
+                    map.shift_remove(key);
                 }
             }
         }
@@ -385,6 +409,31 @@ mod tests {
         let out = apply(&patch, r#"{"providers": {"a": {}, "b": {}}}"#);
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value, json!({"providers": {"b": {}}}));
+    }
+
+    #[test]
+    fn objects_emptied_by_the_patch_are_dropped_but_empty_ones_stay() {
+        let patch = JsonPatch {
+            drop_if_emptied: vec![KeyPath::new(&["env"])],
+            ..floor_patch(&[])
+        };
+        let out = apply(&patch, r#"{"env": {"ANTHROPIC_MODEL": "x"}, "a": 1}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            json!({"a": 1})
+        );
+
+        let out = apply(&patch, r#"{"env": {}, "a": 1}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            json!({"env": {}, "a": 1})
+        );
+
+        let out = apply(&patch, r#"{"env": {"ANTHROPIC_MODEL": "x", "DEBUG": "1"}}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            json!({"env": {"DEBUG": "1"}})
+        );
     }
 
     #[test]

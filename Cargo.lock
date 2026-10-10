@@ -1086,9 +1086,11 @@ dependencies = [
 name = "confdeck-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "json5",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "toml_edit 0.22.27",

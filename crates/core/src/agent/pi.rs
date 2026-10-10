@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use super::{AdaptError, AgentKind, choose_protocol, list_models};
+use crate::engine::LiveFile;
+use crate::fsx::Mode;
 use crate::patch::KeyPath;
 use crate::patch::json::JsonPatch;
 use crate::provider::{Model, Protocol, Provider};
@@ -20,6 +22,15 @@ pub const KEY_PREFIX: &str = "confdeck-";
 
 pub fn models_path(home: &Path) -> PathBuf {
     home.join(".pi").join("agent").join("models.json")
+}
+
+/// 里面有 Key，按 0600 写。
+pub fn live_file(home: &Path) -> LiveFile {
+    LiveFile {
+        owner: AGENT.id(),
+        path: models_path(home),
+        mode: Mode::Private,
+    }
 }
 
 pub fn provider_key(provider_id: &str) -> String {

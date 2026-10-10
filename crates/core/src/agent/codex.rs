@@ -10,6 +10,8 @@ use serde_json::Value as Json;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use super::{AdaptError, AgentKind, choose_protocol, default_model, require_key};
+use crate::engine::LiveFile;
+use crate::fsx::Mode;
 use crate::patch::PatchError;
 use crate::patch::toml::{TomlDocPatch, put_value, remove_key, shape_error};
 use crate::provider::Provider;
@@ -21,6 +23,50 @@ pub const ROUTE_ID: &str = "custom";
 
 pub fn config_path(home: &Path) -> PathBuf {
     home.join(".codex").join("config.toml")
+}
+
+/// 里面有第三方的 Key，按 0600 写。
+pub fn live_file(home: &Path) -> LiveFile {
+    LiveFile {
+        owner: AGENT.id(),
+        path: config_path(home),
+        mode: Mode::Private,
+    }
+}
+
+/// Codex 存 ChatGPT 登录的文件。
+pub fn auth_path(home: &Path) -> PathBuf {
+    home.join(".codex").join("auth.json")
+}
+
+/// `auth.json` 里有没有 Codex 能直接用的登录（OAuth token 等），只有 `OPENAI_API_KEY` 不算。
+/// 判断规则移植自 ccs-lite 的 `codex_auth_has_credential_login_material`。
+///
+/// `config.toml` 里 `cli_auth_credentials_store` 设成 keyring / auto 时登录存在系统钥匙串里，
+/// 这里看不到，当成没有登录。
+pub fn login_on_disk(auth: Option<&[u8]>) -> bool {
+    let Some(auth) = auth.and_then(|bytes| serde_json::from_slice::<Json>(bytes).ok()) else {
+        return false;
+    };
+    let present = |value: &Json| match value {
+        Json::Null => false,
+        Json::String(text) => !text.trim().is_empty(),
+        Json::Object(map) => !map.is_empty(),
+        Json::Array(items) => !items.is_empty(),
+        _ => true,
+    };
+    let carrier = ["personal_access_token", "agent_identity", "bedrock_api_key"]
+        .iter()
+        .any(|key| auth.get(key).is_some_and(present));
+    let tokens = auth
+        .get("tokens")
+        .and_then(Json::as_object)
+        .is_some_and(|tokens| {
+            ["id_token", "access_token", "refresh_token"]
+                .iter()
+                .any(|key| tokens.get(*key).is_some_and(present))
+        });
+    carrier || tokens
 }
 
 /// `config.toml` 顶层的关键字段。另有 `[model_providers.custom]` 整表。
@@ -394,6 +440,22 @@ requires_openai_auth = false
         let patch = patch(Some(&relay()), true).unwrap();
         let once = apply(&patch, Some(LIVE));
         assert_eq!(apply(&patch, Some(&once)), once);
+    }
+
+    #[test]
+    fn login_on_disk_needs_real_credentials() {
+        assert!(!login_on_disk(None));
+        assert!(!login_on_disk(Some(b"{ broken")));
+        assert!(!login_on_disk(Some(
+            br#"{"OPENAI_API_KEY": "sk-x", "last_refresh": "2026-10-01"}"#
+        )));
+        assert!(!login_on_disk(Some(
+            br#"{"tokens": {"account_id": "acct", "id_token": ""}}"#
+        )));
+        assert!(login_on_disk(Some(
+            br#"{"tokens": {"refresh_token": "rt"}}"#
+        )));
+        assert!(login_on_disk(Some(br#"{"agent_identity": {"id": "a"}}"#)));
     }
 
     #[test]
