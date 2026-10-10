@@ -1,4 +1,8 @@
-//! Codex：`~/.codex/config.toml`。单选 agent，列表 + 默认（列表要写进模型目录文件，还没做）。
+//! Codex：`~/.codex/config.toml`。单选 agent，只写默认模型和它的窗口（`model_context_window`）。
+//!
+//! 不写模型目录文件（`model_catalog_json`，用户 10-10 定的）：写了目录，每个模型都要带 `base_instructions`，
+//! Codex 拿它整段换掉自带的系统提示词（0.153.4 抓包）。代价是 Codex 里 `/model` 列的还是 GPT，
+//! 窗口最大按 272K 算。
 //!
 //! 第三方供应商写成 `model_provider = "custom"` 加 `[model_providers.custom]` 一整张表；
 //! 「默认」删掉这两处，回到 Codex 内置的 openai（官方登录）。关键字段的清单和
@@ -85,6 +89,7 @@ pub const FLOOR_TOP: &[&str] = &[
     "model_provider",
     "openai_base_url",
     "model",
+    "model_context_window",
     "review_model",
     "model_reasoning_effort",
     "plan_mode_reasoning_effort",
@@ -195,11 +200,19 @@ pub fn patch(provider: Option<&Provider>, login_on_disk: bool) -> Result<CodexPa
     }
     let stamp = !raw.is_some_and(|raw| raw.contains_key("requires_openai_auth"));
 
+    let mut top = vec![
+        ("model_provider", Value::from(ROUTE_ID)),
+        ("model", Value::from(model.id.as_str())),
+    ];
+    // 第三方模型 Codex 不认识，按内置的兜底数据算 272K 窗口。写上目录里的窗口，比 272K 小的模型才能及时压缩；
+    // 更大的 Codex 截到 272K（`with_config_overrides`），写真实值，Codex 以后放开了也对。
+    if let Some(context) = model.context {
+        let context = i64::try_from(context).unwrap_or(i64::MAX);
+        top.push(("model_context_window", Value::from(context)));
+    }
+
     Ok(CodexPatch {
-        top: vec![
-            ("model_provider", Value::from(ROUTE_ID)),
-            ("model", Value::from(model.id.as_str())),
-        ],
+        top,
         route: Some(Route { table, stamp }),
         login_on_disk,
     })
@@ -269,10 +282,10 @@ fn active_profile(doc: &DocumentMut) -> Option<(String, &dyn TableLike)> {
 }
 
 /// 键的生效值：生效的 profile 里有就用它的。
-fn effective(doc: &DocumentMut, key: &str) -> Option<String> {
+fn effective<'a>(doc: &'a DocumentMut, key: &str) -> Option<&'a Item> {
     active_profile(doc)
-        .and_then(|(_, profile)| text(profile.get(key)))
-        .or_else(|| text(doc.get(key)))
+        .and_then(|(_, profile)| profile.get(key))
+        .or_else(|| doc.get(key))
 }
 
 fn text(item: Option<&Item>) -> Option<String> {
@@ -335,10 +348,10 @@ fn rename_reserved(providers: &mut dyn TableLike) {
 /// 旧写法的 profile 生效时按它盖过的值算。
 pub fn connection(path: &Path, bytes: Option<&[u8]>) -> Result<Connection, PatchError> {
     let doc = toml::parse(path, bytes)?;
-    let selected = effective(&doc, "model_provider").unwrap_or_else(|| "openai".to_string());
+    let selected = text(effective(&doc, "model_provider")).unwrap_or_else(|| "openai".to_string());
     if selected == "openai" {
         // `openai_base_url` 把内置的 openai 路由改道到别的地址。
-        return Ok(match effective(&doc, "openai_base_url") {
+        return Ok(match text(effective(&doc, "openai_base_url")) {
             Some(url) => Connection::Endpoint {
                 base_url: normalize_url(Protocol::OpenaiResponses, &url),
                 credential: None,
@@ -366,7 +379,7 @@ pub fn connection(path: &Path, bytes: Option<&[u8]>) -> Result<Connection, Patch
     })
 }
 
-/// 「把当前配置存成供应商」：读出地址、Key 和 `model`。连的不是一个地址时为 `None`。
+/// 「把当前配置存成供应商」：读出地址、Key、`model` 和它的窗口。连的不是一个地址时为 `None`。
 pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, PatchError> {
     let Connection::Endpoint {
         base_url,
@@ -376,7 +389,11 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
         return Ok(None);
     };
     let doc = toml::parse(path, bytes)?;
-    let model = effective(&doc, "model");
+    let model = text(effective(&doc, "model"));
+    let context = effective(&doc, "model_context_window")
+        .and_then(Item::as_integer)
+        .and_then(|context| u64::try_from(context).ok())
+        .filter(|&context| context > 0);
     Ok(Some(FileSetup {
         protocol: Protocol::OpenaiResponses,
         base_url,
@@ -388,6 +405,7 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
             .iter()
             .map(|id| Model {
                 id: id.clone(),
+                context,
                 ..Model::default()
             })
             .collect(),
@@ -444,6 +462,7 @@ notifications = true
 model = "glm-4.6"   # 平时用的
 approval_policy = "on-request"
 model_provider = "custom"
+model_context_window = 200000
 
 [agents]
 max_threads = 4
@@ -499,6 +518,7 @@ notifications = true
             apply(&patch, None),
             r#"model_provider = "custom"
 model = "glm-4.6"
+model_context_window = 200000
 
 [model_providers.custom]
 name = "Relay"
@@ -683,6 +703,24 @@ requires_openai_auth = false
             patch(Some(&provider), true),
             Err(AdaptError::MissingKey { .. })
         ));
+    }
+
+    #[test]
+    fn the_context_window_follows_the_default_model() {
+        let pre = "model = \"gpt-5.5\"\nmodel_context_window = 1000000\n";
+        // 默认模型改成没写窗口的那个：清掉上一家留下的窗口，Codex 按兜底数据算。
+        let mut provider = relay();
+        provider.models.retain(|model| model.id == "glm-4.5");
+        let out = apply(&patch(Some(&provider), false).unwrap(), Some(pre));
+        assert!(!out.contains("model_context_window"), "{out}");
+        assert!(!apply(&patch(None, false).unwrap(), Some(pre)).contains("model_context_window"));
+
+        let out = apply(&patch(Some(&relay()), false).unwrap(), Some(pre));
+        assert!(out.contains("model_context_window = 200000"), "{out}");
+        let found = setup(Path::new("c.toml"), Some(out.as_bytes()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.models[0].context, Some(200_000));
     }
 
     #[test]
