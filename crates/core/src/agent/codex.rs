@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
-use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
+use toml_edit::{DocumentMut, Item, Table, Value};
 
 use super::{
     AdaptError, AgentKind, Connection, Credential, FileSetup, choose_protocol, default_model,
@@ -15,7 +15,7 @@ use super::{
 };
 use crate::engine::LiveFile;
 use crate::fsx::Mode;
-use crate::patch::toml::{self, TomlDocPatch, put_value, remove_key, shape_error};
+use crate::patch::toml::{self, TomlDocPatch, put_table, put_value, remove_key, shape_error};
 use crate::patch::{Format, PatchError};
 use crate::provider::{Protocol, Provider, normalize_url};
 
@@ -146,7 +146,7 @@ pub fn patch(provider: Option<&Provider>, login_on_disk: bool) -> Result<CodexPa
             table.remove(name);
             continue;
         }
-        let value = to_toml(value).ok_or_else(|| AdaptError::RawNotToml {
+        let value = toml::from_json(value).ok_or_else(|| AdaptError::RawNotToml {
             agent: AGENT,
             key: name.clone(),
         })?;
@@ -159,27 +159,6 @@ pub fn patch(provider: Option<&Provider>, login_on_disk: bool) -> Result<CodexPa
             ("model", Value::from(model.id.as_str())),
         ],
         route: Some(table),
-    })
-}
-
-/// JSON → TOML。TOML 没有 null，嵌在数组或对象里的 null 写不了，返回 `None`。
-fn to_toml(value: &Json) -> Option<Value> {
-    Some(match value {
-        Json::Null => return None,
-        Json::Bool(flag) => Value::from(*flag),
-        Json::Number(number) => match number.as_i64() {
-            Some(int) => Value::from(int),
-            None => Value::from(number.as_f64()?),
-        },
-        Json::String(text) => Value::from(text.as_str()),
-        Json::Array(items) => Value::Array(items.iter().map(to_toml).collect::<Option<_>>()?),
-        Json::Object(map) => {
-            let mut table = InlineTable::new();
-            for (key, item) in map {
-                table.insert(key, to_toml(item)?);
-            }
-            Value::InlineTable(table)
-        }
     })
 }
 
@@ -246,37 +225,6 @@ fn write_route(
         }
     }
     Ok(())
-}
-
-/// 按容器原来的形式写表：内联容器（或原来就是内联表）写内联表，否则写标准表，并留在
-/// 原来的位置。
-fn put_table(providers: &mut dyn TableLike, id: &str, table: Table, container_inline: bool) {
-    let existing_inline = matches!(providers.get(id), Some(Item::Value(_)));
-    if container_inline || existing_inline {
-        let inline = Item::Value(Value::InlineTable(table.into_inline_table()));
-        match providers.get_mut(id) {
-            Some(slot) => *slot = inline,
-            None => {
-                providers.insert(id, inline);
-            }
-        }
-        return;
-    }
-    let mut table = table;
-    match providers.get_mut(id) {
-        Some(slot) => {
-            if let Item::Table(old) = slot {
-                *table.decor_mut() = old.decor().clone();
-                if let Some(position) = old.position() {
-                    table.set_position(position);
-                }
-            }
-            *slot = Item::Table(table);
-        }
-        None => {
-            providers.insert(id, Item::Table(table));
-        }
-    }
 }
 
 /// 从 `config.toml` 读出现在连的是哪。只看选的路由和它的地址、凭据，不看模型名。

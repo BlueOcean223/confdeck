@@ -1,12 +1,13 @@
 //! 把供应商写进 agent 的配置文件：适配器算补丁，引擎写。
 //!
 //! 单选 agent 用 [`switch`]（`None` 是「默认」）；多选 agent 用 [`enable`] / [`disable`]，
-//! 勾一下写一次。改了供应商用 [`save_provider`]：存好以后把改动写进所有在用它的 agent。
-//! Grok Build、OpenCode 的适配器还没做，调用会报 [`ApplyError::Unsupported`]。
+//! 勾一下写一次。改了供应商用 [`save_provider`]：存好以后把改动写进所有在用它的 agent；
+//! 删掉用 [`delete_provider`]，之前用 [`used_by`] 列出在用的 agent 请用户确认。
+//! OpenCode 的适配器还没做，调用会报 [`ApplyError::Unsupported`]。
 
 use std::path::{Path, PathBuf};
 
-use crate::agent::{AdaptError, AgentKind, Mode, claude, codex, pi};
+use crate::agent::{AdaptError, AgentKind, Mode, claude, codex, grok, pi};
 use crate::current::{self, Current};
 use crate::engine::{Engine, EngineError, LiveFile, Outcome};
 use crate::fsx;
@@ -42,7 +43,8 @@ pub fn live_files(home: &Path, agent: AgentKind) -> Vec<LiveFile> {
         AgentKind::ClaudeCode => vec![claude::live_file(home)],
         AgentKind::Codex => vec![codex::live_file(home)],
         AgentKind::Pi => vec![pi::live_file(home)],
-        AgentKind::GrokBuild | AgentKind::Opencode => Vec::new(),
+        AgentKind::GrokBuild => vec![grok::live_file(home)],
+        AgentKind::Opencode => Vec::new(),
     }
 }
 
@@ -73,8 +75,8 @@ fn write_switch(
             let patch = codex::patch(provider, codex_login(home)?)?;
             Ok(engine.write(&codex::live_file(home), &patch)?)
         }
+        AgentKind::GrokBuild => Ok(engine.write(&grok::live_file(home), &grok::patch(provider)?)?),
         AgentKind::Pi | AgentKind::Opencode => Err(ApplyError::WrongMode { agent }),
-        AgentKind::GrokBuild => Err(ApplyError::Unsupported { agent }),
     }
 }
 
@@ -137,13 +139,15 @@ pub(crate) fn writer(home: &Path, agent: AgentKind) -> Result<Writer, ApplyError
                 Box::new(move |provider| Ok(Box::new(codex::patch(Some(provider), login)?))),
             )
         }
+        AgentKind::GrokBuild => (
+            grok::live_file(home),
+            Box::new(|provider| Ok(Box::new(grok::patch(Some(provider))?))),
+        ),
         AgentKind::Pi => (
             pi::live_file(home),
             Box::new(|provider| Ok(Box::new(pi::add(provider)?))),
         ),
-        AgentKind::GrokBuild | AgentKind::Opencode => {
-            return Err(ApplyError::Unsupported { agent });
-        }
+        AgentKind::Opencode => return Err(ApplyError::Unsupported { agent }),
     };
     Ok(Writer { file, patch })
 }
@@ -189,12 +193,8 @@ pub fn save_provider(
         return Ok(Vec::new());
     };
     let mut synced = Vec::new();
-    for agent in AgentKind::ALL {
-        // 还没有适配器的 agent 不会在用。
-        let Some(file) = live_files(home, agent).into_iter().next() else {
-            continue;
-        };
-        let result = match in_use(engine, home, agent, providers, &before.id) {
+    for (agent, file, in_use) in scan(engine, home, providers, &before.id, AgentKind::ALL) {
+        let result = match in_use {
             Ok(false) => continue,
             Ok(true) => write_changes(engine, home, agent, before, provider),
             Err(err) => Err(err),
@@ -206,6 +206,86 @@ pub fn save_provider(
         });
     }
     Ok(synced)
+}
+
+/// 在用一家供应商的 agent。
+#[derive(Debug, Default)]
+pub struct UsedBy {
+    pub agents: Vec<AgentKind>,
+    /// 配置文件读不了、解析不了，认不出在不在用的。
+    pub unknown: Vec<(AgentKind, ApplyError)>,
+}
+
+/// 哪些 agent 在用这家（`providers` 是现在的列表）：删除前列出来请用户确认，供应商页的「X 在用」。
+/// 「在用」的认法同 [`save_provider`]。
+pub fn used_by(engine: &Engine, home: &Path, providers: &[Provider], id: &str) -> UsedBy {
+    let mut used_by = UsedBy::default();
+    for (agent, _, in_use) in scan(engine, home, providers, id, AgentKind::ALL) {
+        match in_use {
+            Ok(true) => used_by.agents.push(agent),
+            Ok(false) => {}
+            Err(err) => used_by.unknown.push((agent, err)),
+        }
+    }
+    used_by
+}
+
+/// 删掉一家供应商（10-10 用户定的）。先存，存不了就什么都不写。
+///
+/// - 单选 agent 的文件不动：之后显示「自定义 · 主机名」，还能「存成供应商」找回来。
+/// - 多选 agent 删掉勾的这一项，不然会留下一项 confdeck 再也管不到的配置。每个写了的（或该写没写成的）返回一项。
+///
+/// 不在列表里的 ID 什么都不做。
+pub fn delete_provider(
+    engine: &Engine,
+    home: &Path,
+    providers: &[Provider],
+    id: &str,
+) -> Result<Vec<Synced>, StoreError> {
+    let after: Vec<Provider> = providers
+        .iter()
+        .filter(|provider| provider.id != id)
+        .cloned()
+        .collect();
+    if after.len() == providers.len() {
+        return Ok(Vec::new());
+    }
+    store::save(engine, &after)?;
+
+    let coexist = AgentKind::ALL
+        .into_iter()
+        .filter(|agent| agent.mode() == Mode::Coexist);
+    let mut synced = Vec::new();
+    for (agent, file, in_use) in scan(engine, home, providers, id, coexist) {
+        let result = match in_use {
+            Ok(false) => continue,
+            Ok(true) => disable(engine, home, agent, id),
+            Err(err) => Err(err),
+        };
+        synced.push(Synced {
+            agent,
+            path: file.path,
+            result,
+        });
+    }
+    Ok(synced)
+}
+
+/// 逐个 agent 看在不在用 `id` 这家。还没有适配器的 agent 跳过。
+fn scan(
+    engine: &Engine,
+    home: &Path,
+    providers: &[Provider],
+    id: &str,
+    agents: impl IntoIterator<Item = AgentKind>,
+) -> Vec<(AgentKind, LiveFile, Result<bool, ApplyError>)> {
+    agents
+        .into_iter()
+        .filter_map(|agent| {
+            let file = live_files(home, agent).into_iter().next()?;
+            Some((agent, file, in_use(engine, home, agent, providers, id)))
+        })
+        .collect()
 }
 
 fn in_use(
@@ -425,10 +505,14 @@ mod tests {
             self.write(relative, &serde_json::to_string_pretty(&value).unwrap());
         }
 
-        /// Claude Code、Codex 切到 `providers[0]`，Pi 勾上全部。
+        /// 单选 agent 切到 `providers[0]`，Pi 勾上全部。
         fn use_everywhere(&self, providers: &[Provider]) {
             store::save(&self.engine, providers).unwrap();
-            for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+            for agent in [
+                AgentKind::ClaudeCode,
+                AgentKind::Codex,
+                AgentKind::GrokBuild,
+            ] {
                 switch(&self.engine, self.path(), agent, Some(&providers[0])).unwrap();
             }
             for provider in providers {
@@ -464,6 +548,14 @@ mod tests {
             value["model"] = "glm-4.5".into();
             value["env"]["ANTHROPIC_CUSTOM_HEADERS"] = "X-Team: infra".into();
         });
+        let grok = home.read(".grok/config.toml");
+        home.write(
+            ".grok/config.toml",
+            &grok.replace(
+                "default = \"confdeck-glm-4.6\"",
+                "default = \"confdeck-glm-4.5-air\"",
+            ),
+        );
         let codex = home.read(".codex/config.toml");
         home.write(
             ".codex/config.toml",
@@ -476,10 +568,19 @@ mod tests {
         let synced = home.save(&providers, &rotated);
         assert_eq!(
             agents(&synced),
-            [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Pi]
+            [
+                AgentKind::ClaudeCode,
+                AgentKind::Codex,
+                AgentKind::Pi,
+                AgentKind::GrokBuild
+            ]
         );
         assert_eq!(synced[0].path, home.path().join(".claude/settings.json"));
-        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+        for agent in [
+            AgentKind::ClaudeCode,
+            AgentKind::Codex,
+            AgentKind::GrokBuild,
+        ] {
             let outcome = outcome(&synced, agent);
             assert!(outcome.changed);
             assert_eq!(
@@ -498,13 +599,20 @@ mod tests {
         assert!(codex.contains("experimental_bearer_token = \"sk-new\""));
         assert!(codex.contains("model_reasoning_effort = \"high\""));
         assert!(codex.contains("model = \"glm-4.5\""));
+        let grok = home.read(".grok/config.toml");
+        assert_eq!(grok.matches("api_key = \"sk-new\"").count(), 2, "{grok}");
+        assert!(grok.contains("default = \"confdeck-glm-4.5-air\""));
         let pi = home.json(".pi/agent/models.json");
         assert_eq!(pi["providers"]["confdeck-relay"]["apiKey"], "sk-new");
         assert_eq!(pi["providers"]["confdeck-other"]["apiKey"], "sk-other");
 
         let saved = store::load(home.engine.data()).unwrap();
         assert_eq!(saved, [rotated, other()]);
-        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+        for agent in [
+            AgentKind::ClaudeCode,
+            AgentKind::Codex,
+            AgentKind::GrokBuild,
+        ] {
             assert_eq!(
                 home.current(agent, &saved),
                 Current::Provider("relay".into())
@@ -526,7 +634,7 @@ mod tests {
         ]
         .into();
         let synced = home.save(&providers, &moved);
-        assert_eq!(synced.len(), 3);
+        assert_eq!(synced.len(), 4);
         assert_eq!(
             home.json(".claude/settings.json")["env"]["ANTHROPIC_BASE_URL"],
             "https://moved.example"
@@ -538,6 +646,10 @@ mod tests {
         assert_eq!(
             home.json(".pi/agent/models.json")["providers"]["confdeck-relay"]["baseUrl"],
             "https://moved.example/v1"
+        );
+        assert!(
+            !home.read(".grok/config.toml").contains("relay.example"),
+            "every model table moves"
         );
     }
 
@@ -585,10 +697,15 @@ mod tests {
         let mut renamed = relay();
         renamed.name = "Relay Pro".into();
         let synced = home.save(&providers, &renamed);
-        assert_eq!(synced.len(), 3);
+        assert_eq!(synced.len(), 4);
         assert!(!outcome(&synced, AgentKind::ClaudeCode).changed);
         assert!(outcome(&synced, AgentKind::Codex).changed);
         assert!(outcome(&synced, AgentKind::Pi).changed);
+        assert!(outcome(&synced, AgentKind::GrokBuild).changed);
+        assert!(
+            home.read(".grok/config.toml")
+                .contains("name = \"GLM 4.6 (Relay Pro)\"")
+        );
         assert_eq!(home.read(".claude/settings.json"), claude);
         assert!(
             home.read(".codex/config.toml")
@@ -611,7 +728,12 @@ mod tests {
         let synced = home.save(&providers, &changed);
         assert_eq!(
             agents(&synced),
-            [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Pi]
+            [
+                AgentKind::ClaudeCode,
+                AgentKind::Codex,
+                AgentKind::Pi,
+                AgentKind::GrokBuild
+            ]
         );
         assert!(matches!(
             synced[0].result,
@@ -676,7 +798,10 @@ mod tests {
         let mut adopted = relay();
         adopted.key = live.credential().and_then(Credential::key).unwrap().into();
         let synced = home.save(&providers, &adopted);
-        assert_eq!(agents(&synced), [AgentKind::Codex, AgentKind::Pi]);
+        assert_eq!(
+            agents(&synced),
+            [AgentKind::Codex, AgentKind::Pi, AgentKind::GrokBuild]
+        );
         assert!(
             home.read(".codex/config.toml")
                 .contains("experimental_bearer_token = \"sk-rotated\"")
@@ -685,6 +810,75 @@ mod tests {
             home.current(AgentKind::ClaudeCode, &[adopted]),
             Current::Provider("relay".into())
         );
+    }
+
+    #[test]
+    fn deleting_a_provider_drops_its_multi_select_entries_and_leaves_switch_files_alone() {
+        let home = Home::new();
+        let providers = [relay(), other()];
+        home.use_everywhere(&providers);
+        let claude = home.read(".claude/settings.json");
+
+        let used = used_by(&home.engine, home.path(), &providers, "relay");
+        assert_eq!(
+            used.agents,
+            [
+                AgentKind::ClaudeCode,
+                AgentKind::Codex,
+                AgentKind::Pi,
+                AgentKind::GrokBuild
+            ]
+        );
+        assert!(used.unknown.is_empty());
+        let used = used_by(&home.engine, home.path(), &providers, "other");
+        assert_eq!(used.agents, [AgentKind::Pi]);
+
+        let synced = delete_provider(&home.engine, home.path(), &providers, "relay").unwrap();
+        assert_eq!(agents(&synced), [AgentKind::Pi]);
+        assert!(outcome(&synced, AgentKind::Pi).changed);
+        assert_eq!(store::load(home.engine.data()).unwrap(), [other()]);
+        assert_eq!(home.read(".claude/settings.json"), claude);
+        let pi = home.json(".pi/agent/models.json");
+        assert!(pi["providers"].get("confdeck-relay").is_none());
+        assert!(pi["providers"]["confdeck-other"].is_object());
+        // Claude Code 还连着原来的地址，现在认作「自定义」。
+        assert_eq!(
+            home.current(AgentKind::ClaudeCode, &[other()]),
+            Current::Custom {
+                host: Some("relay.example".into())
+            }
+        );
+
+        assert!(
+            delete_provider(&home.engine, home.path(), &[other()], "relay")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn files_that_cannot_be_read_are_listed_as_unknown() {
+        let home = Home::new();
+        let providers = [relay()];
+        home.use_everywhere(&providers);
+        home.write(".pi/agent/models.json", "{ broken");
+
+        let used = used_by(&home.engine, home.path(), &providers, "relay");
+        assert_eq!(
+            used.agents,
+            [
+                AgentKind::ClaudeCode,
+                AgentKind::Codex,
+                AgentKind::GrokBuild
+            ]
+        );
+        assert_eq!(used.unknown.len(), 1);
+        assert_eq!(used.unknown[0].0, AgentKind::Pi);
+
+        let synced = delete_provider(&home.engine, home.path(), &providers, "relay").unwrap();
+        assert_eq!(agents(&synced), [AgentKind::Pi]);
+        assert!(matches!(synced[0].result, Err(ApplyError::Parse(_))));
+        assert!(store::load(home.engine.data()).unwrap().is_empty());
     }
 
     #[test]
@@ -700,12 +894,7 @@ mod tests {
             Err(ApplyError::WrongMode { .. })
         ));
         assert!(matches!(
-            switch(
-                &home.engine,
-                home.path(),
-                AgentKind::GrokBuild,
-                Some(&provider)
-            ),
+            enable(&home.engine, home.path(), AgentKind::Opencode, &provider),
             Err(ApplyError::Unsupported { .. })
         ));
         let err = switch(&home.engine, home.path(), AgentKind::Opencode, None).unwrap_err();

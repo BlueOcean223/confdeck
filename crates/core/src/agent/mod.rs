@@ -5,6 +5,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod grok;
 pub mod pi;
 pub mod slots;
 
@@ -102,9 +103,9 @@ pub enum Connection {
 pub enum Credential {
     /// Key 本身。
     Key(String),
-    /// Claude Code 的 `apiKeyHelper`：运行这个命令拿 Key。
+    /// 运行这个命令拿 Key：Claude Code 的 `apiKeyHelper`、Grok Build 的 `auth_provider`。
     Helper(String),
-    /// Codex 的 `env_key`：Key 在这个环境变量里。
+    /// Key 在这个环境变量里：Codex、Grok Build 的 `env_key`。
     EnvVar(String),
 }
 

@@ -3,7 +3,8 @@
 
 use std::path::Path;
 
-use toml_edit::{Decor, DocumentMut, Item, Table, TableLike, Value};
+use serde_json::Value as Json;
+use toml_edit::{Decor, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use super::{KeyPath, LivePatch, PatchError, decode_utf8, line_column};
 
@@ -134,6 +135,58 @@ fn ensure_table_like<'a>(
             .ok_or_else(|| shape_error(path, &segments[..=depth]))?;
     }
     Ok(current)
+}
+
+/// 按容器原来的形式写表：内联容器（或原来就是内联表）写内联表，否则写标准表，并留在
+/// 原来的位置。
+pub fn put_table(container: &mut dyn TableLike, id: &str, table: Table, container_inline: bool) {
+    let existing_inline = matches!(container.get(id), Some(Item::Value(_)));
+    if container_inline || existing_inline {
+        let inline = Item::Value(Value::InlineTable(table.into_inline_table()));
+        match container.get_mut(id) {
+            Some(slot) => *slot = inline,
+            None => {
+                container.insert(id, inline);
+            }
+        }
+        return;
+    }
+    let mut table = table;
+    match container.get_mut(id) {
+        Some(slot) => {
+            if let Item::Table(old) = slot {
+                *table.decor_mut() = old.decor().clone();
+                if let Some(position) = old.position() {
+                    table.set_position(position);
+                }
+            }
+            *slot = Item::Table(table);
+        }
+        None => {
+            container.insert(id, Item::Table(table));
+        }
+    }
+}
+
+/// JSON → TOML。TOML 没有 null，嵌在数组或对象里的 null 写不了，返回 `None`。
+pub fn from_json(value: &Json) -> Option<Value> {
+    Some(match value {
+        Json::Null => return None,
+        Json::Bool(flag) => Value::from(*flag),
+        Json::Number(number) => match number.as_i64() {
+            Some(int) => Value::from(int),
+            None => Value::from(number.as_f64()?),
+        },
+        Json::String(text) => Value::from(text.as_str()),
+        Json::Array(items) => Value::Array(items.iter().map(from_json).collect::<Option<_>>()?),
+        Json::Object(map) => {
+            let mut table = InlineTable::new();
+            for (key, item) in map {
+                table.insert(key, from_json(item)?);
+            }
+            Value::InlineTable(table)
+        }
+    })
 }
 
 /// 原位改值：已有就沿用原来的空白和行尾注释，没有就追加到表末尾。

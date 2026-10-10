@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use crate::agent::{AgentKind, Connection, FileSetup, Mode, claude, codex, pi};
+use crate::agent::{AgentKind, Connection, FileSetup, Mode, claude, codex, grok, pi};
 use crate::apply::{ApplyError, PatchFor, Writer, writer};
 use crate::engine::{Engine, LiveFile};
 use crate::patch::PatchError;
@@ -158,7 +158,7 @@ fn source(home: &Path, agent: AgentKind) -> Result<Source, ApplyError> {
     let (read, setup): (Reader, SetupReader) = match agent {
         AgentKind::ClaudeCode => (claude::connection, claude::setup),
         AgentKind::Codex => (codex::connection, codex::setup),
-        AgentKind::GrokBuild => return Err(ApplyError::Unsupported { agent }),
+        AgentKind::GrokBuild => (grok::connection, grok::setup),
         AgentKind::Pi | AgentKind::Opencode => return Err(ApplyError::WrongMode { agent }),
     };
     let Writer { file, patch } = writer(home, agent)?;
@@ -323,7 +323,11 @@ mod tests {
     fn what_confdeck_switched_to_is_recognized() {
         let home = Home::new();
         let providers = [relay(), other()];
-        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+        for agent in [
+            AgentKind::ClaudeCode,
+            AgentKind::Codex,
+            AgentKind::GrokBuild,
+        ] {
             switch(&home.engine, home.path(), agent, Some(&providers[1])).unwrap();
             assert_eq!(
                 home.current(agent, &providers),
@@ -373,11 +377,16 @@ mod tests {
     fn the_same_address_with_another_key_is_a_key_mismatch() {
         let home = Home::new();
         let providers = [relay(), twin(), other()];
-        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+        for agent in [
+            AgentKind::ClaudeCode,
+            AgentKind::Codex,
+            AgentKind::GrokBuild,
+        ] {
             switch(&home.engine, home.path(), agent, Some(&providers[1])).unwrap();
             let relative = match agent {
                 AgentKind::ClaudeCode => ".claude/settings.json",
-                _ => ".codex/config.toml",
+                AgentKind::Codex => ".codex/config.toml",
+                _ => ".grok/config.toml",
             };
             home.edit(relative, |text| text.replace("sk-relay", "sk-rotated"));
             // 上次选的那家优先，不是列表里的第一家。
@@ -512,6 +521,43 @@ mod tests {
         );
         assert_eq!(
             home.current(AgentKind::Codex, &[draft]),
+            Current::Provider("moonshot".into())
+        );
+    }
+
+    #[test]
+    fn a_grok_model_table_is_saved_with_its_neighbours() {
+        let home = Home::new();
+        home.edit(".grok/config.toml", |_| {
+            "[models]\ndefault = \"kimi\"\n\n[model.kimi]\nmodel = \"kimi-k2\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-moon\"\n\n[model.kimi-fast]\nmodel = \"kimi-k2-turbo\"\nbase_url = \"https://api.moonshot.cn/v1\"\napi_key = \"sk-moon\"\n".into()
+        });
+        let draft = draft(&home.engine, home.path(), AgentKind::GrokBuild, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(draft.id, "moonshot");
+        assert_eq!(
+            draft.endpoint(Protocol::OpenaiChat),
+            Some("https://api.moonshot.cn/v1")
+        );
+        assert_eq!(draft.models.len(), 2);
+        assert_eq!(
+            home.current(AgentKind::GrokBuild, std::slice::from_ref(&draft)),
+            Current::Provider("moonshot".into())
+        );
+
+        // 切过去以后，用户自己的两张表还在，默认换成 confdeck 写的那张，连的还是同一个地址和 Key。
+        switch(
+            &home.engine,
+            home.path(),
+            AgentKind::GrokBuild,
+            Some(&draft),
+        )
+        .unwrap();
+        let text = fs::read_to_string(home.path().join(".grok/config.toml")).unwrap();
+        assert!(text.contains("default = \"confdeck-kimi-k2\""), "{text}");
+        assert!(text.contains("[model.kimi-fast]"), "{text}");
+        assert_eq!(
+            home.current(AgentKind::GrokBuild, &[draft]),
             Current::Provider("moonshot".into())
         );
     }
