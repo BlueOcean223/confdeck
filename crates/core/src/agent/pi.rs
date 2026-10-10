@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-use super::{AdaptError, AgentKind, choose_protocol, list_models};
+use super::{AdaptError, AgentKind, choose_protocol, list_models, merge_raw};
 use crate::engine::LiveFile;
 use crate::fsx::Mode;
 use crate::patch::json::{self, JsonPatch};
@@ -89,7 +89,7 @@ fn entry(provider: &Provider) -> Result<Value, AdaptError> {
 
     let mut entry = Value::Object(entry);
     if let Some(raw) = provider.override_for(AGENT).and_then(|o| o.raw.as_ref()) {
-        merge(&mut entry, raw);
+        merge_raw(&mut entry, raw);
     }
     Ok(entry)
 }
@@ -111,25 +111,6 @@ fn model(model: &Model) -> Value {
         out.insert("maxTokens".into(), json!(output));
     }
     Value::Object(out)
-}
-
-/// 深合并：对象逐键合并，`null` 删掉这个键，其余（含数组）整个替换。
-fn merge(target: &mut Value, raw: &Map<String, Value>) {
-    let Some(target) = target.as_object_mut() else {
-        return;
-    };
-    for (key, value) in raw {
-        match (target.get_mut(key), value) {
-            (_, Value::Null) => {
-                target.shift_remove(key);
-            }
-            (Some(existing @ Value::Object(_)), Value::Object(inner)) => merge(existing, inner),
-            (Some(existing), _) => *existing = value.clone(),
-            (None, _) => {
-                target.insert(key.clone(), value.clone());
-            }
-        }
-    }
 }
 
 /// 勾了哪几家：`providers` 下以 `confdeck-` 开头的项，返回供应商 id。多选 agent 以文件为准，不另记。
@@ -288,7 +269,7 @@ mod tests {
     fn merge_recurses_into_objects_and_replaces_arrays() {
         let mut target = json!({"a": {"x": 1, "y": 2}, "list": [1, 2]});
         let raw = json!({"a": {"y": 3, "x": null}, "list": [9]});
-        merge(&mut target, raw.as_object().unwrap());
+        merge_raw(&mut target, raw.as_object().unwrap());
         assert_eq!(target, json!({"a": {"y": 3}, "list": [9]}));
     }
 }

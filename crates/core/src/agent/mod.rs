@@ -6,6 +6,7 @@
 pub mod claude;
 pub mod codex;
 pub mod grok;
+pub mod opencode;
 pub mod pi;
 pub mod slots;
 
@@ -13,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::provider::{AgentOverride, Model, Protocol, Provider};
 
@@ -266,6 +268,26 @@ fn resolve<'a>(provider: &'a Provider, id: &str) -> Result<&'a Model, AdaptError
         provider: provider.name.clone(),
         model: id.to_string(),
     })
+}
+
+/// 把原始片段深合并进生成的那一节（JSON 写法的 agent）：对象逐键合并，`null` 删掉这个键，
+/// 其余（含数组）整个替换。
+pub(crate) fn merge_raw(target: &mut Value, raw: &Map<String, Value>) {
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    for (key, value) in raw {
+        match (target.get_mut(key), value) {
+            (_, Value::Null) => {
+                target.shift_remove(key);
+            }
+            (Some(existing @ Value::Object(_)), Value::Object(inner)) => merge_raw(existing, inner),
+            (Some(existing), _) => *existing = value.clone(),
+            (None, _) => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 /// 第三方地址必须有 Key（见 [`AdaptError::MissingKey`]）。

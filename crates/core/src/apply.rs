@@ -3,11 +3,10 @@
 //! 单选 agent 用 [`switch`]（`None` 是「默认」）；多选 agent 用 [`enable`] / [`disable`]，
 //! 勾一下写一次。改了供应商用 [`save_provider`]：存好以后把改动写进所有在用它的 agent；
 //! 删掉用 [`delete_provider`]，之前用 [`used_by`] 列出在用的 agent 请用户确认。
-//! OpenCode 的适配器还没做，调用会报 [`ApplyError::Unsupported`]。
 
 use std::path::{Path, PathBuf};
 
-use crate::agent::{AdaptError, AgentKind, Mode, claude, codex, grok, pi};
+use crate::agent::{AdaptError, AgentKind, Mode, claude, codex, grok, opencode, pi};
 use crate::current::{self, Current};
 use crate::engine::{Engine, EngineError, LiveFile, Outcome};
 use crate::fsx;
@@ -24,8 +23,6 @@ pub enum ApplyError {
     /// 读 agent 的配置文件时解析不了（认当前是哪家时）。
     #[error(transparent)]
     Parse(#[from] PatchError),
-    #[error("{agent} 的适配器还没做")]
-    Unsupported { agent: AgentKind },
     #[error("{agent} 是{}，不能这样写", mode_name(*.agent))]
     WrongMode { agent: AgentKind },
 }
@@ -44,7 +41,7 @@ pub fn live_files(home: &Path, agent: AgentKind) -> Vec<LiveFile> {
         AgentKind::Codex => vec![codex::live_file(home)],
         AgentKind::Pi => vec![pi::live_file(home)],
         AgentKind::GrokBuild => vec![grok::live_file(home)],
-        AgentKind::Opencode => Vec::new(),
+        AgentKind::Opencode => vec![opencode::live_file(home)],
     }
 }
 
@@ -89,7 +86,9 @@ pub fn enable(
 ) -> Result<Outcome, ApplyError> {
     match agent {
         AgentKind::Pi => Ok(engine.write(&pi::live_file(home), &pi::add(provider)?)?),
-        AgentKind::Opencode => Err(ApplyError::Unsupported { agent }),
+        AgentKind::Opencode => {
+            Ok(engine.write(&opencode::live_file(home), &opencode::add(provider)?)?)
+        }
         _ => Err(ApplyError::WrongMode { agent }),
     }
 }
@@ -103,7 +102,9 @@ pub fn disable(
 ) -> Result<Outcome, ApplyError> {
     match agent {
         AgentKind::Pi => Ok(engine.write(&pi::live_file(home), &pi::remove(provider_id))?),
-        AgentKind::Opencode => Err(ApplyError::Unsupported { agent }),
+        AgentKind::Opencode => {
+            Ok(engine.write(&opencode::live_file(home), &opencode::remove(provider_id))?)
+        }
         _ => Err(ApplyError::WrongMode { agent }),
     }
 }
@@ -147,7 +148,10 @@ pub(crate) fn writer(home: &Path, agent: AgentKind) -> Result<Writer, ApplyError
             pi::live_file(home),
             Box::new(|provider| Ok(Box::new(pi::add(provider)?))),
         ),
-        AgentKind::Opencode => return Err(ApplyError::Unsupported { agent }),
+        AgentKind::Opencode => (
+            opencode::live_file(home),
+            Box::new(|provider| Ok(Box::new(opencode::add(provider)?))),
+        ),
     };
     Ok(Writer { file, patch })
 }
@@ -271,7 +275,7 @@ pub fn delete_provider(
     Ok(synced)
 }
 
-/// 逐个 agent 看在不在用 `id` 这家。还没有适配器的 agent 跳过。
+/// 逐个 agent 看在不在用 `id` 这家。
 fn scan(
     engine: &Engine,
     home: &Path,
@@ -505,7 +509,7 @@ mod tests {
             self.write(relative, &serde_json::to_string_pretty(&value).unwrap());
         }
 
-        /// 单选 agent 切到 `providers[0]`，Pi 勾上全部。
+        /// 单选 agent 切到 `providers[0]`，多选 agent 勾上全部。
         fn use_everywhere(&self, providers: &[Provider]) {
             store::save(&self.engine, providers).unwrap();
             for agent in [
@@ -516,7 +520,9 @@ mod tests {
                 switch(&self.engine, self.path(), agent, Some(&providers[0])).unwrap();
             }
             for provider in providers {
-                enable(&self.engine, self.path(), AgentKind::Pi, provider).unwrap();
+                for agent in [AgentKind::Pi, AgentKind::Opencode] {
+                    enable(&self.engine, self.path(), agent, provider).unwrap();
+                }
             }
         }
 
@@ -572,7 +578,8 @@ mod tests {
                 AgentKind::ClaudeCode,
                 AgentKind::Codex,
                 AgentKind::Pi,
-                AgentKind::GrokBuild
+                AgentKind::GrokBuild,
+                AgentKind::Opencode
             ]
         );
         assert_eq!(synced[0].path, home.path().join(".claude/settings.json"));
@@ -604,6 +611,15 @@ mod tests {
         assert!(grok.contains("default = \"confdeck-glm-4.5-air\""));
         let pi = home.json(".pi/agent/models.json");
         assert_eq!(pi["providers"]["confdeck-relay"]["apiKey"], "sk-new");
+        let opencode = home.json(".config/opencode/opencode.json");
+        assert_eq!(
+            opencode["provider"]["confdeck-relay"]["options"]["apiKey"],
+            "sk-new"
+        );
+        assert_eq!(
+            opencode["provider"]["confdeck-other"]["options"]["apiKey"],
+            "sk-other"
+        );
         assert_eq!(pi["providers"]["confdeck-other"]["apiKey"], "sk-other");
 
         let saved = store::load(home.engine.data()).unwrap();
@@ -634,7 +650,7 @@ mod tests {
         ]
         .into();
         let synced = home.save(&providers, &moved);
-        assert_eq!(synced.len(), 4);
+        assert_eq!(synced.len(), 5);
         assert_eq!(
             home.json(".claude/settings.json")["env"]["ANTHROPIC_BASE_URL"],
             "https://moved.example"
@@ -697,7 +713,7 @@ mod tests {
         let mut renamed = relay();
         renamed.name = "Relay Pro".into();
         let synced = home.save(&providers, &renamed);
-        assert_eq!(synced.len(), 4);
+        assert_eq!(synced.len(), 5);
         assert!(!outcome(&synced, AgentKind::ClaudeCode).changed);
         assert!(outcome(&synced, AgentKind::Codex).changed);
         assert!(outcome(&synced, AgentKind::Pi).changed);
@@ -732,7 +748,8 @@ mod tests {
                 AgentKind::ClaudeCode,
                 AgentKind::Codex,
                 AgentKind::Pi,
-                AgentKind::GrokBuild
+                AgentKind::GrokBuild,
+                AgentKind::Opencode
             ]
         );
         assert!(matches!(
@@ -800,7 +817,12 @@ mod tests {
         let synced = home.save(&providers, &adopted);
         assert_eq!(
             agents(&synced),
-            [AgentKind::Codex, AgentKind::Pi, AgentKind::GrokBuild]
+            [
+                AgentKind::Codex,
+                AgentKind::Pi,
+                AgentKind::GrokBuild,
+                AgentKind::Opencode
+            ]
         );
         assert!(
             home.read(".codex/config.toml")
@@ -826,20 +848,24 @@ mod tests {
                 AgentKind::ClaudeCode,
                 AgentKind::Codex,
                 AgentKind::Pi,
-                AgentKind::GrokBuild
+                AgentKind::GrokBuild,
+                AgentKind::Opencode
             ]
         );
         assert!(used.unknown.is_empty());
         let used = used_by(&home.engine, home.path(), &providers, "other");
-        assert_eq!(used.agents, [AgentKind::Pi]);
+        assert_eq!(used.agents, [AgentKind::Pi, AgentKind::Opencode]);
 
         let synced = delete_provider(&home.engine, home.path(), &providers, "relay").unwrap();
-        assert_eq!(agents(&synced), [AgentKind::Pi]);
+        assert_eq!(agents(&synced), [AgentKind::Pi, AgentKind::Opencode]);
         assert!(outcome(&synced, AgentKind::Pi).changed);
         assert_eq!(store::load(home.engine.data()).unwrap(), [other()]);
         assert_eq!(home.read(".claude/settings.json"), claude);
         let pi = home.json(".pi/agent/models.json");
         assert!(pi["providers"].get("confdeck-relay").is_none());
+        let opencode = home.json(".config/opencode/opencode.json");
+        assert!(opencode["provider"].get("confdeck-relay").is_none());
+        assert!(opencode["provider"]["confdeck-other"].is_object());
         assert!(pi["providers"]["confdeck-other"].is_object());
         // Claude Code 还连着原来的地址，现在认作「自定义」。
         assert_eq!(
@@ -869,20 +895,21 @@ mod tests {
             [
                 AgentKind::ClaudeCode,
                 AgentKind::Codex,
-                AgentKind::GrokBuild
+                AgentKind::GrokBuild,
+                AgentKind::Opencode
             ]
         );
         assert_eq!(used.unknown.len(), 1);
         assert_eq!(used.unknown[0].0, AgentKind::Pi);
 
         let synced = delete_provider(&home.engine, home.path(), &providers, "relay").unwrap();
-        assert_eq!(agents(&synced), [AgentKind::Pi]);
+        assert_eq!(agents(&synced), [AgentKind::Pi, AgentKind::Opencode]);
         assert!(matches!(synced[0].result, Err(ApplyError::Parse(_))));
         assert!(store::load(home.engine.data()).unwrap().is_empty());
     }
 
     #[test]
-    fn modes_and_missing_adapters_are_reported() {
+    fn modes_are_reported() {
         let home = Home::new();
         let provider = relay();
         assert!(matches!(
@@ -892,10 +919,6 @@ mod tests {
         assert!(matches!(
             enable(&home.engine, home.path(), AgentKind::ClaudeCode, &provider),
             Err(ApplyError::WrongMode { .. })
-        ));
-        assert!(matches!(
-            enable(&home.engine, home.path(), AgentKind::Opencode, &provider),
-            Err(ApplyError::Unsupported { .. })
         ));
         let err = switch(&home.engine, home.path(), AgentKind::Opencode, None).unwrap_err();
         assert_eq!(err.to_string(), "OpenCode 是多选 agent，不能这样写");

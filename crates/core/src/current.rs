@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use crate::agent::{AgentKind, Connection, FileSetup, Mode, claude, codex, grok, pi};
+use crate::agent::{AgentKind, Connection, FileSetup, claude, codex, grok, opencode, pi};
 use crate::apply::{ApplyError, PatchFor, Writer, writer};
 use crate::engine::{Engine, LiveFile};
 use crate::patch::PatchError;
@@ -153,6 +153,7 @@ struct Source {
 
 type Reader = fn(&Path, Option<&[u8]>) -> Result<Connection, PatchError>;
 type SetupReader = fn(&Path, Option<&[u8]>) -> Result<Option<FileSetup>, PatchError>;
+type EnabledReader = fn(&Path, Option<&[u8]>) -> Result<Vec<String>, PatchError>;
 
 fn source(home: &Path, agent: AgentKind) -> Result<Source, ApplyError> {
     let (read, setup): (Reader, SetupReader) = match agent {
@@ -238,16 +239,15 @@ fn id_from_host(host: &str, taken: &[Provider]) -> String {
 
 /// 多选 agent 勾了哪几家（供应商 id，按文件里的顺序）。
 pub fn enabled(engine: &Engine, home: &Path, agent: AgentKind) -> Result<Vec<String>, ApplyError> {
-    match agent {
-        AgentKind::Pi => {
-            let file = pi::live_file(home);
-            let snapshot = engine.read(&file)?;
-            Ok(pi::enabled(&file.path, snapshot.bytes.as_deref())?)
+    let (file, read): (LiveFile, EnabledReader) = match agent {
+        AgentKind::Pi => (pi::live_file(home), pi::enabled),
+        AgentKind::Opencode => (opencode::live_file(home), opencode::enabled),
+        AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::GrokBuild => {
+            return Err(ApplyError::WrongMode { agent });
         }
-        AgentKind::Opencode => Err(ApplyError::Unsupported { agent }),
-        _ if agent.mode() == Mode::Switch => Err(ApplyError::WrongMode { agent }),
-        _ => Err(ApplyError::Unsupported { agent }),
-    }
+    };
+    let snapshot = engine.read(&file)?;
+    Ok(read(&file.path, snapshot.bytes.as_deref())?)
 }
 
 #[cfg(test)]
