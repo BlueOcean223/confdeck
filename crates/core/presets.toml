@@ -1,0 +1,297 @@
+# 内置的供应商预设，编进程序里（`crate::preset`）。
+#
+# 每家一项：地址、模型目录、给各 agent 的推荐值（`agents.<agent>`）。用预设新建供应商时，地址和模型目录照抄进去，
+# 推荐值不抄、写配置文件时现查，排在用户的覆盖和自动之间。推荐值只写和自动结果不一样的：
+# 自动的规则是协议按 agent 的偏好顺序、槽位强的取最强的（档位高、打星的在前）快的取快速档、列表取打星的、默认取最强的。
+#
+# 数据来源：ccs-lite（BlueOcean223/cc-switch）各 agent 的预设，它们 2026-08～10 对着官方文档核对过、不少用真 Key 试过；
+# 模型的上下文、档位优先取它的 Codex 预设（照抄各家官方的 Codex 模型目录）。各家的出处写在注释里。
+
+# DeepSeek 开放平台。三种协议都有：Anthropic 在 /anthropic 子路径，Chat 在 /v1，
+# Responses 直接挂在根上（官方 Codex 文档 api-docs.deepseek.com → agent_integrations/codex，ccs-lite 2026-08-15 复核）。
+[[presets]]
+id = "deepseek"
+name = "DeepSeek"
+website = "https://platform.deepseek.com"
+key_url = "https://platform.deepseek.com/api_keys"
+
+[presets.endpoints]
+anthropic = "https://api.deepseek.com/anthropic"
+openai-chat = "https://api.deepseek.com/v1"
+openai-responses = "https://api.deepseek.com"
+
+[[presets.models]]
+id = "deepseek-v4-pro"
+name = "DeepSeek V4 Pro"
+star = true
+tier = "flagship"
+context = 1048576
+output = 384000
+input = ["text"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "deepseek-flash"
+name = "DeepSeek V4.1 Flash"
+star = true
+tier = "fast"
+context = 1048576
+output = 384000
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+# 官方 Codex 文档推荐 deepseek-flash。
+[presets.agents.codex]
+default_model = "deepseek-flash"
+
+# Kimi 开放平台（按量）。Responses 和 Chat 同一个地址（platform.kimi.com/docs/guide/codex-kimi.md）；
+# Claude Code 主模型 K3、Haiku 用 K2.7 Code（platform.kimi.com/docs/guide/claude-code-kimi，2026-10），和自动填的一样。
+[[presets]]
+id = "kimi"
+name = "Kimi"
+website = "https://platform.kimi.com"
+key_url = "https://platform.kimi.com/console/api-keys"
+
+[presets.endpoints]
+anthropic = "https://api.moonshot.cn/anthropic"
+openai-chat = "https://api.moonshot.cn/v1"
+openai-responses = "https://api.moonshot.cn/v1"
+
+[[presets.models]]
+id = "kimi-k3"
+name = "Kimi K3"
+star = true
+tier = "flagship"
+context = 1048576
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "kimi-k2.7-code"
+name = "Kimi K2.7 Code"
+star = true
+tier = "fast"
+context = 262144
+output = 262144
+input = ["text", "image"]
+reasoning = ["high"]
+
+[[presets.models]]
+id = "kimi-k2.7-code-highspeed"
+name = "Kimi K2.7 Code HighSpeed"
+tier = "fast"
+context = 262144
+output = 262144
+input = ["text", "image"]
+reasoning = ["high"]
+
+# Kimi For Coding（会员订阅）。Responses 在 /coding/v1（kimi.com/code/docs/third-party-tools/codex.html），
+# Chat 同一个地址（ccs-lite 的 OpenClaw 预设），Anthropic 在 /coding。
+# 官方 Claude Code 配置所有槽位都用 kimi-for-coding；Pi、OpenCode 走 Anthropic（ccs-lite 的这两个预设都这么配）。
+[[presets]]
+id = "kimi-coding"
+name = "Kimi For Coding"
+website = "https://www.kimi.com/code/"
+key_url = "https://www.kimi.com/code/console"
+
+[presets.endpoints]
+anthropic = "https://api.kimi.com/coding"
+openai-chat = "https://api.kimi.com/coding/v1"
+openai-responses = "https://api.kimi.com/coding/v1"
+
+# 2026-09-15 起是 K2.8 Preview，最高 1M 上下文（官方 Codex 指南）；输出上限取 ccs-lite Pi 预设的 32768。
+[[presets.models]]
+id = "kimi-for-coding"
+name = "Kimi For Coding"
+star = true
+tier = "flagship"
+context = 1048576
+output = 32768
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "kimi-for-coding-highspeed"
+name = "Kimi For Coding HighSpeed"
+tier = "fast"
+context = 262144
+reasoning = ["high"]
+
+# K3 的 1M 上下文要看会员档位，k3-256k 固定 256K。
+[[presets.models]]
+id = "k3"
+name = "Kimi K3"
+tier = "flagship"
+context = 1048576
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "k3-256k"
+name = "Kimi K3 256K"
+tier = "flagship"
+context = 262144
+reasoning = ["low", "high", "max"]
+
+[presets.agents.claude-code.slots]
+haiku = "kimi-for-coding"
+subagent = "kimi-for-coding"
+
+[presets.agents.pi]
+protocol = "anthropic"
+
+[presets.agents.opencode]
+protocol = "anthropic"
+
+# 智谱 BigModel 开放平台（按量）。Anthropic 和 Responses 地址和 GLM Coding Plan 共用，Chat 地址不同
+# （docs.bigmodel.cn 的《Claude API 兼容》《Response API 兼容》《OpenAI API 兼容》，2026-09-23～10-09）。
+# Claude Code 官方配置：Opus、Sonnet 用 glm-5.3，Haiku 用 glm-5.3-flash（coding-plan/tool/claude，2026-10），和自动填的一样。
+[[presets]]
+id = "zhipu"
+name = "智谱 GLM"
+website = "https://open.bigmodel.cn"
+key_url = "https://bigmodel.cn/usercenter/proj-mgmt/apikeys"
+
+[presets.endpoints]
+anthropic = "https://open.bigmodel.cn/api/anthropic"
+openai-chat = "https://open.bigmodel.cn/api/paas/v4"
+openai-responses = "https://open.bigmodel.cn/api/v1"
+
+[[presets.models]]
+id = "glm-5.3"
+name = "GLM-5.3"
+star = true
+tier = "flagship"
+context = 1048576
+output = 131072
+input = ["text"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "glm-5.3-flash"
+name = "GLM-5.3-Flash"
+star = true
+tier = "fast"
+context = 1048576
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+# 智谱 GLM Coding Plan。Chat 走 /api/coding/paas/v4，配错了不扣套餐额度（docs.bigmodel.cn/cn/coding-plan/tool/others）。
+# 模型目录照官方 Codex models.json（ccs-lite 2026-09-04 核对，glm-5.3-flash 09-26 补上）。
+[[presets]]
+id = "zhipu-coding"
+name = "智谱 GLM Coding Plan"
+website = "https://open.bigmodel.cn"
+key_url = "https://bigmodel.cn/coding-plan/personal/overview"
+
+[presets.endpoints]
+anthropic = "https://open.bigmodel.cn/api/anthropic"
+openai-chat = "https://open.bigmodel.cn/api/coding/paas/v4"
+openai-responses = "https://open.bigmodel.cn/api/v1"
+
+[[presets.models]]
+id = "glm-5.3"
+name = "GLM-5.3"
+star = true
+tier = "flagship"
+context = 1048576
+output = 131072
+input = ["text"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "glm-5.3-flash"
+name = "GLM-5.3-Flash"
+star = true
+tier = "fast"
+context = 1048576
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "glm-5-turbo"
+name = "GLM-5-Turbo"
+tier = "balanced"
+context = 204800
+input = ["text"]
+reasoning = ["max"]
+
+# OpenRouter。Claude 模型走 Anthropic 协议（ccs-lite 的 Pi、OpenCode 预设都这么配）；主模型用 Sonnet（ccs-lite 的 Claude Code 预设）。
+# Codex 默认用 GPT、Grok 默认用 Grok（ccs-lite 的 Codex、Grok Build 预设，2026-10-07 对过 OpenRouter 的模型列表），
+# 这两个不打星，Pi、OpenCode 只列 Claude 的。推理档位按 OpenRouter 统一的 reasoning.effort（low / medium / high）。
+[[presets]]
+id = "openrouter"
+name = "OpenRouter"
+website = "https://openrouter.ai"
+key_url = "https://openrouter.ai/keys"
+
+[presets.endpoints]
+anthropic = "https://openrouter.ai/api"
+openai-chat = "https://openrouter.ai/api/v1"
+openai-responses = "https://openrouter.ai/api/v1"
+
+[[presets.models]]
+id = "anthropic/claude-opus-5.5"
+name = "Claude Opus 5.5"
+star = true
+tier = "flagship"
+context = 1000000
+output = 128000
+input = ["text", "image"]
+reasoning = ["low", "medium", "high"]
+
+[[presets.models]]
+id = "anthropic/claude-sonnet-5.5"
+name = "Claude Sonnet 5.5"
+star = true
+tier = "balanced"
+context = 1000000
+output = 128000
+input = ["text", "image"]
+reasoning = ["low", "medium", "high"]
+
+[[presets.models]]
+id = "anthropic/claude-haiku-5.5"
+name = "Claude Haiku 5.5"
+star = true
+tier = "fast"
+context = 1000000
+output = 128000
+input = ["text", "image"]
+reasoning = ["low", "medium", "high"]
+
+[[presets.models]]
+id = "anthropic/claude-fable-5.1"
+name = "Claude Fable 5.1"
+tier = "flagship"
+context = 1000000
+output = 128000
+input = ["text", "image"]
+reasoning = ["low", "medium", "high"]
+
+[[presets.models]]
+id = "openai/gpt-6.1-sol"
+tier = "flagship"
+
+[[presets.models]]
+id = "x-ai/grok-4.7"
+tier = "flagship"
+
+[presets.agents.claude-code.slots]
+main = "anthropic/claude-sonnet-5.5"
+sonnet = "anthropic/claude-sonnet-5.5"
+fable = "anthropic/claude-fable-5.1"
+
+[presets.agents.codex]
+default_model = "openai/gpt-6.1-sol"
+
+[presets.agents.grok-build]
+default_model = "x-ai/grok-4.7"
+
+[presets.agents.pi]
+protocol = "anthropic"
+
+[presets.agents.opencode]
+protocol = "anthropic"

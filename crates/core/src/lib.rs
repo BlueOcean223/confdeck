@@ -3,6 +3,7 @@
 //! 这个 crate 不依赖任何 UI 框架。
 //!
 //! - [`provider`]：供应商、模型目录、每个 agent 的覆盖。
+//! - [`preset`]：内置的常用供应商：地址、模型目录、给各 agent 的推荐值。
 //! - [`store`]：confdeck 自己的数据文件 `~/.confdeck/providers.json`。
 //! - [`agent`]：适配器，把供应商翻译成某个 agent 的配置补丁，只在内存里算。
 //! - [`patch`]：按键补丁，只改点名的键，文件里其余内容原样保留。
@@ -23,5 +24,6 @@ pub mod data;
 pub mod engine;
 pub mod fsx;
 pub mod patch;
+pub mod preset;
 pub mod provider;
 pub mod store;

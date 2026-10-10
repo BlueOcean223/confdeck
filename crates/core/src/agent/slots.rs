@@ -1,13 +1,13 @@
 //! 槽位型 agent（Claude Code 等）怎么从目录里给每个槽位挑模型。
 //!
-//! 用户填的 > 预设 > 按强弱档自动填：强槽位用最强的，快槽位用快速档；没标档位就全填同一个。
-//! 预设还没做，现在是两层。
+//! 用户填的 > 预设推荐的 > 按强弱档自动填：强槽位用最强的，快槽位用快速档；没标档位就全填同一个。
+//! 推荐的模型不在目录里了就当没推荐。
 
 use std::collections::BTreeMap;
 
 use crate::provider::{Model, Provider, Tier};
 
-use super::{AdaptError, AgentKind};
+use super::{AdaptError, AgentKind, recommended};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strength {
@@ -53,7 +53,7 @@ fn tier_rank(tier: Option<Tier>) -> u8 {
 
 /// 给槽位填模型，按 `slots` 的顺序返回（槽位，模型 id）。
 ///
-/// `auto` 为假时只返回用户填了的槽位（连 Anthropic 官方时就是这样）。
+/// `auto` 为假时只返回用户填了的槽位（连 Anthropic 官方时就是这样），预设推荐的也不用。
 pub fn fill<'a>(
     provider: &'a Provider,
     agent: AgentKind,
@@ -62,6 +62,7 @@ pub fn fill<'a>(
 ) -> Result<Vec<(Slot, &'a str)>, AdaptError> {
     let none = BTreeMap::new();
     let chosen = provider.override_for(agent).map_or(&none, |o| &o.slots);
+    let suggested = recommended(provider, agent).map_or(&none, |r| &r.slots);
     for key in chosen.keys() {
         if !slots.iter().any(|slot| slot.key == key) {
             return Err(AdaptError::UnknownSlot {
@@ -86,11 +87,14 @@ pub fn fill<'a>(
                 provider: provider.name.clone(),
                 model: id.clone(),
             })?,
-            None if auto => match slot.strength {
-                Strength::Strong => strongest(&catalog),
-                Strength::Fast => fastest(&catalog),
-            }
-            .expect("catalog is not empty"),
+            None if auto => suggested
+                .get(slot.key)
+                .and_then(|id| provider.model(id))
+                .or_else(|| match slot.strength {
+                    Strength::Strong => strongest(&catalog),
+                    Strength::Fast => fastest(&catalog),
+                })
+                .expect("catalog is not empty"),
             None => continue,
         };
         filled.push((slot, model.id.as_str()));
@@ -101,6 +105,8 @@ pub fn fill<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::claude;
+    use crate::preset;
     use crate::provider::AgentOverride;
     use crate::provider::tests::relay;
 
@@ -174,6 +180,46 @@ mod tests {
             fill(&provider, AgentKind::ClaudeCode, SLOTS, true),
             Err(AdaptError::UnknownSlot { .. })
         ));
+    }
+
+    #[test]
+    fn preset_slots_sit_between_the_users_and_the_automatic_ones() {
+        let slots: Vec<Slot> = claude::SLOTS.iter().map(|(slot, _)| *slot).collect();
+        let provider = preset::get("kimi-coding")
+            .unwrap()
+            .provider("kimi-coding", "sk");
+        // 自动会给快槽位挑 HighSpeed；官方配置所有槽位都用 kimi-for-coding。
+        let filled = fill(&provider, AgentKind::ClaudeCode, &slots, true).unwrap();
+        assert!(
+            ids(&filled).iter().all(|(_, id)| id == "kimi-for-coding"),
+            "{filled:?}"
+        );
+
+        let mut chosen = provider.clone();
+        chosen.overrides.insert(
+            AgentKind::ClaudeCode,
+            AgentOverride {
+                slots: [("haiku".into(), "kimi-for-coding-highspeed".into())].into(),
+                ..AgentOverride::default()
+            },
+        );
+        let filled = ids(&fill(&chosen, AgentKind::ClaudeCode, &slots, true).unwrap());
+        assert!(filled.contains(&("haiku", "kimi-for-coding-highspeed".into())));
+        assert!(filled.contains(&("subagent", "kimi-for-coding".into())));
+
+        // 推荐的模型被删了：按档位自动填。
+        let mut removed = provider.clone();
+        removed.models.retain(|model| model.id != "kimi-for-coding");
+        let filled = ids(&fill(&removed, AgentKind::ClaudeCode, &slots, true).unwrap());
+        assert!(filled.contains(&("main", "k3".into())));
+        assert!(filled.contains(&("haiku", "kimi-for-coding-highspeed".into())));
+
+        // 不自动填的时候，推荐的也不用。
+        assert!(
+            fill(&provider, AgentKind::ClaudeCode, &slots, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

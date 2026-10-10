@@ -16,6 +16,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::preset::{self, Recommended};
 use crate::provider::{AgentOverride, Model, Protocol, Provider};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -200,9 +201,12 @@ fn override_of(provider: &Provider, agent: AgentKind) -> Option<&AgentOverride> 
     provider.override_for(agent)
 }
 
-/// 用哪种协议：用户覆盖的 > agent 偏好顺序里这家提供的第一种。返回协议和地址。
-///
-/// 预设推荐的协议排在两者之间，等预设做了再加。
+/// 供应商的预设给这个 agent 的推荐值，见 [`crate::preset`]。
+pub(crate) fn recommended(provider: &Provider, agent: AgentKind) -> Option<&'static Recommended> {
+    preset::get(provider.preset.as_deref()?)?.recommended(agent)
+}
+
+/// 用哪种协议：用户覆盖的 > 预设推荐的 > agent 偏好顺序里这家提供的第一种。返回协议和地址。
 pub fn choose_protocol(
     provider: &Provider,
     agent: AgentKind,
@@ -222,6 +226,12 @@ pub fn choose_protocol(
             .endpoint(protocol)
             .map(|url| (protocol, url))
             .ok_or_else(incompatible);
+    }
+    if let Some(protocol) = recommended(provider, agent).and_then(|r| r.protocol)
+        && supported.contains(&protocol)
+        && let Some(url) = provider.endpoint(protocol)
+    {
+        return Ok((protocol, url));
     }
     supported
         .iter()
@@ -254,10 +264,16 @@ pub fn list_models(provider: &Provider, agent: AgentKind) -> Result<Vec<&Model>,
     Ok(chosen)
 }
 
-/// 默认模型：用户覆盖的 > 列表里最强的。
+/// 默认模型：用户覆盖的 > 预设推荐的（目录里还有的）> 列表里最强的。
 pub fn default_model(provider: &Provider, agent: AgentKind) -> Result<&Model, AdaptError> {
     if let Some(id) = override_of(provider, agent).and_then(|o| o.default_model.as_ref()) {
         return resolve(provider, id);
+    }
+    if let Some(model) = recommended(provider, agent)
+        .and_then(|r| r.default_model.as_deref())
+        .and_then(|id| provider.model(id))
+    {
+        return Ok(model);
     }
     let list = list_models(provider, agent)?;
     Ok(slots::strongest(&list).expect("list_models never returns an empty list"))
@@ -420,6 +436,79 @@ mod tests {
             list_models(&empty, AgentKind::Pi),
             Err(AdaptError::NoModels { .. })
         ));
+    }
+
+    fn from_preset(id: &str) -> Provider {
+        preset::get(id).unwrap().provider(id, "sk-test")
+    }
+
+    #[test]
+    fn the_preset_protocol_sits_between_the_override_and_the_preference() {
+        // Kimi For Coding：Pi 偏好 Chat，预设推荐 Anthropic。
+        let provider = from_preset("kimi-coding");
+        assert_eq!(
+            choose_protocol(&provider, AgentKind::Pi).unwrap(),
+            (Protocol::Anthropic, "https://api.kimi.com/coding")
+        );
+
+        let mut chosen = provider.clone();
+        chosen.overrides.insert(
+            AgentKind::Pi,
+            AgentOverride {
+                protocol: Some(Protocol::OpenaiChat),
+                ..AgentOverride::default()
+            },
+        );
+        assert_eq!(
+            choose_protocol(&chosen, AgentKind::Pi).unwrap().0,
+            Protocol::OpenaiChat
+        );
+
+        // 用户删了 Anthropic 地址，或者预设不认识（新版本加的、改名了的）：按偏好来，不报错。
+        let mut removed = provider.clone();
+        removed.endpoints.remove(&Protocol::Anthropic);
+        let mut unknown = provider;
+        unknown.preset = Some("gone".into());
+        for provider in [removed, unknown] {
+            assert_eq!(
+                choose_protocol(&provider, AgentKind::Pi).unwrap().0,
+                Protocol::OpenaiChat
+            );
+        }
+    }
+
+    #[test]
+    fn the_preset_default_model_sits_between_the_override_and_the_strongest() {
+        let provider = from_preset("deepseek");
+        assert_eq!(
+            default_model(&provider, AgentKind::Codex).unwrap().id,
+            "deepseek-flash"
+        );
+        // 没给 Grok 推荐：取最强的。
+        assert_eq!(
+            default_model(&provider, AgentKind::GrokBuild).unwrap().id,
+            "deepseek-v4-pro"
+        );
+
+        let mut chosen = provider.clone();
+        chosen.overrides.insert(
+            AgentKind::Codex,
+            AgentOverride {
+                default_model: Some("deepseek-v4-pro".into()),
+                ..AgentOverride::default()
+            },
+        );
+        assert_eq!(
+            default_model(&chosen, AgentKind::Codex).unwrap().id,
+            "deepseek-v4-pro"
+        );
+
+        let mut removed = provider;
+        removed.models.retain(|model| model.id != "deepseek-flash");
+        assert_eq!(
+            default_model(&removed, AgentKind::Codex).unwrap().id,
+            "deepseek-v4-pro"
+        );
     }
 
     #[test]

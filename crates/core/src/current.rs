@@ -19,6 +19,7 @@ use crate::agent::{AgentKind, Connection, FileSetup, claude, codex, grok, openco
 use crate::apply::{ApplyError, PatchFor, Writer, writer};
 use crate::engine::{Engine, LiveFile};
 use crate::patch::PatchError;
+use crate::preset;
 use crate::provider::{self, AgentOverride, Model, Provider};
 
 /// 单选 agent 现在用的是哪家。
@@ -93,8 +94,10 @@ pub fn connection(
 /// 「把当前配置存成供应商」：从单选 agent 的配置文件里读出地址、Key 和模型，拼成一家新供应商，
 /// 给新建供应商的表单预先填好，不保存。
 ///
-/// ID 从主机名起（`api.deepseek.com` → `deepseek`），和 `providers` 重复时加 `-2`、`-3`；
-/// 名字是主机名。槽位型 agent 的槽位、列表型 agent 的默认模型写进这个 agent 的覆盖，
+/// 地址是某个内置预设的（[`preset::matching`]）：名字、各协议的地址、模型目录照预设，记下预设，
+/// ID 用预设的；文件里有、目录里没有的模型补在目录后面。这样存好就能给别的 agent 用。
+/// 认不出预设时，ID 从主机名起（`api.example.com` → `example`），名字是主机名，只有文件里这一个地址。
+/// ID 和 `providers` 重复时加 `-2`、`-3`。槽位型 agent 的槽位、列表型 agent 的默认模型写进这个 agent 的覆盖，
 /// 存好后再切换，文件里写了的槽位不变，没写的按目录补上。
 /// 文件里读不到 Key（`apiKeyHelper`、`env_key`）时 Key 留空。
 /// 文件连的不是一个地址（「默认」、Bedrock 等）时为 `None`。
@@ -117,25 +120,31 @@ pub fn draft(
         slots: setup.slots,
         ..AgentOverride::default()
     };
-    let mut draft = Provider {
-        id: id_from_host(&host, providers),
-        name: if host.is_empty() {
-            setup.base_url.clone()
-        } else {
-            host
+    let key = setup.key.unwrap_or_default();
+    let mut draft = match preset::matching(setup.protocol, &setup.base_url) {
+        Some(preset) => preset.provider(&unique_id(&preset.id, providers), &key),
+        None => Provider {
+            id: unique_id(&id_base(&host), providers),
+            name: if host.is_empty() {
+                setup.base_url.clone()
+            } else {
+                host
+            },
+            preset: None,
+            key,
+            endpoints: [(setup.protocol, setup.base_url)].into(),
+            models: Vec::new(),
+            overrides: Default::default(),
         },
-        key: setup.key.unwrap_or_default(),
-        endpoints: [(setup.protocol, setup.base_url)].into(),
-        models: setup
-            .models
-            .into_iter()
-            .map(|id| Model {
+    };
+    for id in setup.models {
+        if draft.model(&id).is_none() {
+            draft.models.push(Model {
                 id,
                 ..Model::default()
-            })
-            .collect(),
-        overrides: Default::default(),
-    };
+            });
+        }
+    }
     if overrides != AgentOverride::default() {
         draft.overrides.insert(agent, overrides);
     }
@@ -201,7 +210,7 @@ fn identify(live: &Connection, candidates: &[Candidate], record: Option<&str>) -
 
 /// 从主机名起一个供应商 ID：去掉开头的 `api.`、`www.` 和末尾的顶级域名，其余的点换成连字符；
 /// IP 地址整个保留。和 `taken` 重复时加 `-2`、`-3`。
-fn id_from_host(host: &str, taken: &[Provider]) -> String {
+fn id_base(host: &str) -> String {
     let host = host.to_ascii_lowercase();
     let mut labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
     let is_ip = host.contains(':')
@@ -224,10 +233,15 @@ fn id_from_host(host: &str, taken: &[Provider]) -> String {
             base.push('-');
         }
     }
-    let base = match base.trim_end_matches('-') {
+    match base.trim_end_matches('-') {
         "" => "custom",
         trimmed => trimmed,
-    };
+    }
+    .to_string()
+}
+
+/// `base`，和已有的重复时加 `-2`、`-3`。
+fn unique_id(base: &str, taken: &[Provider]) -> String {
     let mut id = base.to_string();
     let mut n = 2;
     while taken.iter().any(|provider| provider.id == id) {
@@ -433,7 +447,7 @@ mod tests {
         let home = Home::new();
         home.edit(".claude/settings.json", |_| {
             r#"{"env": {
-                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic/",
+                "ANTHROPIC_BASE_URL": "https://api.relay-one.com/anthropic/",
                 "ANTHROPIC_AUTH_TOKEN": "sk-deep",
                 "ANTHROPIC_MODEL": "deepseek-chat",
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-chat"
@@ -441,7 +455,7 @@ mod tests {
             .into()
         });
         let mut taken = relay();
-        taken.id = "deepseek".into();
+        taken.id = "relay-one".into();
         let draft = draft(
             &home.engine,
             home.path(),
@@ -450,12 +464,16 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(draft.id, "deepseek-2");
-        assert_eq!(draft.name, "api.deepseek.com");
+        assert_eq!(draft.id, "relay-one-2");
+        assert_eq!(draft.name, "api.relay-one.com");
+        assert_eq!(draft.preset, None);
         assert_eq!(draft.key, "sk-deep");
         assert_eq!(
-            draft.endpoint(Protocol::Anthropic),
-            Some("https://api.deepseek.com/anthropic")
+            draft.endpoints,
+            BTreeMap::from([(
+                Protocol::Anthropic,
+                "https://api.relay-one.com/anthropic".into()
+            )])
         );
         assert_eq!(draft.models.len(), 1);
         assert_eq!(
@@ -471,7 +489,7 @@ mod tests {
         let saved = [relay(), draft];
         assert_eq!(
             home.current(AgentKind::ClaudeCode, &saved),
-            Current::Provider("deepseek-2".into())
+            Current::Provider("relay-one-2".into())
         );
         let before = fs::read(home.path().join(".claude/settings.json")).unwrap();
         switch(
@@ -498,6 +516,36 @@ mod tests {
     }
 
     #[test]
+    fn a_setup_on_a_preset_address_is_saved_with_the_whole_preset() {
+        let home = Home::new();
+        home.edit(".claude/settings.json", |_| {
+            r#"{"env": {
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_AUTH_TOKEN": "sk-deep",
+                "ANTHROPIC_MODEL": "deepseek-chat"
+            }}"#
+            .into()
+        });
+        let draft = draft(&home.engine, home.path(), AgentKind::ClaudeCode, &[])
+            .unwrap()
+            .unwrap();
+        let deepseek = preset::get("deepseek").unwrap();
+        assert_eq!(draft.id, "deepseek");
+        assert_eq!(draft.name, "DeepSeek");
+        assert_eq!(draft.preset.as_deref(), Some("deepseek"));
+        assert_eq!(draft.key, "sk-deep");
+        // 三个协议的地址都有了，存好就能给 Codex、Pi 用。
+        assert_eq!(draft.endpoints, deepseek.endpoints);
+        let ids: Vec<&str> = draft.models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, ["deepseek-v4-pro", "deepseek-flash", "deepseek-chat"]);
+        assert_eq!(
+            draft.override_for(AgentKind::ClaudeCode).unwrap().slots,
+            BTreeMap::from([("main".into(), "deepseek-chat".into())])
+        );
+        draft.validate().unwrap();
+    }
+
+    #[test]
     fn a_codex_route_is_saved_with_its_model() {
         let home = Home::new();
         home.edit(".codex/config.toml", |_| {
@@ -506,7 +554,7 @@ mod tests {
         let draft = draft(&home.engine, home.path(), AgentKind::Codex, &[])
             .unwrap()
             .unwrap();
-        assert_eq!(draft.id, "moonshot");
+        assert_eq!(draft.id, "kimi");
         assert_eq!(
             draft.endpoint(Protocol::OpenaiResponses),
             Some("https://api.moonshot.cn/v1")
@@ -521,7 +569,7 @@ mod tests {
         );
         assert_eq!(
             home.current(AgentKind::Codex, &[draft]),
-            Current::Provider("moonshot".into())
+            Current::Provider("kimi".into())
         );
     }
 
@@ -534,15 +582,16 @@ mod tests {
         let draft = draft(&home.engine, home.path(), AgentKind::GrokBuild, &[])
             .unwrap()
             .unwrap();
-        assert_eq!(draft.id, "moonshot");
+        assert_eq!(draft.id, "kimi");
         assert_eq!(
             draft.endpoint(Protocol::OpenaiChat),
             Some("https://api.moonshot.cn/v1")
         );
-        assert_eq!(draft.models.len(), 2);
+        // Kimi 预设的三个模型，加上文件里的两个。
+        assert_eq!(draft.models.len(), 5);
         assert_eq!(
             home.current(AgentKind::GrokBuild, std::slice::from_ref(&draft)),
-            Current::Provider("moonshot".into())
+            Current::Provider("kimi".into())
         );
 
         // 切过去以后，用户自己的两张表还在，默认换成 confdeck 写的那张，连的还是同一个地址和 Key。
@@ -558,7 +607,7 @@ mod tests {
         assert!(text.contains("[model.kimi-fast]"), "{text}");
         assert_eq!(
             home.current(AgentKind::GrokBuild, &[draft]),
-            Current::Provider("moonshot".into())
+            Current::Provider("kimi".into())
         );
     }
 
@@ -580,7 +629,7 @@ mod tests {
 
     #[test]
     fn ids_come_from_the_host() {
-        let id = |host| id_from_host(host, &[]);
+        let id = id_base;
         assert_eq!(id("api.deepseek.com"), "deepseek");
         assert_eq!(id("relay.elsewhere.io"), "relay-elsewhere");
         assert_eq!(id("open.bigmodel.cn"), "open-bigmodel");

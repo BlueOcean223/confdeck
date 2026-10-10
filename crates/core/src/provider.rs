@@ -97,6 +97,9 @@ pub struct Provider {
     /// 小写字母、数字和连字符；写进 agent 配置时用作键（比如 Pi 的 `confdeck-<id>`）。
     pub id: String,
     pub name: String,
+    /// 用哪个内置预设建的（[`crate::preset`]）。写配置文件时用它的推荐值，排在覆盖和自动之间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub key: String,
     pub endpoints: BTreeMap<Protocol, String>,
@@ -264,6 +267,7 @@ pub(crate) mod tests {
         Provider {
             id: "relay".into(),
             name: "Relay".into(),
+            preset: None,
             key: "sk-relay".into(),
             endpoints: BTreeMap::from([
                 (Protocol::Anthropic, "https://relay.example".into()),
