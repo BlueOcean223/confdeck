@@ -184,6 +184,11 @@ pub enum AdaptError {
     RawUnsupported { agent: AgentKind },
     #[error("{agent} 的原始片段里 {key} 的值含有 null，TOML 里写不了")]
     RawNotToml { agent: AgentKind, key: String },
+    /// Codex 的路由表没有自己的凭据却要求官方登录，请求会带上 ChatGPT 登录发给第三方。
+    #[error(
+        "{agent} 的原始片段把 requires_openai_auth 设成了 true，但路由表没有自己的 Key，ChatGPT 登录会被发给第三方地址"
+    )]
+    RawSendsLogin { agent: AgentKind },
     /// Grok Build 走 Anthropic 协议时 Key 只会放进 `Authorization: Bearer`，Anthropic 官方要 `x-api-key`。
     #[error("{agent} 连 Anthropic 官方要把 Key 放进 x-api-key 头，还不支持")]
     AnthropicOfficial { agent: AgentKind },

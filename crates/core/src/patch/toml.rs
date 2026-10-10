@@ -17,7 +17,15 @@ impl<T: TomlDocPatch> LivePatch for T {
     fn apply(&self, path: &Path, pre: Option<&[u8]>) -> Result<Vec<u8>, PatchError> {
         let mut doc = parse(path, pre)?;
         self.apply_to(path, &mut doc)?;
-        Ok(doc.to_string().into_bytes())
+        let text = doc.to_string();
+        // 顶层的键删光以后，原来隔开它们和第一张表的空行会跑到文件开头。
+        let blank_start = pre.is_some_and(|pre| pre.starts_with(b"\n") || pre.starts_with(b"\r\n"));
+        let text = if blank_start {
+            text.as_str()
+        } else {
+            text.trim_start_matches(['\r', '\n'])
+        };
+        Ok(text.as_bytes().to_vec())
     }
 }
 

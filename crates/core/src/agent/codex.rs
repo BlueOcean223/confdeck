@@ -3,11 +3,15 @@
 //! 第三方供应商写成 `model_provider = "custom"` 加 `[model_providers.custom]` 一整张表；
 //! 「默认」删掉这两处，回到 Codex 内置的 openai（官方登录）。关键字段的清单和
 //! `requires_openai_auth` 的规则移植自 ccs-lite 的 `live/floor.rs`、`live/project/codex.rs`。
+//!
+//! ccs-lite 切回官方时不删 `custom` 表、改成连不上的休眠形态，理由是删了旧会话续不上。
+//! Codex 0.153.4 上试过：删了表，`codex exec resume` 照样续上原来走 `custom` 的会话，请求按当前配置发；
+//! 没生效的 profile 选着不存在的表也能正常加载。所以这里直接删。
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use super::{
     AdaptError, AgentKind, Connection, Credential, FileSetup, choose_protocol, default_model,
@@ -23,6 +27,10 @@ const AGENT: AgentKind = AgentKind::Codex;
 
 /// confdeck 写的路由表的 id。
 pub const ROUTE_ID: &str = "custom";
+
+/// 不许定义成 `[model_providers.<id>]` 的内置 id：有这几张表，Codex 0.148 起整份配置都不加载
+/// （0.153.4 实测）。`amazon-bedrock` 允许改少数几个字段；id 区分大小写，`OpenAI` 是普通 id。
+pub const RESERVED_IDS: &[&str] = &["openai", "ollama", "lmstudio"];
 
 pub fn config_path(home: &Path) -> PathBuf {
     home.join(".codex").join("config.toml")
@@ -44,10 +52,8 @@ pub fn auth_path(home: &Path) -> PathBuf {
 }
 
 /// `auth.json` 里有没有 Codex 能直接用的登录（OAuth token 等），只有 `OPENAI_API_KEY` 不算。
-/// 判断规则移植自 ccs-lite 的 `codex_auth_has_credential_login_material`。
-///
-/// `config.toml` 里 `cli_auth_credentials_store` 设成 keyring / auto 时登录存在系统钥匙串里，
-/// 这里看不到，当成没有登录。
+/// 判断规则移植自 ccs-lite 的 `codex_auth_has_credential_login_material`。登录不一定存在这个文件里，
+/// 见 [`has_login`]。
 pub fn login_on_disk(auth: Option<&[u8]>) -> bool {
     let Some(auth) = auth.and_then(|bytes| serde_json::from_slice::<Json>(bytes).ok()) else {
         return false;
@@ -100,14 +106,35 @@ pub const FLOOR_NESTED: &[&[&str]] = &[
     &["memories", "consolidation_model"],
 ];
 
+/// Codex 看不看得到 ChatGPT 登录。登录存在哪由 `config.toml` 的 `cli_auth_credentials_store` 决定：
+/// 不写或 `file` 只存 `auth.json`，看 `login_on_disk`；`ephemeral` 只在进程里，从不落盘；
+/// `keyring`、`auto` 可能存在系统钥匙串里，confdeck 不读钥匙串，当成有（同 ccs-lite）。
+/// 别的值 Codex 拒绝加载整份配置，也当成有。
+pub fn has_login(doc: &DocumentMut, login_on_disk: bool) -> bool {
+    let Some(store) = doc.get("cli_auth_credentials_store") else {
+        return login_on_disk;
+    };
+    match store.as_str() {
+        Some("file") => login_on_disk,
+        Some("ephemeral") => false,
+        _ => true,
+    }
+}
+
+/// 路由表有没有自己的 Key：`experimental_bearer_token` 或 `env_key`。`auth` 命令、`aws`、
+/// `Authorization` 请求头不算：`requires_openai_auth = true` 时官方登录会盖掉请求头（ccs-lite 在 0.149 核实）。
+fn own_credentials(table: &Table) -> bool {
+    text(table.get("experimental_bearer_token")).is_some() || table.contains_key("env_key")
+}
+
 /// 第三方路由表的 `requires_openai_auth`。
 ///
-/// 这个值不决定请求用什么凭据（`experimental_bearer_token` 优先），但决定登录界面：
-/// 为 `true` 而 `auth.json` 里没有登录，Codex 会卡在登录页；为 `false` 而旁边留着
-/// ChatGPT 登录，Codex 当成已登出（账号信息不显示、token 不刷新）。所以跟着
-/// 「盘上有没有登录」走。（ccs-lite 在 Codex 0.149 上核实）
-pub fn requires_openai_auth(login_on_disk: bool) -> bool {
-    login_on_disk
+/// 这个值不决定请求用什么凭据（表自己的 Key 优先），但决定登录界面：为 `true` 而 Codex 看不到登录，
+/// 会卡在登录页；为 `false` 而旁边留着 ChatGPT 登录，Codex 当成已登出（账号信息不显示、token 不刷新）。
+/// 所以表有自己的 Key 时跟着「有没有登录」走。没有自己的 Key 时恒为 `false`：为 `true` 时请求会带上
+/// 官方登录，发给第三方地址。（ccs-lite 在 Codex 0.149 上核实）
+pub fn requires_openai_auth(own_credentials: bool, login: bool) -> bool {
+    own_credentials && login
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +142,16 @@ pub struct CodexPatch {
     /// 顶层关键字段的目标值。
     top: Vec<(&'static str, Value)>,
     /// `[model_providers.custom]`；`None` 是「默认」。
-    route: Option<Table>,
+    route: Option<Route>,
+    /// `~/.codex/auth.json` 里有没有 ChatGPT 登录。
+    login_on_disk: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Route {
+    table: Table,
+    /// 原始片段没写 `requires_openai_auth`，由 confdeck 在写入时定值。
+    stamp: bool,
 }
 
 /// 切到这家供应商的补丁；`None` 是「默认」。`login_on_disk`：`~/.codex/auth.json`
@@ -125,6 +161,7 @@ pub fn patch(provider: Option<&Provider>, login_on_disk: bool) -> Result<CodexPa
         return Ok(CodexPatch {
             top: Vec::new(),
             route: None,
+            login_on_disk,
         });
     };
     let (_, base_url) = choose_protocol(provider, AGENT)?;
@@ -136,10 +173,8 @@ pub fn patch(provider: Option<&Provider>, login_on_disk: bool) -> Result<CodexPa
     table.insert("base_url", toml_edit::value(base_url));
     table.insert("wire_api", toml_edit::value("responses"));
     table.insert("experimental_bearer_token", toml_edit::value(key));
-    table.insert(
-        "requires_openai_auth",
-        toml_edit::value(requires_openai_auth(login_on_disk)),
-    );
+    // 先占住位置，值要看 `config.toml` 里登录存在哪，写入时再定。
+    table.insert("requires_openai_auth", toml_edit::value(false));
     let raw = provider.override_for(AGENT).and_then(|o| o.raw.as_ref());
     for (name, value) in raw.into_iter().flatten() {
         if value.is_null() {
@@ -152,18 +187,28 @@ pub fn patch(provider: Option<&Provider>, login_on_disk: bool) -> Result<CodexPa
         })?;
         table.insert(name, Item::Value(value));
     }
+    // 占位的值是 false，这里是 true 只能是原始片段写的。
+    if table.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
+        && !own_credentials(&table)
+    {
+        return Err(AdaptError::RawSendsLogin { agent: AGENT });
+    }
+    let stamp = !raw.is_some_and(|raw| raw.contains_key("requires_openai_auth"));
 
     Ok(CodexPatch {
         top: vec![
             ("model_provider", Value::from(ROUTE_ID)),
             ("model", Value::from(model.id.as_str())),
         ],
-        route: Some(table),
+        route: Some(Route { table, stamp }),
+        login_on_disk,
     })
 }
 
 impl TomlDocPatch for CodexPatch {
     fn apply_to(&self, path: &Path, doc: &mut DocumentMut) -> Result<(), PatchError> {
+        let login = has_login(doc, self.login_on_disk);
+
         // 1. 清空顶层关键字段。目标里也有的留给第 4 步原位改值，保住原来的位置和注释。
         let doomed: Vec<String> = doc
             .iter()
@@ -184,21 +229,60 @@ impl TomlDocPatch for CodexPatch {
         }
 
         // 3. 路由表。
-        write_route(path, doc, self.route.as_ref())?;
+        let route = self.route.as_ref().map(|route| {
+            let mut table = route.table.clone();
+            if route.stamp {
+                let value = requires_openai_auth(own_credentials(&table), login);
+                table.insert("requires_openai_auth", toml_edit::value(value));
+            }
+            table
+        });
+        write_route(path, doc, route)?;
 
         // 4. 目标值：已有就原位改，没有就追加。
         for (key, value) in &self.top {
             put_value(doc.as_table_mut(), key, value);
         }
+
+        // 5. 生效的 profile 自己选了别的路由，写了 Codex 也不走 `custom`。「默认」不查：删掉自己的表总是对的。
+        if self.route.is_some()
+            && let Some((name, profile)) = active_profile(doc)
+            && text(profile.get("model_provider")).is_some_and(|selected| selected != ROUTE_ID)
+        {
+            return Err(PatchError::Overridden {
+                path: path.to_path_buf(),
+                by: format!("生效的 profile「{name}」"),
+                key: "model_provider".to_string(),
+            });
+        }
         Ok(())
     }
 }
 
-fn write_route(
-    path: &Path,
-    doc: &mut DocumentMut,
-    route: Option<&Table>,
-) -> Result<(), PatchError> {
+/// 旧写法的 profile：顶层 `profile = "名字"` 选中 `[profiles.名字]`，里面的键盖过顶层的。
+/// Codex 0.153.4 已经不认（有顶层 `profile` 就报错退出；profile 改成单独的 `名字.config.toml`，
+/// 只在命令行带 `--profile` 时生效），更早的版本还认。
+fn active_profile(doc: &DocumentMut) -> Option<(String, &dyn TableLike)> {
+    let name = text(doc.get("profile"))?;
+    let profile = doc.get("profiles")?.get(&name)?.as_table_like()?;
+    Some((name, profile))
+}
+
+/// 键的生效值：生效的 profile 里有就用它的。
+fn effective(doc: &DocumentMut, key: &str) -> Option<String> {
+    active_profile(doc)
+        .and_then(|(_, profile)| text(profile.get(key)))
+        .or_else(|| text(doc.get(key)))
+}
+
+fn text(item: Option<&Item>) -> Option<String> {
+    item.and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn write_route(path: &Path, doc: &mut DocumentMut, route: Option<Table>) -> Result<(), PatchError> {
     let root = doc.as_table_mut();
     let container_inline = matches!(root.get("model_providers"), Some(Item::Value(_)));
     let Some(container) = root.get_mut("model_providers") else {
@@ -206,7 +290,7 @@ fn write_route(
             // 隐式表：只输出 `[model_providers.custom]`，不多一行空的 `[model_providers]`。
             let mut providers = Table::new();
             providers.set_implicit(true);
-            providers.insert(ROUTE_ID, Item::Table(table.clone()));
+            providers.insert(ROUTE_ID, Item::Table(table));
             root.insert("model_providers", Item::Table(providers));
         }
         return Ok(());
@@ -214,8 +298,9 @@ fn write_route(
     let providers = container
         .as_table_like_mut()
         .ok_or_else(|| shape_error(path, &["model_providers".to_string()]))?;
+    rename_reserved(providers);
     match route {
-        Some(table) => put_table(providers, ROUTE_ID, table.clone(), container_inline),
+        Some(table) => put_table(providers, ROUTE_ID, table, container_inline),
         None => {
             let emptied = providers.len() == usize::from(providers.contains_key(ROUTE_ID));
             remove_key(doc, &["model_providers"], ROUTE_ID);
@@ -227,19 +312,33 @@ fn write_route(
     Ok(())
 }
 
+/// 保留 id 的表改名成 `<id>-custom`（Codex 报错里建议的名字），内容不动。这几张表不是 confdeck 写的，
+/// 删了可能丢掉用户要的设置；不改 Codex 又整份不加载。
+fn rename_reserved(providers: &mut dyn TableLike) {
+    for id in RESERVED_IDS {
+        if !providers.get(id).is_some_and(Item::is_table_like) {
+            continue;
+        }
+        let item = providers.remove(id).expect("checked above");
+        let base = format!("{id}-custom");
+        let mut renamed = base.clone();
+        let mut suffix = 2;
+        while providers.contains_key(&renamed) {
+            renamed = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        providers.insert(&renamed, item);
+    }
+}
+
 /// 从 `config.toml` 读出现在连的是哪。只看选的路由和它的地址、凭据，不看模型名。
+/// 旧写法的 profile 生效时按它盖过的值算。
 pub fn connection(path: &Path, bytes: Option<&[u8]>) -> Result<Connection, PatchError> {
     let doc = toml::parse(path, bytes)?;
-    let text = |item: Option<&Item>| {
-        item.and_then(Item::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    };
-    let selected = text(doc.get("model_provider")).unwrap_or_else(|| "openai".to_string());
+    let selected = effective(&doc, "model_provider").unwrap_or_else(|| "openai".to_string());
     if selected == "openai" {
         // `openai_base_url` 把内置的 openai 路由改道到别的地址。
-        return Ok(match text(doc.get("openai_base_url")) {
+        return Ok(match effective(&doc, "openai_base_url") {
             Some(url) => Connection::Endpoint {
                 base_url: normalize_url(Protocol::OpenaiResponses, &url),
                 credential: None,
@@ -277,12 +376,7 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
         return Ok(None);
     };
     let doc = toml::parse(path, bytes)?;
-    let model = doc
-        .get("model")
-        .and_then(Item::as_str)
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(str::to_string);
+    let model = effective(&doc, "model");
     Ok(Some(FileSetup {
         protocol: Protocol::OpenaiResponses,
         base_url,
@@ -589,5 +683,151 @@ requires_openai_auth = false
             patch(Some(&provider), true),
             Err(AdaptError::MissingKey { .. })
         ));
+    }
+
+    #[test]
+    fn reserved_tables_are_renamed_on_every_write() {
+        let pre = r#"model_provider = "openai"
+
+# 以前的代理
+[model_providers.openai]
+name = "Proxy"
+base_url = "https://proxy.example/v1"
+
+[model_providers.openai-custom]
+name = "Taken"
+
+[model_providers.OpenAI]
+name = "Not reserved"
+"#;
+        assert_eq!(
+            apply(&patch(None, false).unwrap(), Some(pre)),
+            r#"# 以前的代理
+[model_providers.openai-custom-2]
+name = "Proxy"
+base_url = "https://proxy.example/v1"
+
+[model_providers.openai-custom]
+name = "Taken"
+
+[model_providers.OpenAI]
+name = "Not reserved"
+"#
+        );
+
+        let pre = "model_providers = { ollama = { base_url = \"http://localhost:11434/v1\" } }\n";
+        let out = apply(&patch(Some(&relay()), false).unwrap(), Some(pre));
+        let doc: DocumentMut = out.parse().unwrap();
+        let providers = doc["model_providers"].as_inline_table().unwrap();
+        assert!(!providers.contains_key("ollama"), "{out}");
+        assert!(providers.contains_key("ollama-custom"), "{out}");
+        assert!(providers.contains_key(ROUTE_ID), "{out}");
+    }
+
+    fn requires(pre: &str, login_on_disk: bool) -> Option<bool> {
+        let out = apply(&patch(Some(&relay()), login_on_disk).unwrap(), Some(pre));
+        let doc: DocumentMut = out.parse().unwrap();
+        doc["model_providers"][ROUTE_ID]
+            .get("requires_openai_auth")
+            .and_then(Item::as_bool)
+    }
+
+    #[test]
+    fn requires_openai_auth_follows_where_codex_keeps_the_login() {
+        for (store, without, with) in [
+            ("", false, true),
+            ("cli_auth_credentials_store = \"file\"\n", false, true),
+            ("cli_auth_credentials_store = \"ephemeral\"\n", false, false),
+            ("cli_auth_credentials_store = \"keyring\"\n", true, true),
+            ("cli_auth_credentials_store = \"auto\"\n", true, true),
+        ] {
+            assert_eq!(requires(store, false), Some(without), "{store}");
+            assert_eq!(requires(store, true), Some(with), "{store}");
+        }
+    }
+
+    fn with_raw(raw: Json) -> Provider {
+        let mut provider = relay();
+        provider.overrides.insert(
+            AGENT,
+            AgentOverride {
+                raw: Some(raw.as_object().unwrap().clone()),
+                ..AgentOverride::default()
+            },
+        );
+        provider
+    }
+
+    #[test]
+    fn a_table_without_its_own_key_never_asks_for_the_login() {
+        // 改用请求头带 Key：不能要求官方登录，否则登录会被发给第三方。
+        let provider = with_raw(json!({
+            "experimental_bearer_token": null,
+            "http_headers": {"Authorization": "Bearer sk-relay"}
+        }));
+        let out = apply(&patch(Some(&provider), true).unwrap(), None);
+        assert!(out.contains("requires_openai_auth = false"), "{out}");
+
+        let provider = with_raw(json!({"env_key": "RELAY_KEY", "experimental_bearer_token": null}));
+        let out = apply(&patch(Some(&provider), true).unwrap(), None);
+        assert!(out.contains("requires_openai_auth = true"), "{out}");
+
+        let provider = with_raw(json!({
+            "experimental_bearer_token": null,
+            "requires_openai_auth": true
+        }));
+        assert!(matches!(
+            patch(Some(&provider), true),
+            Err(AdaptError::RawSendsLogin { .. })
+        ));
+
+        // 有自己的 Key 时，原始片段写的值照写。
+        let provider = with_raw(json!({"requires_openai_auth": false}));
+        let out = apply(&patch(Some(&provider), true).unwrap(), None);
+        assert!(out.contains("requires_openai_auth = false"), "{out}");
+    }
+
+    const PROFILES: &str = r#"profile = "work"
+
+[profiles.work]
+model_provider = "azure"
+model = "gpt-5.5"
+
+[profiles.home]
+model_provider = "custom"
+"#;
+
+    #[test]
+    fn an_active_profile_on_another_route_is_refused() {
+        let err = patch(Some(&relay()), false)
+            .unwrap()
+            .apply(Path::new("config.toml"), Some(PROFILES.as_bytes()))
+            .unwrap_err();
+        assert!(matches!(err, PatchError::Overridden { .. }), "{err:?}");
+
+        // 「默认」照写；生效的 profile 选的是 custom、或者 profile 没生效，都照写。
+        apply(&patch(None, false).unwrap(), Some(PROFILES));
+        let home = PROFILES.replace("profile = \"work\"", "profile = \"home\"");
+        apply(&patch(Some(&relay()), false).unwrap(), Some(&home));
+        let inactive = PROFILES.replace("profile = \"work\"\n", "");
+        apply(&patch(Some(&relay()), false).unwrap(), Some(&inactive));
+    }
+
+    #[test]
+    fn connection_and_setup_follow_the_active_profile() {
+        let text = format!(
+            "{PROFILES}\n[model_providers.azure]\nbase_url = \"https://azure.example/openai/v1\"\nenv_key = \"AZURE_KEY\"\n"
+        );
+        assert_eq!(
+            read(&text),
+            Connection::Endpoint {
+                base_url: "https://azure.example/openai/v1".into(),
+                credential: Some(Credential::EnvVar("AZURE_KEY".into()))
+            }
+        );
+        let found = setup(Path::new("c.toml"), Some(text.as_bytes()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.default_model.as_deref(), Some("gpt-5.5"));
     }
 }

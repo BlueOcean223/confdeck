@@ -106,6 +106,13 @@ pub enum PatchError {
         key_path: KeyPath,
         expected: &'static str,
     },
+    /// 文件里另有设置盖过了要写的值，写了也不生效，比如 Codex 生效的 profile 自己选了路由。
+    #[error("{path} 里 {by} 改了 {key}，写进去也不生效，没有写入")]
+    Overridden {
+        path: PathBuf,
+        by: String,
+        key: String,
+    },
 }
 
 /// 字节偏移 → (行, 列)，都从 1 开始。
