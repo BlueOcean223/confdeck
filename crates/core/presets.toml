@@ -86,8 +86,7 @@ output = 262144
 input = ["text", "image"]
 reasoning = ["high"]
 
-# Kimi For Coding（会员订阅）。Responses 在 /coding/v1（kimi.com/code/docs/third-party-tools/codex.html），
-# Chat 同一个地址（ccs-lite 的 OpenClaw 预设），Anthropic 在 /coding。
+# Kimi For Coding（会员订阅）。Chat 和 Responses 都在 /coding/v1，Anthropic 在 /coding（kimi.com/code/docs 的地址表，10-10）。
 # 官方 Claude Code 配置所有槽位都用 kimi-for-coding；Pi、OpenCode 走 Anthropic（ccs-lite 的这两个预设都这么配）。
 [[presets]]
 id = "kimi-coding"
@@ -100,7 +99,9 @@ anthropic = "https://api.kimi.com/coding"
 openai-chat = "https://api.kimi.com/coding/v1"
 openai-responses = "https://api.kimi.com/coding/v1"
 
-# 2026-09-15 起是 K2.8 Preview，最高 1M 上下文（官方 Codex 指南）；输出上限取 ccs-lite Pi 预设的 32768。
+# 2026-09-15 起是 K2.8 Preview，最高 1M 上下文（官方 Codex 指南）。官方文档没写输出上限，取 models.dev 的
+# kimi-code-plan-cn（OpenCode 内置的就是它）和 ccs-lite Pi 预设都用的 32768；其余三个的输出上限也取 models.dev。
+# 输入类型照 kimi.com/code/docs/kimi-code/models.html（视频 confdeck 不记）。
 [[presets.models]]
 id = "kimi-for-coding"
 name = "Kimi For Coding"
@@ -116,6 +117,8 @@ id = "kimi-for-coding-highspeed"
 name = "Kimi For Coding HighSpeed"
 tier = "fast"
 context = 262144
+output = 32768
+input = ["text", "image"]
 reasoning = ["high"]
 
 # K3 的 1M 上下文要看会员档位，k3-256k 固定 256K。
@@ -124,6 +127,8 @@ id = "k3"
 name = "Kimi K3"
 tier = "flagship"
 context = 1048576
+output = 131072
+input = ["text", "image"]
 reasoning = ["low", "high", "max"]
 
 [[presets.models]]
@@ -131,6 +136,8 @@ id = "k3-256k"
 name = "Kimi K3 256K"
 tier = "flagship"
 context = 262144
+output = 131072
+input = ["text", "image"]
 reasoning = ["low", "high", "max"]
 
 [presets.agents.claude-code.slots]
@@ -221,6 +228,7 @@ reasoning = ["max"]
 # OpenRouter。Claude 模型走 Anthropic 协议（ccs-lite 的 Pi、OpenCode 预设都这么配）；主模型用 Sonnet（ccs-lite 的 Claude Code 预设）。
 # Codex 默认用 GPT、Grok 默认用 Grok（ccs-lite 的 Codex、Grok Build 预设，2026-10-07 对过 OpenRouter 的模型列表），
 # 这两个不打星，Pi、OpenCode 只列 Claude 的。推理档位按 OpenRouter 统一的 reasoning.effort（low / medium / high）。
+# 上下文、输出上限、输入类型 10-10 对过 openrouter.ai/api/v1/models（`context_length`、`top_provider.max_completion_tokens`）。
 [[presets]]
 id = "openrouter"
 name = "OpenRouter"
@@ -273,11 +281,21 @@ reasoning = ["low", "medium", "high"]
 
 [[presets.models]]
 id = "openai/gpt-6.1-sol"
+name = "GPT-6.1 Sol"
 tier = "flagship"
+context = 1050000
+output = 128000
+input = ["text", "image"]
+reasoning = ["low", "medium", "high"]
 
 [[presets.models]]
 id = "x-ai/grok-4.7"
+name = "Grok 4.7"
 tier = "flagship"
+context = 500000
+output = 450000
+input = ["text", "image"]
+reasoning = ["low", "medium", "high"]
 
 [presets.agents.claude-code.slots]
 main = "anthropic/claude-sonnet-5.5"
