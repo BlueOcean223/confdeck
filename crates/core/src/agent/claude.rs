@@ -15,7 +15,7 @@ use crate::engine::LiveFile;
 use crate::fsx::Mode;
 use crate::patch::json::{self, ClearScope, JsonPatch};
 use crate::patch::{Format, KeyPath, PatchError};
-use crate::provider::{Protocol, Provider, normalize_url};
+use crate::provider::{Model, Protocol, Provider, normalize_url};
 
 const AGENT: AgentKind = AgentKind::ClaudeCode;
 
@@ -173,14 +173,41 @@ pub fn patch(provider: Option<&Provider>) -> Result<JsonPatch, AdaptError> {
     }
 
     let slot_list: Vec<Slot> = SLOTS.iter().map(|(slot, _)| *slot).collect();
-    for (slot, model) in slots::fill(provider, AGENT, &slot_list, !official)? {
+    for (slot, id) in slots::fill(provider, AGENT, &slot_list, !official)? {
         let (_, name) = SLOTS
             .iter()
             .find(|(known, _)| *known == slot)
             .expect("fill returns known slots");
-        env(name, model);
+        let long = !official
+            && provider
+                .model(id)
+                .and_then(|model| model.context)
+                .is_some_and(|tokens| tokens >= ONE_M_TOKENS);
+        if long && !strip_one_m(id).1 {
+            env(name, &format!("{id}{ONE_M}"));
+        } else {
+            env(name, id);
+        }
     }
     Ok(patch)
+}
+
+/// Claude Code 认模型名末尾的 `[1m]`（不分大小写）：带了按 1M 上下文算，不带按 200K；
+/// 发请求前去掉它，另加一个 `context-1m-2025-08-07` beta 头（Claude Code 2.1.293 抓包核实）。
+/// 智谱、MiniMax 官方的 Claude Code 配置就这么写。
+const ONE_M: &str = "[1m]";
+
+/// 目录里上下文至少这么长的模型，写进槽位时加 `[1m]`。比这短的不加：标成 1M 会让 Claude Code 塞超了。
+/// 连 Anthropic 官方时不加，1M 要看账号有没有开通。
+const ONE_M_TOKENS: u64 = 1_000_000;
+
+/// 去掉模型名末尾的 `[1m]`，返回（模型名，原来有没有）。
+pub fn strip_one_m(model: &str) -> (&str, bool) {
+    let cut = model.len().saturating_sub(ONE_M.len());
+    match model.get(cut..) {
+        Some(tail) if tail.eq_ignore_ascii_case(ONE_M) => (model[..cut].trim_end(), true),
+        _ => (model, false),
+    }
 }
 
 /// 没写 `ANTHROPIC_BASE_URL` 时 Claude Code 连的地址。
@@ -234,19 +261,27 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
     };
     let (doc, _) = json::parse(path, bytes, false)?;
     let env = doc.get("env").and_then(Value::as_object);
-    let mut models: Vec<String> = Vec::new();
+    let mut models: Vec<Model> = Vec::new();
     let mut slots = BTreeMap::new();
     for (slot, name) in SLOTS {
-        let model = env
+        let value = env
             .and_then(|env| env.get(*name))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|model| !model.is_empty());
-        if let Some(model) = model {
-            slots.insert(slot.key.to_string(), model.to_string());
-            if !models.iter().any(|seen| seen == model) {
-                models.push(model.to_string());
-            }
+        let Some((id, long)) = value.map(strip_one_m).filter(|(id, _)| !id.is_empty()) else {
+            continue;
+        };
+        slots.insert(slot.key.to_string(), id.to_string());
+        // 带 `[1m]` 的记成 1M 上下文，存成供应商后再写回来还是带着。
+        let context = long.then_some(ONE_M_TOKENS);
+        match models.iter_mut().find(|seen| seen.id == id) {
+            Some(seen) => seen.context = seen.context.or(context),
+            None => models.push(Model {
+                id: id.to_string(),
+                context,
+                ..Model::default()
+            }),
         }
     }
     Ok(Some(FileSetup {
@@ -464,20 +499,79 @@ mod tests {
     }
 
     #[test]
+    fn models_with_a_million_tokens_of_context_get_the_1m_suffix() {
+        let mut provider = relay();
+        provider.models[1].context = Some(1_048_576); // glm-4.6，强槽位
+        provider.models[0].context = Some(262_144); // glm-4.5-air，快槽位
+        let env = &apply(Some(&provider), "{}")["env"];
+        assert_eq!(env["ANTHROPIC_MODEL"], "glm-4.6[1m]");
+        assert_eq!(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "glm-4.6[1m]");
+        assert_eq!(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "glm-4.5-air");
+
+        // 目录里的 ID 已经带了后缀，不再加一次。
+        provider.models[1].id = "glm-4.6[1M]".into();
+        provider.overrides.insert(
+            AGENT,
+            AgentOverride {
+                slots: [("main".into(), "glm-4.6[1M]".into())].into(),
+                ..AgentOverride::default()
+            },
+        );
+        assert_eq!(
+            apply(Some(&provider), "{}")["env"]["ANTHROPIC_MODEL"],
+            "glm-4.6[1M]"
+        );
+
+        // 连 Anthropic 官方不加。
+        let mut official = relay();
+        official.endpoints = [(Protocol::Anthropic, OFFICIAL_URL.to_string())].into();
+        official.models[1].context = Some(1_000_000);
+        official.overrides.insert(
+            AGENT,
+            AgentOverride {
+                slots: [("main".into(), "glm-4.6".into())].into(),
+                ..AgentOverride::default()
+            },
+        );
+        assert_eq!(
+            apply(Some(&official), "{}")["env"]["ANTHROPIC_MODEL"],
+            "glm-4.6"
+        );
+    }
+
+    #[test]
+    fn the_1m_suffix_is_stripped_in_any_case() {
+        assert_eq!(strip_one_m("glm-5.3[1m]"), ("glm-5.3", true));
+        assert_eq!(strip_one_m("MiniMax-M3[1M]"), ("MiniMax-M3", true));
+        assert_eq!(strip_one_m("glm-5.3"), ("glm-5.3", false));
+        assert_eq!(strip_one_m("[1m]"), ("", true));
+        assert_eq!(strip_one_m("模型"), ("模型", false));
+    }
+
+    #[test]
     fn setup_reads_the_address_key_and_slots() {
+        // 带 `[1m]` 的去掉后缀，记成 1M 上下文；同一个模型别的槽位没带也算。
         let text = r#"{"env": {
             "ANTHROPIC_BASE_URL": "https://relay.elsewhere.io",
             "ANTHROPIC_AUTH_TOKEN": "sk-x",
             "ANTHROPIC_MODEL": "glm-4.6",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5-air",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.6"
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.6[1M]"
         }}"#;
         let read = setup(Path::new("s.json"), Some(text.as_bytes()))
             .unwrap()
             .unwrap();
         assert_eq!(read.base_url, "https://relay.elsewhere.io");
         assert_eq!(read.key.as_deref(), Some("sk-x"));
-        assert_eq!(read.models, ["glm-4.6", "glm-4.5-air"]);
+        let models: Vec<(&str, Option<u64>)> = read
+            .models
+            .iter()
+            .map(|model| (model.id.as_str(), model.context))
+            .collect();
+        assert_eq!(
+            models,
+            [("glm-4.6", Some(1_000_000)), ("glm-4.5-air", None)]
+        );
         assert_eq!(
             read.slots,
             BTreeMap::from([

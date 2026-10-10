@@ -308,7 +308,7 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
     };
     let base_url = normalize_url(protocol, &base_url);
     let default = model_id(name, table);
-    let mut models = vec![default.clone()];
+    let mut models = vec![file_model(default.clone(), table)];
     let tables = doc.get("model").and_then(Item::as_table_like);
     for (other, item) in tables.into_iter().flat_map(|tables| tables.iter()) {
         let Some(other_table) = item.as_table_like() else {
@@ -317,8 +317,8 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
         let same_address = endpoint(&doc, other_table)
             .is_some_and(|(p, url, _)| p == protocol && normalize_url(p, &url) == base_url);
         let id = model_id(other, other_table);
-        if same_address && !models.contains(&id) {
-            models.push(id);
+        if same_address && !models.iter().any(|model| model.id == id) {
+            models.push(file_model(id, other_table));
         }
     }
     Ok(Some(FileSetup {
@@ -332,6 +332,17 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
         slots: Default::default(),
         default_model: Some(default),
     }))
+}
+
+fn file_model(id: String, table: &dyn TableLike) -> Model {
+    Model {
+        id,
+        context: table
+            .get("context_window")
+            .and_then(Item::as_integer)
+            .and_then(|tokens| u64::try_from(tokens).ok()),
+        ..Model::default()
+    }
 }
 
 fn text(item: Option<&Item>) -> Option<String> {
@@ -623,6 +634,7 @@ model = "m-a"
 base_url = "https://gw.example/v1"
 api_key = "sk-gw"
 api_backend = "responses"
+context_window = 400000
 
 [model.c]
 model = "m-c"
@@ -644,7 +656,12 @@ base_url = "https://gw.example/v1"
         assert_eq!(setup.protocol, Protocol::OpenaiResponses);
         assert_eq!(setup.base_url, "https://gw.example/v1");
         assert_eq!(setup.key.as_deref(), Some("sk-gw"));
-        assert_eq!(setup.models, ["m-a", "m-b"]);
+        let models: Vec<(&str, Option<u64>)> = setup
+            .models
+            .iter()
+            .map(|model| (model.id.as_str(), model.context))
+            .collect();
+        assert_eq!(models, [("m-a", Some(400_000)), ("m-b", None)]);
         assert_eq!(setup.default_model.as_deref(), Some("m-a"));
         assert_eq!(
             super::setup(

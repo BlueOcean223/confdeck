@@ -48,7 +48,7 @@ pub enum Modality {
     Image,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
     /// 显示名；没有时显示 `id`。

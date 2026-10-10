@@ -128,8 +128,8 @@ pub struct FileSetup {
     pub base_url: String,
     /// 文件里是 Key 本身时才有；`apiKeyHelper`、`env_key` 这类读不到 Key。
     pub key: Option<String>,
-    /// 文件里出现的模型名，按出现顺序，去重。
-    pub models: Vec<String>,
+    /// 文件里出现的模型，按出现顺序，去重。看得出上下文长度的带上（Claude Code 的 `[1m]`、Grok 的 `context_window`）。
+    pub models: Vec<Model>,
     /// 槽位型 agent 的槽位 → 模型名。
     pub slots: BTreeMap<String, String>,
     /// 列表型 agent 的默认模型。

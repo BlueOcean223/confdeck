@@ -17,7 +17,7 @@ use crate::engine::LiveFile;
 use crate::fsx::Mode;
 use crate::patch::toml::{self, TomlDocPatch, put_table, put_value, remove_key, shape_error};
 use crate::patch::{Format, PatchError};
-use crate::provider::{Protocol, Provider, normalize_url};
+use crate::provider::{Model, Protocol, Provider, normalize_url};
 
 const AGENT: AgentKind = AgentKind::Codex;
 
@@ -290,7 +290,13 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
             .as_ref()
             .and_then(Credential::key)
             .map(str::to_string),
-        models: model.iter().cloned().collect(),
+        models: model
+            .iter()
+            .map(|id| Model {
+                id: id.clone(),
+                ..Model::default()
+            })
+            .collect(),
         slots: Default::default(),
         default_model: model,
     }))
@@ -527,7 +533,13 @@ requires_openai_auth = false
         assert_eq!(read.protocol, Protocol::OpenaiResponses);
         assert_eq!(read.base_url, "https://relay.elsewhere.io/v1");
         assert_eq!(read.key.as_deref(), Some("sk-x"));
-        assert_eq!(read.models, ["glm-4.6"]);
+        assert_eq!(
+            read.models,
+            [Model {
+                id: "glm-4.6".into(),
+                ..Model::default()
+            }]
+        );
         assert_eq!(read.default_model.as_deref(), Some("glm-4.6"));
         assert!(read.slots.is_empty());
         assert_eq!(

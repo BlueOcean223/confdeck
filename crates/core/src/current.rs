@@ -20,7 +20,7 @@ use crate::apply::{ApplyError, PatchFor, Writer, writer};
 use crate::engine::{Engine, LiveFile};
 use crate::patch::PatchError;
 use crate::preset;
-use crate::provider::{self, AgentOverride, Model, Provider};
+use crate::provider::{self, AgentOverride, Provider};
 
 /// 单选 agent 现在用的是哪家。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,12 +137,9 @@ pub fn draft(
             overrides: Default::default(),
         },
     };
-    for id in setup.models {
-        if draft.model(&id).is_none() {
-            draft.models.push(Model {
-                id,
-                ..Model::default()
-            });
+    for model in setup.models {
+        if draft.model(&model.id).is_none() {
+            draft.models.push(model);
         }
     }
     if overrides != AgentOverride::default() {
@@ -449,7 +446,7 @@ mod tests {
             r#"{"env": {
                 "ANTHROPIC_BASE_URL": "https://api.relay-one.com/anthropic/",
                 "ANTHROPIC_AUTH_TOKEN": "sk-deep",
-                "ANTHROPIC_MODEL": "deepseek-chat",
+                "ANTHROPIC_MODEL": "deepseek-chat[1m]",
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-chat"
             }}"#
             .into()
@@ -513,6 +510,9 @@ mod tests {
             6,
             "every slot is written, the two from the file and the rest filled from the catalog"
         );
+        // `[1m]` 记成了 1M 上下文，写回来还带着。
+        let env: serde_json::Value = serde_json::from_slice(&after).unwrap();
+        assert_eq!(env["env"]["ANTHROPIC_MODEL"], "deepseek-chat[1m]");
     }
 
     #[test]
