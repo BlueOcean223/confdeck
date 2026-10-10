@@ -27,6 +27,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 # Pi 的 models.json 允许注释和尾逗号，按 JSON5 读。
 json5 = "1"
+# 改写 JSON5 / JSONC 文件时保留注释和排版（round-trip 语法树）。
+json-five = { version = "0.3.1", default-features = false }
 # 写入引擎：文件内容的 hash、备份文件名里的本地时间。
 sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

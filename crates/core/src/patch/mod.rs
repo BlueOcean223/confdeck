@@ -6,6 +6,7 @@
 //! 移植自 ccs-lite（BlueOcean223/cc-switch）的 `live/patch`。
 
 pub mod json;
+mod jsonc;
 pub mod toml;
 
 use std::fmt;
@@ -55,7 +56,7 @@ pub trait LivePatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Json,
-    /// 读的时候允许注释、尾逗号（JSON5 / JSONC），写回是标准 JSON。
+    /// 允许注释、尾逗号（JSON5 / JSONC）。写回时注释和排版原样保留，只改动变了的值。
     Json5,
     Toml,
 }

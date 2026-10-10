@@ -4,9 +4,12 @@
 //! `preserve_order` 下等于 `swap_remove`，会把最后一个键挪到被删键的位置，所以这里
 //! 删除一律用 `shift_remove`，替换一律原位改值，新增的键追加到所在对象末尾。
 //!
+//! 允许 JSON5 的文件（Pi、OpenCode）交给 [`super::jsonc`] 改写，注释和排版原样留下，只动变了的值。
+//! 改写不了（见那边的说明）或者改完重新解析和目标对不上时，退回下面的重新序列化。
+//!
 //! 重新序列化不保留原始排版：缩进沿用文件原有的（空格或 Tab），换行符和末尾换行
-//! 照原样，但 `é` 这类转义会变成原字符、数字可能换写法，JSON5 文件里的注释和尾逗号
-//! 会丢。所以承诺的是：键、值、顺序不变；第一次写入可能规范化写法，之后的写入字节稳定。
+//! 照原样，但 `é` 这类转义会变成原字符、数字可能换写法，注释和尾逗号会丢。
+//! 所以承诺的是：键、值、顺序不变；第一次写入可能规范化写法，之后的写入字节稳定。
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -14,7 +17,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use super::{KeyPath, LivePatch, PatchError, decode_utf8};
+use super::{KeyPath, LivePatch, PatchError, decode_utf8, jsonc};
 
 /// 按谓词清空的作用域：父对象里所有命中谓词的键（关键字段）。
 #[derive(Clone)]
@@ -25,7 +28,7 @@ pub struct ClearScope {
 
 #[derive(Clone, Default)]
 pub struct JsonPatch {
-    /// 文件允许 JSON5 写法（注释、尾逗号、不加引号的键）。写回时一律是标准 JSON。
+    /// 文件允许 JSON5 写法（注释、尾逗号、不加引号的键）。写回时保留注释和排版。
     pub json5: bool,
     /// 先清空的关键字段。目标值里也有的键不删，留给 `set` 原位改值。
     pub clear: Vec<ClearScope>,
@@ -104,10 +107,35 @@ impl JsonPatch {
 
 impl LivePatch for JsonPatch {
     fn apply(&self, path: &Path, pre: Option<&[u8]>) -> Result<Vec<u8>, PatchError> {
-        let (mut doc, style) = parse(path, pre, self.json5)?;
-        self.apply_to(path, &mut doc)?;
-        Ok(serialize(&doc, &style))
+        rewrite(path, pre, self.json5, |doc| self.apply_to(path, doc))
     }
+}
+
+/// 解析写前内容，交给 `edit` 改，再写回。允许 JSON5 的文件保留注释和排版，见模块说明。
+pub fn rewrite(
+    path: &Path,
+    pre: Option<&[u8]>,
+    json5: bool,
+    edit: impl FnOnce(&mut Value) -> Result<(), PatchError>,
+) -> Result<Vec<u8>, PatchError> {
+    let (mut doc, style) = parse(path, pre, json5)?;
+    let before = doc.clone();
+    edit(&mut doc)?;
+
+    // parse 已经确认过是 UTF-8。空文件没有可保留的东西。
+    let source = pre
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(|text| text.strip_prefix('\u{feff}').unwrap_or(text))
+        .filter(|text| !text.trim().is_empty());
+    if let Some(source) = source.filter(|_| json5) {
+        let edited = jsonc::rewrite(source, &before, &doc, &style.indent)
+            .filter(|out| parse_text(path, out, true).is_ok_and(|reparsed| reparsed == doc));
+        if let Some(out) = edited {
+            let bom = if style.bom { "\u{feff}" } else { "" };
+            return Ok(format!("{bom}{out}").into_bytes());
+        }
+    }
+    Ok(serialize(&doc, &style))
 }
 
 /// 从 `old` 改成 `new` 的补丁，规则见 [`super::delta`]。两个文档的顶层都是对象。
@@ -536,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn json5_files_are_read_only_when_allowed() {
+    fn json5_files_are_read_only_when_allowed_and_keep_their_comments() {
         let pre = "{\n  // 本地模型\n  providers: {\n    ollama: { baseUrl: 'http://localhost:11434/v1', },\n  },\n}\n";
         let strict = JsonPatch::default().apply(Path::new("models.json"), Some(pre.as_bytes()));
         assert!(
@@ -552,15 +580,27 @@ mod tests {
             )],
             ..JsonPatch::default()
         };
-        let out = apply(&patch, pre);
-        let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
-            value,
-            json!({"providers": {
-                "ollama": {"baseUrl": "http://localhost:11434/v1"},
-                "x": {"api": "anthropic-messages"}
-            }})
+            apply(&patch, pre),
+            "{\n  // 本地模型\n  providers: {\n    ollama: { baseUrl: 'http://localhost:11434/v1', },\n    \"x\": {\n      \"api\": \"anthropic-messages\"\n    },\n  },\n}\n"
         );
+    }
+
+    #[test]
+    fn json5_files_fall_back_to_reserializing_when_comments_cannot_be_kept() {
+        // 同一个键出现两次又要改它：不知道改哪一个，整个重新序列化，注释丢了但内容是对的。
+        let patch = JsonPatch {
+            json5: true,
+            set: vec![(KeyPath::new(&["a"]), json!(3))],
+            ..JsonPatch::default()
+        };
+        assert_eq!(
+            apply(&patch, "{\n  // 说明\n  \"a\": 1,\n  \"a\": 2\n}\n"),
+            "{\n  \"a\": 3\n}\n"
+        );
+        // BOM 照留。
+        let out = apply(&patch, "\u{feff}{\n  // 说明\n  \"a\": 1\n}\n");
+        assert_eq!(out, "\u{feff}{\n  // 说明\n  \"a\": 3\n}\n");
     }
 
     #[test]

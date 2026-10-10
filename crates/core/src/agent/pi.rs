@@ -1,7 +1,7 @@
 //! Pi：`~/.pi/agent/models.json`。多选 agent，列表型。
 //!
 //! 每家供应商是 `providers` 下的一项，键是 `confdeck-<id>`；勾上就整项写入，取消就整项删掉，
-//! 用户自己写的其他项不动。Pi 读这个文件时允许注释（JSONC），写回后注释会丢。
+//! 用户自己写的其他项不动。Pi 读这个文件时允许注释（JSONC），写回时注释和排版原样保留。
 //! 默认模型存在 Pi 自己的 `settings.json`，confdeck 只读不写。
 
 use std::path::{Path, PathBuf};
@@ -153,7 +153,7 @@ mod tests {
         let out = patch
             .apply(Path::new("models.json"), pre.map(str::as_bytes))
             .unwrap();
-        serde_json::from_slice(&out).unwrap()
+        json5::from_str(std::str::from_utf8(&out).unwrap()).unwrap()
     }
 
     #[test]
@@ -195,12 +195,12 @@ mod tests {
             .unwrap()
             .apply(Path::new("models.json"), Some(LIVE.as_bytes()))
             .unwrap();
+        assert!(String::from_utf8_lossy(&added).contains("// 本地模型"));
         let out = remove("relay")
             .apply(Path::new("models.json"), Some(&added))
             .unwrap();
-        let value: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(value["providers"].as_object().unwrap().len(), 1);
-        assert!(value["providers"].get("ollama").is_some());
+        // 加上再删掉，文件和原来一个字节都不差。
+        assert_eq!(String::from_utf8(out).unwrap(), LIVE);
     }
 
     #[test]

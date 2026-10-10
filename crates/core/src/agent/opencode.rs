@@ -11,8 +11,11 @@
 //! （自定义供应商走 `languageModel`，这个包默认发 Responses）；Anthropic → `@ai-sdk/anthropic`，地址补 `/v1`；
 //! Gemini → `@ai-sdk/google`。
 //!
-//! 文件允许注释（JSONC），写回后注释会丢，原件在备份里。默认模型（顶层 `model`）只读不写；
+//! 文件允许注释（JSONC），写回时注释和排版原样保留。默认模型（顶层 `model`）只读不写；
 //! 取消勾选时，`model`、`small_model` 指着这家的一并删掉，不然 OpenCode 找不到这个模型。
+//!
+//! 10-10 用 OpenCode 1.18.35 实际跑过：三种协议的请求地址和鉴权头都对（Anthropic 发 `x-api-key`）；
+//! 没有 `$schema` 的配置，OpenCode 启动时会在最前面补一行（注释保留），有就不改文件。
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +35,8 @@ pub const KEY_PREFIX: &str = "confdeck-";
 
 /// 顶层按 `供应商/模型` 引用模型的键。
 const MODEL_REFS: &[&str] = &["model", "small_model"];
+
+const SCHEMA: &str = "https://opencode.ai/config.json";
 
 pub fn config_dir(home: &Path) -> PathBuf {
     home.join(".config").join("opencode")
@@ -73,12 +78,30 @@ pub fn package(protocol: Protocol) -> &'static str {
 }
 
 /// 勾上这家供应商：写入（或整项替换）`provider.confdeck-<id>`。
-pub fn add(provider: &Provider) -> Result<JsonPatch, AdaptError> {
-    Ok(JsonPatch {
+pub fn add(provider: &Provider) -> Result<AddPatch, AdaptError> {
+    Ok(AddPatch(JsonPatch {
         json5: true,
         set: vec![(path(&provider.id), entry(provider)?)],
         ..JsonPatch::default()
-    })
+    }))
+}
+
+/// 文件是 confdeck 新建的（或者是空对象）时，先写 `$schema`，和 OpenCode 自己建的一样；
+/// 不写的话 OpenCode 下次启动会补上，confdeck 就认成文件被别人改过。
+#[derive(Clone)]
+pub struct AddPatch(JsonPatch);
+
+impl LivePatch for AddPatch {
+    fn apply(&self, path: &Path, pre: Option<&[u8]>) -> Result<Vec<u8>, PatchError> {
+        json::rewrite(path, pre, true, |doc| {
+            if let Some(root) = doc.as_object_mut()
+                && root.is_empty()
+            {
+                root.insert("$schema".into(), SCHEMA.into());
+            }
+            self.0.apply_to(path, doc)
+        })
+    }
 }
 
 /// 取消勾选：删掉 `provider.confdeck-<id>`，和指着它的默认模型。
@@ -103,20 +126,21 @@ pub struct RemovePatch {
 
 impl LivePatch for RemovePatch {
     fn apply(&self, path: &Path, pre: Option<&[u8]>) -> Result<Vec<u8>, PatchError> {
-        let (mut doc, style) = json::parse(path, pre, true)?;
-        self.patch.apply_to(path, &mut doc)?;
-        if let Some(root) = doc.as_object_mut() {
-            for key in MODEL_REFS {
-                let dangling = root
-                    .get(*key)
-                    .and_then(Value::as_str)
-                    .is_some_and(|model| model.starts_with(&self.refs));
-                if dangling {
-                    root.shift_remove(*key);
+        json::rewrite(path, pre, true, |doc| {
+            self.patch.apply_to(path, doc)?;
+            if let Some(root) = doc.as_object_mut() {
+                for key in MODEL_REFS {
+                    let dangling = root
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|model| model.starts_with(&self.refs));
+                    if dangling {
+                        root.shift_remove(*key);
+                    }
                 }
             }
-        }
-        Ok(json::serialize(&doc, &style))
+            Ok(())
+        })
     }
 }
 
@@ -223,7 +247,7 @@ mod tests {
         let out = patch
             .apply(Path::new("opencode.json"), pre.map(str::as_bytes))
             .unwrap();
-        serde_json::from_slice(&out).unwrap()
+        json5::from_str(std::str::from_utf8(&out).unwrap()).unwrap()
     }
 
     fn only(protocol: Protocol, url: &str) -> Provider {
@@ -256,6 +280,16 @@ mod tests {
         assert!(value["provider"]["ollama"].is_object());
         assert_eq!(value["model"], "ollama/qwen2.5-coder:7b");
         assert_eq!(value["$schema"], "https://opencode.ai/config.json");
+    }
+
+    #[test]
+    fn a_new_file_starts_with_the_schema() {
+        let value = apply(&add(&relay()).unwrap(), None);
+        let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["$schema", "provider"]);
+        // 已有的文件没有也不补，OpenCode 自己会补。
+        let value = apply(&add(&relay()).unwrap(), Some(r#"{"theme": "x"}"#));
+        assert!(value.get("$schema").is_none());
     }
 
     #[test]
@@ -336,7 +370,10 @@ mod tests {
 
         // 只剩 confdeck 那一项时，删完不留空的 `provider`。
         let ours = serde_json::to_string(&apply(&add(&relay()).unwrap(), None)).unwrap();
-        assert_eq!(apply(&remove("relay"), Some(&ours)), json!({}));
+        assert_eq!(
+            apply(&remove("relay"), Some(&ours)),
+            json!({"$schema": SCHEMA})
+        );
     }
 
     #[test]

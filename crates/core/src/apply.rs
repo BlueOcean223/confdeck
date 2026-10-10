@@ -337,7 +337,7 @@ mod tests {
 
     use super::*;
     use crate::agent::Credential;
-    use crate::backup::{self, Reason};
+    use crate::backup::Reason;
     use crate::data::DataDir;
     use crate::engine::FileStatus;
     use crate::provider::Protocol;
@@ -463,20 +463,14 @@ mod tests {
         home.write(".pi/agent/models.json", "{\n  // 我的本地模型\n  \"providers\": {\"ollama\": {\"api\": \"openai-completions\"}},\n}\n");
 
         enable(&home.engine, home.path(), AgentKind::Pi, &relay()).unwrap();
-        let value: Value = serde_json::from_str(&home.read(".pi/agent/models.json")).unwrap();
+        let text = home.read(".pi/agent/models.json");
+        let value: Value = json5::from_str(&text).unwrap();
         assert!(value["providers"]["confdeck-relay"].is_object());
         assert!(value["providers"]["ollama"].is_object());
-        // 注释在第一次写入时丢了，原件里还有。
-        let backups =
-            backup::list(home.engine.data(), &pi::live_file(home.path()).shelf()).unwrap();
-        assert!(
-            fs::read_to_string(&backups[0].path)
-                .unwrap()
-                .contains("我的本地模型")
-        );
+        assert!(text.contains("// 我的本地模型"));
 
         disable(&home.engine, home.path(), AgentKind::Pi, "relay").unwrap();
-        let value: Value = serde_json::from_str(&home.read(".pi/agent/models.json")).unwrap();
+        let value: Value = json5::from_str(&home.read(".pi/agent/models.json")).unwrap();
         assert_eq!(value["providers"].as_object().unwrap().len(), 1);
         assert_eq!(
             home.engine.status(&pi::live_file(home.path())).unwrap(),
