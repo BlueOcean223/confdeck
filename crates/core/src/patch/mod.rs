@@ -51,6 +51,43 @@ pub trait LivePatch {
     fn apply(&self, path: &Path, pre: Option<&[u8]>) -> Result<Vec<u8>, PatchError>;
 }
 
+/// 配置文件的格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Json,
+    /// 读的时候允许注释、尾逗号（JSON5 / JSONC），写回是标准 JSON。
+    Json5,
+    Toml,
+}
+
+/// 从 `old` 改成 `new` 的补丁：`old` 有、`new` 没有的键删掉，`new` 里新增的键和值变了的键写上，
+/// 两边一样的键不碰，文件里这些键的当前值保持原样。两边都是对象（表）的键逐层往下比，
+/// 其余的值（含数组）整个比、整个写；新增的对象（TOML 里是标准表，内联表整个写）逐个写里面的键，
+/// 文件里同一处已有的其他键不动。
+///
+/// 用来把供应商的改动写进在用它的 agent：`old`、`new` 是改前、改后的供应商各自写到空文件上的结果，
+/// 见 [`crate::apply::save_provider`]。
+pub fn delta(
+    format: Format,
+    path: &Path,
+    old: &[u8],
+    new: &[u8],
+) -> Result<Box<dyn LivePatch>, PatchError> {
+    match format {
+        Format::Json | Format::Json5 => {
+            let json5 = format == Format::Json5;
+            let (old, _) = json::parse(path, Some(old), json5)?;
+            let (new, _) = json::parse(path, Some(new), json5)?;
+            Ok(Box::new(json::delta(&old, &new, json5)))
+        }
+        Format::Toml => {
+            let old = toml::parse(path, Some(old))?;
+            let new = toml::parse(path, Some(new))?;
+            Ok(Box::new(toml::Delta::between(&old, &new)))
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PatchError {
     /// 文件解析不了。行号、列号从 1 开始。

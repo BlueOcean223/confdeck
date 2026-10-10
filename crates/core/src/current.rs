@@ -16,10 +16,9 @@
 use std::path::Path;
 
 use crate::agent::{AgentKind, Connection, FileSetup, Mode, claude, codex, pi};
-use crate::apply::ApplyError;
-use crate::engine::{Engine, EngineError, LiveFile};
-use crate::fsx;
-use crate::patch::{LivePatch, PatchError};
+use crate::apply::{ApplyError, PatchFor, Writer, writer};
+use crate::engine::{Engine, LiveFile};
+use crate::patch::PatchError;
 use crate::provider::{self, AgentOverride, Model, Provider};
 
 /// 单选 agent 现在用的是哪家。
@@ -32,7 +31,8 @@ pub enum Current {
     /// 地址是这家（供应商 id）的，Key 不一样，显示「DeepSeek · Key 不一致」。
     ///
     /// 选择器里可以用 confdeck 的 Key 重写（[`crate::apply::switch`]），或者把文件里的 Key
-    /// 存进这家（Key 从 [`connection`] 读）。文件里没写 Key、或者写的是 `apiKeyHelper`、
+    /// 存进这家（Key 从 [`connection`] 读，用 [`crate::apply::save_provider`] 存，其他在用这家的
+    /// agent 跟着换成这个 Key）。文件里没写 Key、或者写的是 `apiKeyHelper`、
     /// `env_key` 这类读不到 Key 的写法，也算这一种，只是没有第二个选项。
     KeyMismatch { provider: String },
     /// 和列表里哪家都对不上，显示「自定义 · 主机名」。
@@ -153,33 +153,21 @@ struct Source {
 
 type Reader = fn(&Path, Option<&[u8]>) -> Result<Connection, PatchError>;
 type SetupReader = fn(&Path, Option<&[u8]>) -> Result<Option<FileSetup>, PatchError>;
-type PatchFor = dyn Fn(&Provider) -> Result<Box<dyn LivePatch>, crate::agent::AdaptError>;
 
 fn source(home: &Path, agent: AgentKind) -> Result<Source, ApplyError> {
-    match agent {
-        AgentKind::ClaudeCode => Ok(Source {
-            file: claude::live_file(home),
-            read: claude::connection,
-            setup: claude::setup,
-            patch: Box::new(|provider| Ok(Box::new(claude::patch(Some(provider))?))),
-        }),
-        AgentKind::Codex => {
-            let auth_path = codex::auth_path(home);
-            let auth = fsx::read_optional(&auth_path).map_err(|source| EngineError::Io {
-                path: auth_path.clone(),
-                source,
-            })?;
-            let login = codex::login_on_disk(auth.as_deref());
-            Ok(Source {
-                file: codex::live_file(home),
-                read: codex::connection,
-                setup: codex::setup,
-                patch: Box::new(move |provider| Ok(Box::new(codex::patch(Some(provider), login)?))),
-            })
-        }
-        AgentKind::GrokBuild => Err(ApplyError::Unsupported { agent }),
-        AgentKind::Pi | AgentKind::Opencode => Err(ApplyError::WrongMode { agent }),
-    }
+    let (read, setup): (Reader, SetupReader) = match agent {
+        AgentKind::ClaudeCode => (claude::connection, claude::setup),
+        AgentKind::Codex => (codex::connection, codex::setup),
+        AgentKind::GrokBuild => return Err(ApplyError::Unsupported { agent }),
+        AgentKind::Pi | AgentKind::Opencode => return Err(ApplyError::WrongMode { agent }),
+    };
+    let Writer { file, patch } = writer(home, agent)?;
+    Ok(Source {
+        file,
+        read,
+        setup,
+        patch,
+    })
 }
 
 fn identify(live: &Connection, candidates: &[Candidate], record: Option<&str>) -> Current {

@@ -110,6 +110,45 @@ impl LivePatch for JsonPatch {
     }
 }
 
+/// 从 `old` 改成 `new` 的补丁，规则见 [`super::delta`]。两个文档的顶层都是对象。
+pub fn delta(old: &Value, new: &Value, json5: bool) -> JsonPatch {
+    let mut patch = JsonPatch {
+        json5,
+        ..JsonPatch::default()
+    };
+    diff(&KeyPath::root(), old, new, &mut patch);
+    patch
+}
+
+fn diff(at: &KeyPath, old: &Value, new: &Value, patch: &mut JsonPatch) {
+    match (old, new) {
+        (Value::Object(old), Value::Object(new)) => {
+            for key in old.keys().filter(|key| !new.contains_key(*key)) {
+                patch.remove.push(at.child(key));
+            }
+            for (key, value) in new {
+                match old.get(key) {
+                    Some(before) => diff(&at.child(key), before, value, patch),
+                    None => added(&at.child(key), value, patch),
+                }
+            }
+        }
+        _ if old == new => {}
+        _ => patch.set.push((at.clone(), new.clone())),
+    }
+}
+
+fn added(at: &KeyPath, value: &Value, patch: &mut JsonPatch) {
+    match value {
+        Value::Object(map) if !map.is_empty() => {
+            for (key, child) in map {
+                added(&at.child(key), child, patch);
+            }
+        }
+        _ => patch.set.push((at.clone(), value.clone())),
+    }
+}
+
 /// 文档里 `path` 处的值。
 pub fn value_at<'a>(doc: &'a Value, path: &KeyPath) -> Option<&'a Value> {
     path.0
@@ -522,6 +561,81 @@ mod tests {
                 "x": {"api": "anthropic-messages"}
             }})
         );
+    }
+
+    #[test]
+    fn a_delta_touches_only_what_changed_between_two_renderings() {
+        let old = json!({"env": {
+            "ANTHROPIC_BASE_URL": "https://a.example",
+            "ANTHROPIC_AUTH_TOKEN": "sk-a",
+            "ANTHROPIC_MODEL": "m",
+            "ANTHROPIC_CUSTOM_HEADERS": "x: 1"
+        }});
+        let new = json!({"env": {
+            "ANTHROPIC_BASE_URL": "https://a.example",
+            "ANTHROPIC_AUTH_TOKEN": "sk-b",
+            "ANTHROPIC_MODEL": "m",
+            "ANTHROPIC_SMALL_FAST_MODEL": "s"
+        }, "headers": {"X-Team": "infra"}});
+        let patch = delta(&old, &new, false);
+        assert_eq!(
+            patch.remove,
+            [KeyPath::new(&["env", "ANTHROPIC_CUSTOM_HEADERS"])]
+        );
+        assert_eq!(
+            patch.set,
+            [
+                (
+                    KeyPath::new(&["env", "ANTHROPIC_AUTH_TOKEN"]),
+                    json!("sk-b")
+                ),
+                (
+                    KeyPath::new(&["env", "ANTHROPIC_SMALL_FAST_MODEL"]),
+                    json!("s")
+                ),
+                (KeyPath::new(&["headers", "X-Team"]), json!("infra")),
+            ]
+        );
+
+        // 文件里的其他键，和这家生成过、但这次没变的键（用户自己改过的模型名），都不动。
+        let live = r#"{
+  "model": "picked-in-claude",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://a.example",
+    "ANTHROPIC_AUTH_TOKEN": "sk-a",
+    "ANTHROPIC_MODEL": "edited-by-hand",
+    "ANTHROPIC_CUSTOM_HEADERS": "x: 1"
+  },
+  "headers": {"Mine": "1"}
+}"#;
+        let out: Value = serde_json::from_str(&apply(&patch, live)).unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "model": "picked-in-claude",
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://a.example",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-b",
+                    "ANTHROPIC_MODEL": "edited-by-hand",
+                    "ANTHROPIC_SMALL_FAST_MODEL": "s"
+                },
+                "headers": {"Mine": "1", "X-Team": "infra"}
+            })
+        );
+    }
+
+    #[test]
+    fn a_delta_replaces_arrays_whole_and_drops_removed_objects_whole() {
+        let old = json!({"p": {"models": [{"id": "a"}, {"id": "b"}], "headers": {"X": "1"}}});
+        let new = json!({"p": {"models": [{"id": "a"}]}});
+        let patch = delta(&old, &new, true);
+        assert!(patch.json5);
+        assert_eq!(patch.remove, [KeyPath::new(&["p", "headers"])]);
+        assert_eq!(
+            patch.set,
+            [(KeyPath::new(&["p", "models"]), json!([{"id": "a"}]))]
+        );
+        assert!(delta(&old, &old, false).set.is_empty());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use super::{
 use crate::engine::LiveFile;
 use crate::fsx::Mode;
 use crate::patch::json::{self, ClearScope, JsonPatch};
-use crate::patch::{KeyPath, PatchError};
+use crate::patch::{Format, KeyPath, PatchError};
 use crate::provider::{Protocol, Provider, normalize_url};
 
 const AGENT: AgentKind = AgentKind::ClaudeCode;
@@ -29,6 +29,7 @@ pub fn live_file(home: &Path) -> LiveFile {
         owner: AGENT.id(),
         path: settings_path(home),
         mode: Mode::Private,
+        format: Format::Json,
     }
 }
 

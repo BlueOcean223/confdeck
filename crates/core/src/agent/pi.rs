@@ -12,7 +12,7 @@ use super::{AdaptError, AgentKind, choose_protocol, list_models};
 use crate::engine::LiveFile;
 use crate::fsx::Mode;
 use crate::patch::json::{self, JsonPatch};
-use crate::patch::{KeyPath, PatchError};
+use crate::patch::{Format, KeyPath, PatchError};
 use crate::provider::{Model, Protocol, Provider};
 
 const AGENT: AgentKind = AgentKind::Pi;
@@ -30,6 +30,7 @@ pub fn live_file(home: &Path) -> LiveFile {
         owner: AGENT.id(),
         path: models_path(home),
         mode: Mode::Private,
+        format: Format::Json5,
     }
 }
 

@@ -37,6 +37,105 @@ pub fn parse(path: &Path, pre: Option<&[u8]>) -> Result<DocumentMut, PatchError>
     })
 }
 
+/// 从一份文档改成另一份的补丁，规则见 [`super::delta`]。删键用 [`remove_key`]，改值用
+/// [`put_value`]，注释和位置都保住。
+#[derive(Debug, Clone, Default)]
+pub struct Delta {
+    remove: Vec<KeyPath>,
+    set: Vec<(KeyPath, Item)>,
+}
+
+impl Delta {
+    pub fn between(old: &DocumentMut, new: &DocumentMut) -> Self {
+        let mut delta = Self::default();
+        delta.diff(&KeyPath::root(), old.as_table(), new.as_table());
+        delta
+    }
+
+    fn diff(&mut self, at: &KeyPath, old: &dyn TableLike, new: &dyn TableLike) {
+        for (key, _) in old.iter() {
+            if !new.contains_key(key) {
+                self.remove.push(at.child(key));
+            }
+        }
+        for (key, item) in new.iter() {
+            let at = at.child(key);
+            let Some(before) = old.get(key) else {
+                self.added(at, item);
+                continue;
+            };
+            match (before.as_table_like(), item.as_table_like()) {
+                (Some(before), Some(after)) => self.diff(&at, before, after),
+                _ if bare(before).to_string() == bare(item).to_string() => {}
+                _ => self.set.push((at, bare(item))),
+            }
+        }
+    }
+
+    /// 新增的标准表逐个写里面的键；内联表和其他值整个写。
+    fn added(&mut self, at: KeyPath, item: &Item) {
+        match item {
+            Item::Table(table) if !table.is_empty() => {
+                for (key, child) in table.iter() {
+                    self.added(at.child(key), child);
+                }
+            }
+            _ => self.set.push((at, bare(item))),
+        }
+    }
+}
+
+/// 去掉值前后的空白和注释：用来比较两个值是否相同；写进文件时由 toml_edit 按所在位置补上默认的空白。
+fn bare(item: &Item) -> Item {
+    let mut item = item.clone();
+    if let Item::Value(value) = &mut item {
+        value.decor_mut().clear();
+    }
+    item
+}
+
+impl TomlDocPatch for Delta {
+    fn apply_to(&self, path: &Path, doc: &mut DocumentMut) -> Result<(), PatchError> {
+        for key_path in &self.remove {
+            let (parent, key) = key_path.split_last().expect("delta paths name a key");
+            let parent: Vec<&str> = parent.iter().map(String::as_str).collect();
+            remove_key(doc, &parent, key);
+        }
+        for (key_path, item) in &self.set {
+            let (parent, key) = key_path.split_last().expect("delta paths name a key");
+            let table = ensure_table_like(path, doc.as_table_mut(), parent)?;
+            match item {
+                Item::Value(value) => put_value(table, key, value),
+                other => {
+                    table.insert(key, other.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 沿路径找到表（标准表或内联表），缺的层级补成隐式表（只装子表时不输出空表头）。
+fn ensure_table_like<'a>(
+    path: &Path,
+    root: &'a mut Table,
+    segments: &[String],
+) -> Result<&'a mut dyn TableLike, PatchError> {
+    let mut current: &mut dyn TableLike = root;
+    for (depth, segment) in segments.iter().enumerate() {
+        if !current.contains_key(segment) {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            current.insert(segment, Item::Table(table));
+        }
+        current = current
+            .get_mut(segment)
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| shape_error(path, &segments[..=depth]))?;
+    }
+    Ok(current)
+}
+
 /// 原位改值：已有就沿用原来的空白和行尾注释，没有就追加到表末尾。
 pub fn put_value(table: &mut dyn TableLike, key: &str, value: &Value) {
     match table.get_mut(key) {
@@ -284,6 +383,48 @@ mod tests {
             removed(text, &[], &["v"]),
             "k = 1\n# 说明\n\n[a.c]\nx = 1\n\n[a]\ny = 2\n"
         );
+    }
+
+    fn delta(old: &str, new: &str, live: &str) -> String {
+        let delta = Delta::between(&old.parse().unwrap(), &new.parse().unwrap());
+        let out = delta
+            .apply(Path::new("c.toml"), Some(live.as_bytes()))
+            .expect("apply");
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_delta_changes_only_what_changed_and_keeps_comments() {
+        let old = "model_provider = \"custom\"\nmodel = \"m\"\n\n[model_providers.custom]\nname = \"Relay\"\nbase_url = \"https://a.example/v1\"\nexperimental_bearer_token = \"sk-a\"\nheaders = { X = \"1\" }\n";
+        let new = "model_provider = \"custom\"\nmodel = \"m\"\n\n[model_providers.custom]\nname = \"Relay\"\nbase_url = \"https://a.example/v1\"\nexperimental_bearer_token = \"sk-b\"\nquery = { v = \"2\" }\n";
+        // 用户在 Codex 里换了模型、加了推理档位和自己的设置，路由表上方写了注释。
+        let live = "# 我的 Codex\nmodel_provider = \"custom\"\nmodel = \"picked\"\nmodel_reasoning_effort = \"high\"\n\n# 中转\n[model_providers.custom]\nname = \"Relay\"\nbase_url = \"https://a.example/v1\"\nexperimental_bearer_token = \"sk-a\"   # 别外传\nheaders = { X = \"1\" }\n\n[tui]\nnotifications = true\n";
+        assert_eq!(
+            delta(old, new, live),
+            "# 我的 Codex\nmodel_provider = \"custom\"\nmodel = \"picked\"\nmodel_reasoning_effort = \"high\"\n\n# 中转\n[model_providers.custom]\nname = \"Relay\"\nbase_url = \"https://a.example/v1\"\nexperimental_bearer_token = \"sk-b\"   # 别外传\nquery = { v = \"2\" }\n\n[tui]\nnotifications = true\n"
+        );
+    }
+
+    #[test]
+    fn a_delta_reaches_into_inline_tables_and_creates_missing_ones() {
+        let old = "[p.custom]\nbase_url = \"a\"\n";
+        let new = "[p.custom]\nbase_url = \"b\"\n";
+        assert_eq!(
+            delta(
+                old,
+                new,
+                "p = { custom = { base_url = \"a\", mine = 1 } }\n"
+            ),
+            "p = { custom = { base_url = \"b\", mine = 1 } }\n"
+        );
+        assert_eq!(
+            delta(old, new, "k = 1\n"),
+            "k = 1\n\n[p.custom]\nbase_url = \"b\"\n"
+        );
+        let err = Delta::between(&old.parse().unwrap(), &new.parse().unwrap())
+            .apply(Path::new("c.toml"), Some(b"p = 1\n"))
+            .expect_err("must refuse");
+        assert!(matches!(err, PatchError::Shape { .. }), "{err:?}");
     }
 
     #[test]

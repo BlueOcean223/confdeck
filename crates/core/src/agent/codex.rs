@@ -15,8 +15,8 @@ use super::{
 };
 use crate::engine::LiveFile;
 use crate::fsx::Mode;
-use crate::patch::PatchError;
 use crate::patch::toml::{self, TomlDocPatch, put_value, remove_key, shape_error};
+use crate::patch::{Format, PatchError};
 use crate::provider::{Protocol, Provider, normalize_url};
 
 const AGENT: AgentKind = AgentKind::Codex;
@@ -34,6 +34,7 @@ pub fn live_file(home: &Path) -> LiveFile {
         owner: AGENT.id(),
         path: config_path(home),
         mode: Mode::Private,
+        format: Format::Toml,
     }
 }
 

@@ -30,7 +30,7 @@ use chrono::Local;
 use crate::backup::{self, Backup, Reason, Shelf};
 use crate::data::DataDir;
 use crate::fsx::{self, Digest, Mode};
-use crate::patch::{LivePatch, PatchError};
+use crate::patch::{Format, LivePatch, PatchError};
 use state::State;
 
 /// 第 6 步发现被外部改了以后最多重来几次。
@@ -44,6 +44,7 @@ pub struct LiveFile {
     /// 配置里的路径，可以是软链接。
     pub path: PathBuf,
     pub mode: Mode,
+    pub format: Format,
 }
 
 impl LiveFile {
@@ -319,6 +320,7 @@ mod tests {
             owner: "claude-code",
             path: dir.path().join(".claude").join("settings.json"),
             mode: Mode::Private,
+            format: Format::Json,
         };
         Setup {
             _dir: dir,
