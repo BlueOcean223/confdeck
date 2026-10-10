@@ -25,4 +25,7 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
+# Pi 的 models.json 允许注释和尾逗号，按 JSON5 读。
+json5 = "1"
+tempfile = "3"
 toml_edit = "0.22"
