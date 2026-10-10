@@ -9,6 +9,11 @@
 //! 记录丢了也会漏删。
 //!
 //! 字段和凭据的规则见 Grok 自带文档 `~/.grok/docs/user-guide/11-custom-models.md`（Grok Build 1.0.46 核实）。
+//!
+//! Anthropic 协议（`api_backend = "messages"`）：请求发到 `{base_url}/messages`，所以地址要带 `/v1`；
+//! Key 按 `Authorization: Bearer` 发，不发 `x-api-key` 和 `anthropic-version`（10-10 在 1.0.46 上抓包核实，
+//! 和 xai-org/grok-build 源码里 `AuthScheme` 默认 `Bearer` 一致）。第三方 Anthropic 兼容地址都收 Bearer
+//! （Claude Code 的 `ANTHROPIC_AUTH_TOKEN` 也是这么发的）；Anthropic 官方要 `x-api-key`，不支持。
 
 use std::path::{Path, PathBuf};
 
@@ -65,7 +70,6 @@ fn api_backend(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::OpenaiResponses => "responses",
         Protocol::OpenaiChat => "chat_completions",
-        // Grok 1.0.46 也支持 Anthropic 协议，鉴权头还没核实，所以不在 Grok 的协议列表里。
         Protocol::Anthropic => "messages",
         Protocol::Gemini => unreachable!("Grok Build 不支持 Gemini 协议，choose_protocol 不会选到"),
     }
@@ -101,6 +105,14 @@ pub fn patch(provider: Option<&Provider>) -> Result<GrokPatch, AdaptError> {
         });
     };
     let (protocol, base_url) = choose_protocol(provider, AGENT)?;
+    let base_url = match protocol {
+        Protocol::Anthropic if provider.is_anthropic_official() => {
+            return Err(AdaptError::AnthropicOfficial { agent: AGENT });
+        }
+        // confdeck 存的 Anthropic 地址不带 `/v1`，Grok 只在后面拼 `/messages`。
+        Protocol::Anthropic => format!("{base_url}/v1"),
+        _ => base_url.to_string(),
+    };
     let key = require_key(provider, AGENT)?;
     let default = default_model(provider, AGENT)?;
     let mut models = list_models(provider, AGENT)?;
@@ -112,7 +124,7 @@ pub fn patch(provider: Option<&Provider>) -> Result<GrokPatch, AdaptError> {
 
     let mut tables = Vec::new();
     for model in models {
-        let mut table = model_table(provider, model, protocol, base_url, key);
+        let mut table = model_table(provider, model, protocol, &base_url, key);
         for (name, value) in raw.into_iter().flatten() {
             if value.is_null() {
                 table.remove(name);
@@ -680,11 +692,32 @@ base_url = "https://gw.example/v1"
         let out = apply(&patch(Some(&chat_only)).unwrap(), None);
         assert!(out.contains("api_backend = \"chat_completions\""), "{out}");
 
+        // 只有 Anthropic 兼容地址的：走 messages，地址补上 /v1，读回来还是存的那个地址。
         let mut anthropic_only = relay();
         anthropic_only.endpoints =
             BTreeMap::from([(Protocol::Anthropic, "https://a.example".into())]);
+        let out = apply(&patch(Some(&anthropic_only)).unwrap(), None);
+        assert!(out.contains("api_backend = \"messages\""), "{out}");
+        assert!(out.contains("base_url = \"https://a.example/v1\""), "{out}");
+        assert_eq!(
+            read(&out),
+            Connection::Endpoint {
+                base_url: "https://a.example".into(),
+                credential: Some(Credential::Key("sk-relay".into())),
+            }
+        );
+
+        let mut official = relay();
+        official.endpoints =
+            BTreeMap::from([(Protocol::Anthropic, "https://api.anthropic.com".into())]);
         assert!(matches!(
-            patch(Some(&anthropic_only)),
+            patch(Some(&official)),
+            Err(AdaptError::AnthropicOfficial { .. })
+        ));
+        let mut gemini_only = relay();
+        gemini_only.endpoints = BTreeMap::from([(Protocol::Gemini, "https://g.example".into())]);
+        assert!(matches!(
+            patch(Some(&gemini_only)),
             Err(AdaptError::Incompatible { .. })
         ));
 

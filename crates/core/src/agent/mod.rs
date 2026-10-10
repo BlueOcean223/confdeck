@@ -66,7 +66,7 @@ impl AgentKind {
         match self {
             Self::ClaudeCode => &[Anthropic],
             Self::Codex => &[OpenaiResponses],
-            Self::GrokBuild => &[OpenaiResponses, OpenaiChat],
+            Self::GrokBuild => &[OpenaiResponses, OpenaiChat, Anthropic],
             Self::Pi | Self::Opencode => &[OpenaiChat, Anthropic, OpenaiResponses, Gemini],
         }
     }
@@ -181,6 +181,9 @@ pub enum AdaptError {
     RawUnsupported { agent: AgentKind },
     #[error("{agent} 的原始片段里 {key} 的值含有 null，TOML 里写不了")]
     RawNotToml { agent: AgentKind, key: String },
+    /// Grok Build 走 Anthropic 协议时 Key 只会放进 `Authorization: Bearer`，Anthropic 官方要 `x-api-key`。
+    #[error("{agent} 连 Anthropic 官方要把 Key 放进 x-api-key 头，还不支持")]
+    AnthropicOfficial { agent: AgentKind },
 }
 
 fn join(protocols: &[Protocol]) -> String {
