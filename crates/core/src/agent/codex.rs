@@ -139,7 +139,7 @@ fn own_credentials(table: &Table) -> bool {
 /// 这个值不决定请求用什么凭据（表自己的 Key 优先），但决定登录界面：为 `true` 而 Codex 看不到登录，
 /// 会卡在登录页；为 `false` 而旁边留着 ChatGPT 登录，Codex 当成已登出（账号信息不显示、token 不刷新）。
 /// 所以表有自己的 Key 时跟着「有没有登录」走。没有自己的 Key 时恒为 `false`：为 `true` 时请求会带上
-/// 官方登录，发给第三方地址。（ccs-lite 在 Codex 0.149 上核实）
+/// 官方登录，发给第三方地址。（ccs-lite 在 Codex 0.149 上核实；登录界面的两种表现 10-10 在 0.153.4 上又试过）
 pub fn requires_openai_auth(own_credentials: bool, login: bool) -> bool {
     own_credentials && login
 }
