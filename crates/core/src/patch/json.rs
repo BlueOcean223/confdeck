@@ -34,6 +34,8 @@ pub struct JsonPatch {
     pub clear: Vec<ClearScope>,
     /// 按路径点名删掉的键。`set` 里有同一路径时跳过。
     pub remove: Vec<KeyPath>,
+    /// 值还是这个才删：confdeck 上次写的、之后没被改过的键。`set` 里有同一路径时跳过。
+    pub remove_if: Vec<(KeyPath, Value)>,
     /// 目标值：已存在就原位改值，不存在就追加到父对象末尾（父对象缺失时一并创建）。
     pub set: Vec<(KeyPath, Value)>,
     /// 这些对象被上面几步删空了，就连对象本身一起删掉（比如切回默认后不留一个空的 `env`）。
@@ -70,6 +72,16 @@ impl JsonPatch {
 
         for key_path in &self.remove {
             if targets.contains(key_path) {
+                continue;
+            }
+            let (parent, key) = split(key_path);
+            if let Some(map) = object_at_mut(path, doc, parent)? {
+                map.shift_remove(key);
+            }
+        }
+
+        for (key_path, value) in &self.remove_if {
+            if targets.contains(key_path) || value_at(doc, key_path) != Some(value) {
                 continue;
             }
             let (parent, key) = split(key_path);

@@ -4,6 +4,8 @@
 //!   一样说明文件还是 confdeck 上次写的样子，不用备份；不一样说明被外部改过。
 //! - `selections`：单选 agent 上次在 confdeck 里选的是哪家（`null` 是「默认」，没有这一项是没选过）。
 //!   认当前是哪家时，同一个地址和 Key 对得上好几家，就以它为准（见 [`crate::current`]）。
+//! - `owned`：原始片段写进 agent 配置里和用户共用的位置的键和值（现在只有 Claude Code 的 `env` 和顶层）。
+//!   下次切换时，值还是这个的才删；用户改过的留着。记在这里而不是现查上一家供应商：那家可能已经改了或删了。
 //!
 //! 这份记录只是提示，丢了或读不出来就当作空的：后果只是多备份一次、认不出同地址的几家里是哪一家，
 //! 所以不像用户的文件那样「读不出就报错」。
@@ -13,8 +15,10 @@ use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::fsx::{self, Digest, Mode};
+use crate::patch::KeyPath;
 
 const VERSION: u32 = 1;
 
@@ -28,6 +32,15 @@ pub struct State {
     /// 键是 agent 的 id。
     #[serde(default)]
     selections: BTreeMap<String, Option<String>>,
+    /// 键是 agent 的 id。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    owned: BTreeMap<String, Vec<Owned>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Owned {
+    pub path: KeyPath,
+    pub value: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +86,18 @@ impl State {
     pub fn select(&mut self, agent: &str, provider_id: Option<&str>) {
         self.selections
             .insert(agent.to_string(), provider_id.map(str::to_string));
+    }
+
+    pub fn owned(&self, agent: &str) -> &[Owned] {
+        self.owned.get(agent).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn own(&mut self, agent: &str, entries: Vec<Owned>) {
+        if entries.is_empty() {
+            self.owned.remove(agent);
+        } else {
+            self.owned.insert(agent.to_string(), entries);
+        }
     }
 
     pub fn record(&mut self, target: &Path, written: &Digest, at: &str) {
@@ -122,6 +147,19 @@ mod tests {
         assert_eq!(state.selection("codex"), Some(None));
         assert_eq!(state.selection("claude-code"), Some(Some("relay")));
         assert!(state.is_ours(target, Some(&digest)), "files are kept");
+
+        let mut state = State::load(&path);
+        let owned = Owned {
+            path: KeyPath::new(&["env", "API_TIMEOUT_MS"]),
+            value: Value::from("600000"),
+        };
+        state.own("claude-code", vec![owned.clone()]);
+        state.save(&path).unwrap();
+        assert_eq!(State::load(&path).owned("claude-code"), [owned]);
+        let mut state = State::load(&path);
+        state.own("claude-code", Vec::new());
+        state.save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("owned"));
 
         fs::write(&path, "{ broken").unwrap();
         assert!(State::load(&path).get(target).is_none());

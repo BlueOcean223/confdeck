@@ -1,6 +1,12 @@
 //! Claude Code：`~/.claude/settings.json`。单选 agent，槽位型。
 //!
 //! 关键字段的清单移植自 ccs-lite 的 `live/floor.rs`（Claude Code 2.1.282 核实）。
+//!
+//! **原始片段**（`AgentOverride::raw`）写这家供应商自己要的设置，比如网关不接受实验性 beta 头时的
+//! `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`、窗口类的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`：
+//! `env` 逐个变量合并（值是字符串），其余顶层键整个值写进去；`null` 是不写 confdeck 生成的这个键。
+//! 这些键和用户自己的设置在同一个地方，切走时不能按清单清空：切进来时记下写了什么（`Engine::set_owned`），
+//! 下次切换时值没变的才删，用户改过的留着。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -130,7 +136,11 @@ const fn slot(key: &'static str, strength: Strength) -> Slot {
 }
 
 /// 切到这家供应商的补丁；`None` 是「默认」：清掉关键字段，还原成 Claude Code 自带的登录。
-pub fn patch(provider: Option<&Provider>) -> Result<JsonPatch, AdaptError> {
+/// `owned` 是上次切换时原始片段写进去的键和值（`Engine::owned`），值没被改过的删掉。
+pub fn patch(
+    provider: Option<&Provider>,
+    owned: &[(KeyPath, Value)],
+) -> Result<JsonPatch, AdaptError> {
     let mut patch = JsonPatch {
         clear: vec![
             ClearScope {
@@ -142,19 +152,13 @@ pub fn patch(provider: Option<&Provider>) -> Result<JsonPatch, AdaptError> {
                 is_floor: is_floor_env,
             },
         ],
+        remove_if: owned.to_vec(),
         drop_if_emptied: vec![KeyPath::new(&["env"])],
         ..JsonPatch::default()
     };
     let Some(provider) = provider else {
         return Ok(patch);
     };
-    if provider
-        .override_for(AGENT)
-        .is_some_and(|o| o.raw.is_some())
-    {
-        // 原始片段里的非关键字段切走时要能删掉，得先记下写过哪些键。
-        return Err(AdaptError::RawUnsupported { agent: AGENT });
-    }
 
     let (_, base_url) = choose_protocol(provider, AGENT)?;
     let key = require_key(provider, AGENT)?;
@@ -189,7 +193,59 @@ pub fn patch(provider: Option<&Provider>) -> Result<JsonPatch, AdaptError> {
             env(name, id);
         }
     }
+
+    for (key_path, value) in raw_changes(provider)? {
+        patch.set.retain(|(path, _)| *path != key_path);
+        if let Some(value) = value {
+            patch.set.push((key_path, value));
+        }
+    }
     Ok(patch)
+}
+
+/// 原始片段写进去的键和值，切换后交给 `Engine::set_owned` 记下。`None` 和没有原始片段的是空的。
+pub fn raw_entries(provider: Option<&Provider>) -> Result<Vec<(KeyPath, Value)>, AdaptError> {
+    let Some(provider) = provider else {
+        return Ok(Vec::new());
+    };
+    Ok(raw_changes(provider)?
+        .into_iter()
+        .filter_map(|(key_path, value)| Some((key_path, value?)))
+        .collect())
+}
+
+/// 原始片段拆成一个个键：`env` 逐个变量，其余顶层键整个值。值为 `None` 的是 `null`。
+fn raw_changes(provider: &Provider) -> Result<Vec<(KeyPath, Option<Value>)>, AdaptError> {
+    let raw = provider.override_for(AGENT).and_then(|o| o.raw.as_ref());
+    let mut changes = Vec::new();
+    for (key, value) in raw.into_iter().flatten() {
+        if key != "env" {
+            changes.push((
+                KeyPath::new(&[key]),
+                Some(value).filter(|v| !v.is_null()).cloned(),
+            ));
+            continue;
+        }
+        let env = value.as_object().ok_or_else(|| shape("env", "对象"))?;
+        for (name, value) in env {
+            let value = match value {
+                Value::Null => None,
+                Value::String(_) => Some(value.clone()),
+                // Claude Code 的 `env` 只收字符串。
+                _ => return Err(shape(&format!("env.{name}"), "字符串")),
+            };
+            changes.push((KeyPath::new(&["env", name]), value));
+        }
+    }
+    Ok(changes)
+}
+
+fn shape(key: &str, expected: &'static str) -> AdaptError {
+    AdaptError::RawShape {
+        agent: AGENT,
+        key: key.to_string(),
+        expected,
+    }
 }
 
 /// Claude Code 认模型名末尾的 `[1m]`（不分大小写）：带了按 1M 上下文算，不带按 200K；
@@ -307,7 +363,7 @@ mod tests {
     use crate::provider::{AgentOverride, Protocol};
 
     fn apply(provider: Option<&Provider>, pre: &str) -> Value {
-        let out = patch(provider)
+        let out = patch(provider, &[])
             .unwrap()
             .apply(Path::new("settings.json"), Some(pre.as_bytes()))
             .unwrap();
@@ -403,11 +459,11 @@ mod tests {
     #[test]
     fn switching_twice_is_byte_stable() {
         let provider = relay();
-        let once = patch(Some(&provider))
+        let once = patch(Some(&provider), &[])
             .unwrap()
             .apply(Path::new("s.json"), Some(LIVE.as_bytes()))
             .unwrap();
-        let twice = patch(Some(&provider))
+        let twice = patch(Some(&provider), &[])
             .unwrap()
             .apply(Path::new("s.json"), Some(&once))
             .unwrap();
@@ -419,36 +475,113 @@ mod tests {
         let mut provider = relay();
         provider.key.clear();
         assert!(matches!(
-            patch(Some(&provider)),
+            patch(Some(&provider), &[]),
             Err(AdaptError::MissingKey { .. })
         ));
 
         let mut provider = relay();
         provider.endpoints.remove(&Protocol::Anthropic);
         assert!(matches!(
-            patch(Some(&provider)),
+            patch(Some(&provider), &[]),
             Err(AdaptError::Incompatible { .. })
         ));
 
         let mut provider = relay();
         provider.models.clear();
         assert!(matches!(
-            patch(Some(&provider)),
+            patch(Some(&provider), &[]),
             Err(AdaptError::NoModels { .. })
         ));
 
+        for raw in [
+            json!({"env": "x"}),
+            json!({"env": {"API_TIMEOUT_MS": 600000}}),
+        ] {
+            assert!(matches!(
+                patch(Some(&with_raw(raw)), &[]),
+                Err(AdaptError::RawShape { .. })
+            ));
+        }
+    }
+
+    fn with_raw(raw: Value) -> Provider {
         let mut provider = relay();
         provider.overrides.insert(
             AGENT,
             AgentOverride {
-                raw: Some(serde_json::Map::new()),
+                raw: Some(raw.as_object().unwrap().clone()),
                 ..AgentOverride::default()
             },
         );
-        assert!(matches!(
-            patch(Some(&provider)),
-            Err(AdaptError::RawUnsupported { .. })
-        ));
+        provider
+    }
+
+    #[test]
+    fn the_raw_snippet_merges_env_and_replaces_top_level_values() {
+        let provider = with_raw(json!({
+            "env": {
+                "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+                "DISABLE_TELEMETRY": "0",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5",
+                "CLAUDE_CODE_SUBAGENT_MODEL": null
+            },
+            "alwaysThinkingEnabled": true
+        }));
+        let out = apply(Some(&provider), LIVE);
+        let env = &out["env"];
+        assert_eq!(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1");
+        assert_eq!(
+            env["DISABLE_TELEMETRY"], "0",
+            "the snippet wins over the file"
+        );
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "glm-4.5",
+            "and over the slots"
+        );
+        assert!(
+            env.get("CLAUDE_CODE_SUBAGENT_MODEL").is_none(),
+            "null skips a generated key"
+        );
+        assert_eq!(env["CLAUDE_CODE_USE_POWERSHELL_TOOL"], "1");
+        assert_eq!(out["alwaysThinkingEnabled"], true);
+
+        let entries = raw_entries(Some(&provider)).unwrap();
+        assert_eq!(entries.len(), 4, "{entries:?}");
+        assert!(raw_entries(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn switching_away_drops_only_raw_keys_left_unchanged() {
+        let provider = with_raw(json!({
+            "env": {"API_TIMEOUT_MS": "600000", "CLAUDE_CODE_DISABLE_ARTIFACT": "1"},
+            "alwaysThinkingEnabled": true
+        }));
+        let owned = raw_entries(Some(&provider)).unwrap();
+        let switched = patch(Some(&provider), &[])
+            .unwrap()
+            .apply(Path::new("s.json"), Some(LIVE.as_bytes()))
+            .unwrap();
+        // 用户在 Claude Code 里改了一个。
+        let mut edited: Value = serde_json::from_slice(&switched).unwrap();
+        edited["env"]["API_TIMEOUT_MS"] = json!("900000");
+        let edited = serde_json::to_vec(&edited).unwrap();
+
+        let out = patch(None, &owned)
+            .unwrap()
+            .apply(Path::new("s.json"), Some(&edited))
+            .unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(out["env"]["API_TIMEOUT_MS"], "900000");
+        assert!(out["env"].get("CLAUDE_CODE_DISABLE_ARTIFACT").is_none());
+        assert!(out.get("alwaysThinkingEnabled").is_none());
+        assert_eq!(out["env"]["DISABLE_TELEMETRY"], "1");
+
+        // 切到同一家：值照写，不先删后加。
+        let again = patch(Some(&provider), &owned)
+            .unwrap()
+            .apply(Path::new("s.json"), Some(&switched))
+            .unwrap();
+        assert_eq!(again, switched);
     }
 
     fn read(text: &str) -> Connection {
@@ -602,7 +735,7 @@ mod tests {
     #[test]
     fn what_patch_writes_reads_back_as_the_same_connection() {
         let provider = relay();
-        let out = patch(Some(&provider))
+        let out = patch(Some(&provider), &[])
             .unwrap()
             .apply(Path::new("s.json"), None)
             .unwrap();

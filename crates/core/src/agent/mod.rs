@@ -180,8 +180,12 @@ pub enum AdaptError {
     /// 不写 Key 时 agent 会拿官方登录的凭据去请求第三方地址，所以拒绝。
     #[error("{provider} 没有填 Key，{agent} 连第三方地址必须有 Key")]
     MissingKey { agent: AgentKind, provider: String },
-    #[error("{agent} 的原始片段还不支持")]
-    RawUnsupported { agent: AgentKind },
+    #[error("{agent} 的原始片段里 {key} 应该是{expected}")]
+    RawShape {
+        agent: AgentKind,
+        key: String,
+        expected: &'static str,
+    },
     #[error("{agent} 的原始片段里 {key} 的值含有 null，TOML 里写不了")]
     RawNotToml { agent: AgentKind, key: String },
     /// Codex 的路由表没有自己的凭据却要求官方登录，请求会带上 ChatGPT 登录发给第三方。

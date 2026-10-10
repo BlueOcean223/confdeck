@@ -65,8 +65,10 @@ fn write_switch(
 ) -> Result<Outcome, ApplyError> {
     match agent {
         AgentKind::ClaudeCode => {
-            let patch = claude::patch(provider)?;
-            Ok(engine.write(&claude::live_file(home), &patch)?)
+            let patch = claude::patch(provider, &engine.owned(agent.id()))?;
+            let outcome = engine.write(&claude::live_file(home), &patch)?;
+            engine.set_owned(agent.id(), &claude::raw_entries(provider)?)?;
+            Ok(outcome)
         }
         AgentKind::Codex => {
             let patch = codex::patch(provider, codex_login(home)?)?;
@@ -131,7 +133,7 @@ pub(crate) fn writer(home: &Path, agent: AgentKind) -> Result<Writer, ApplyError
     let (file, patch): (LiveFile, Box<PatchFor>) = match agent {
         AgentKind::ClaudeCode => (
             claude::live_file(home),
-            Box::new(|provider| Ok(Box::new(claude::patch(Some(provider))?))),
+            Box::new(|provider| Ok(Box::new(claude::patch(Some(provider), &[])?))),
         ),
         AgentKind::Codex => {
             let login = codex_login(home)?;
@@ -326,7 +328,11 @@ fn write_changes(
     };
     let new = new.apply(&file.path, None)?;
     let delta = patch::delta(file.format, &file.path, &old, &new)?;
-    Ok(engine.write(&file, delta.as_ref())?)
+    let outcome = engine.write(&file, delta.as_ref())?;
+    if agent == AgentKind::ClaudeCode {
+        engine.set_owned(agent.id(), &claude::raw_entries(Some(after))?)?;
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -340,8 +346,8 @@ mod tests {
     use crate::backup::Reason;
     use crate::data::DataDir;
     use crate::engine::FileStatus;
-    use crate::provider::Protocol;
     use crate::provider::tests::relay;
+    use crate::provider::{AgentOverride, Protocol};
 
     struct Home {
         dir: tempfile::TempDir,
@@ -397,6 +403,58 @@ mod tests {
             value,
             serde_json::json!({"permissions": {"allow": ["Bash"]}})
         );
+    }
+
+    #[test]
+    fn claude_code_raw_keys_follow_the_provider() {
+        let home = Home::new();
+        let raw = |value: Value| AgentOverride {
+            raw: Some(value.as_object().unwrap().clone()),
+            ..AgentOverride::default()
+        };
+        let mut provider = relay();
+        provider.overrides.insert(
+            AgentKind::ClaudeCode,
+            raw(serde_json::json!({"env": {
+                "API_TIMEOUT_MS": "600000",
+                "CLAUDE_CODE_DISABLE_ARTIFACT": "1"
+            }})),
+        );
+        let providers = vec![provider.clone()];
+        switch(
+            &home.engine,
+            home.path(),
+            AgentKind::ClaudeCode,
+            Some(&provider),
+        )
+        .unwrap();
+        let env = |home: &Home| -> Value {
+            let value: Value = serde_json::from_str(&home.read(".claude/settings.json")).unwrap();
+            value["env"].clone()
+        };
+        assert_eq!(env(&home)["CLAUDE_CODE_DISABLE_ARTIFACT"], "1");
+        assert_eq!(
+            current::current(&home.engine, home.path(), AgentKind::ClaudeCode, &providers).unwrap(),
+            Current::Provider("relay".into())
+        );
+
+        // 改了原始片段：去掉一个、改一个，记录跟着换成新的。
+        let mut edited = provider.clone();
+        edited.overrides.insert(
+            AgentKind::ClaudeCode,
+            raw(serde_json::json!({"env": {"API_TIMEOUT_MS": "900000"}})),
+        );
+        save_provider(&home.engine, home.path(), &providers, &edited).unwrap();
+        assert_eq!(env(&home)["API_TIMEOUT_MS"], "900000");
+        assert!(env(&home).get("CLAUDE_CODE_DISABLE_ARTIFACT").is_none());
+
+        switch(&home.engine, home.path(), AgentKind::ClaudeCode, None).unwrap();
+        assert!(
+            !home
+                .read(".claude/settings.json")
+                .contains("API_TIMEOUT_MS")
+        );
+        assert!(home.engine.owned("claude-code").is_empty());
     }
 
     #[test]

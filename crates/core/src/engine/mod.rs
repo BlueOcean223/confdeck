@@ -30,8 +30,8 @@ use chrono::Local;
 use crate::backup::{self, Backup, Reason, Shelf};
 use crate::data::DataDir;
 use crate::fsx::{self, Digest, Mode};
-use crate::patch::{Format, LivePatch, PatchError};
-use state::State;
+use crate::patch::{Format, KeyPath, LivePatch, PatchError};
+use state::{Owned, State};
 
 /// 第 6 步发现被外部改了以后最多重来几次。
 const ATTEMPTS: usize = 3;
@@ -196,6 +196,35 @@ impl Engine {
         let path = self.data.state();
         let mut state = State::load(&path);
         state.select(agent, provider_id);
+        state.save(&path).map_err(io_error(&path))
+    }
+
+    /// 上次切换时原始片段写进这个 agent 共用位置的键和值（见 `state.json` 的 `owned`）。
+    pub fn owned(&self, agent: &str) -> Vec<(KeyPath, serde_json::Value)> {
+        State::load(&self.data.state())
+            .owned(agent)
+            .iter()
+            .map(|owned| (owned.path.clone(), owned.value.clone()))
+            .collect()
+    }
+
+    /// 记下这次写进去的键和值，替换上一次的。只存在本机。
+    pub fn set_owned(
+        &self,
+        agent: &str,
+        entries: &[(KeyPath, serde_json::Value)],
+    ) -> Result<(), EngineError> {
+        let _lock = self.lock()?;
+        let path = self.data.state();
+        let mut state = State::load(&path);
+        let entries = entries
+            .iter()
+            .map(|(path, value)| Owned {
+                path: path.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        state.own(agent, entries);
         state.save(&path).map_err(io_error(&path))
     }
 
