@@ -11,8 +11,8 @@ use serde_json::{Map, Value, json};
 use super::{AdaptError, AgentKind, choose_protocol, list_models};
 use crate::engine::LiveFile;
 use crate::fsx::Mode;
-use crate::patch::KeyPath;
-use crate::patch::json::JsonPatch;
+use crate::patch::json::{self, JsonPatch};
+use crate::patch::{KeyPath, PatchError};
 use crate::provider::{Model, Protocol, Provider};
 
 const AGENT: AgentKind = AgentKind::Pi;
@@ -131,6 +131,22 @@ fn merge(target: &mut Value, raw: &Map<String, Value>) {
     }
 }
 
+/// 勾了哪几家：`providers` 下以 `confdeck-` 开头的项，返回供应商 id。多选 agent 以文件为准，不另记。
+pub fn enabled(path: &Path, bytes: Option<&[u8]>) -> Result<Vec<String>, PatchError> {
+    let (doc, _) = json::parse(path, bytes, true)?;
+    Ok(doc
+        .get("providers")
+        .and_then(Value::as_object)
+        .map(|providers| {
+            providers
+                .keys()
+                .filter_map(|key| key.strip_prefix(KEY_PREFIX))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +263,24 @@ mod tests {
         assert!(!entry.contains_key("name"));
         assert_eq!(entry["headers"], json!({"X-Team": "infra"}));
         assert_eq!(entry["authHeader"], json!(true));
+    }
+
+    #[test]
+    fn enabled_lists_only_our_entries() {
+        let added = add(&relay())
+            .unwrap()
+            .apply(Path::new("models.json"), Some(LIVE.as_bytes()))
+            .unwrap();
+        assert_eq!(
+            enabled(Path::new("models.json"), Some(&added)).unwrap(),
+            ["relay"]
+        );
+        assert!(
+            enabled(Path::new("models.json"), Some(LIVE.as_bytes()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(enabled(Path::new("models.json"), None).unwrap().is_empty());
     }
 
     #[test]

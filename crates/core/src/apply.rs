@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::agent::{AdaptError, AgentKind, Mode, claude, codex, pi};
 use crate::engine::{Engine, EngineError, LiveFile, Outcome};
 use crate::fsx;
+use crate::patch::PatchError;
 use crate::provider::Provider;
 
 #[derive(Debug, thiserror::Error)]
@@ -16,6 +17,9 @@ pub enum ApplyError {
     Adapt(#[from] AdaptError),
     #[error(transparent)]
     Engine(#[from] EngineError),
+    /// 读 agent 的配置文件时解析不了（认当前是哪家时）。
+    #[error(transparent)]
+    Parse(#[from] PatchError),
     #[error("{agent} 的适配器还没做")]
     Unsupported { agent: AgentKind },
     #[error("{agent} 是{}，不能这样写", mode_name(*.agent))]
@@ -39,8 +43,19 @@ pub fn live_files(home: &Path, agent: AgentKind) -> Vec<LiveFile> {
     }
 }
 
-/// 单选 agent 换供应商；`None` 还原成 agent 自带的登录。
+/// 单选 agent 换供应商；`None` 还原成 agent 自带的登录。写完记下选了哪家（只存在本机）。
 pub fn switch(
+    engine: &Engine,
+    home: &Path,
+    agent: AgentKind,
+    provider: Option<&Provider>,
+) -> Result<Outcome, ApplyError> {
+    let outcome = write_switch(engine, home, agent, provider)?;
+    engine.set_selection(agent.id(), provider.map(|provider| provider.id.as_str()))?;
+    Ok(outcome)
+}
+
+fn write_switch(
     engine: &Engine,
     home: &Path,
     agent: AgentKind,
@@ -159,6 +174,43 @@ mod tests {
             value,
             serde_json::json!({"permissions": {"allow": ["Bash"]}})
         );
+    }
+
+    #[test]
+    fn switching_records_the_selection_only_after_a_successful_write() {
+        let home = Home::new();
+        assert_eq!(home.engine.selection("claude-code"), None);
+        switch(
+            &home.engine,
+            home.path(),
+            AgentKind::ClaudeCode,
+            Some(&relay()),
+        )
+        .unwrap();
+        assert_eq!(
+            home.engine.selection("claude-code"),
+            Some(Some("relay".into()))
+        );
+
+        let mut keyless = relay();
+        keyless.id = "keyless".into();
+        keyless.key.clear();
+        assert!(
+            switch(
+                &home.engine,
+                home.path(),
+                AgentKind::ClaudeCode,
+                Some(&keyless)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            home.engine.selection("claude-code"),
+            Some(Some("relay".into()))
+        );
+
+        switch(&home.engine, home.path(), AgentKind::ClaudeCode, None).unwrap();
+        assert_eq!(home.engine.selection("claude-code"), Some(None));
     }
 
     #[test]

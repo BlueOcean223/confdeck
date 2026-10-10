@@ -8,6 +8,7 @@
 //! - [`patch`]：按键补丁，只改点名的键，文件里其余内容原样保留。
 //! - [`engine`]：写入引擎，改 agent 配置文件的唯一路径：备份、原子写入、写入期间被改了就重来。
 //! - [`apply`]：把上面串起来，「把这家供应商写进这个 agent」。
+//! - [`current`]：认出 agent 现在用的是哪家（单选连的哪家，多选勾了哪几家），对不上的算「自定义」。
 //! - [`backup`]、[`data`]、[`fsx`]：备份、数据目录、文件操作的基本件。
 //!
 //! 按键补丁、写入引擎和各 agent 的关键字段清单移植自 ccs-lite（BlueOcean223/cc-switch，MIT 许可）
@@ -16,6 +17,7 @@
 pub mod agent;
 pub mod apply;
 pub mod backup;
+pub mod current;
 pub mod data;
 pub mod engine;
 pub mod fsx;

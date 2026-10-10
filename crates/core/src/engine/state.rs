@@ -1,7 +1,11 @@
-//! `~/.confdeck/state.json`：每个 agent 配置文件上次由 confdeck 写入后的 hash。
+//! `~/.confdeck/state.json`：只属于这台设备的记录，不同步。
 //!
-//! 写之前拿文件的当前内容和这里比：一样说明文件还是 confdeck 上次写的样子，不用备份；
-//! 不一样说明被外部改过。这份记录只是提示，丢了或读不出来就当作空的：后果只是多备份一次，
+//! - `files`：每个 agent 配置文件上次由 confdeck 写入后的 hash。写之前拿文件的当前内容和这里比：
+//!   一样说明文件还是 confdeck 上次写的样子，不用备份；不一样说明被外部改过。
+//! - `selections`：单选 agent 上次在 confdeck 里选的是哪家（`null` 是「默认」，没有这一项是没选过）。
+//!   认当前是哪家时，同一个地址和 Key 对得上好几家，就以它为准（见 [`crate::current`]）。
+//!
+//! 这份记录只是提示，丢了或读不出来就当作空的：后果只是多备份一次、认不出同地址的几家里是哪一家，
 //! 所以不像用户的文件那样「读不出就报错」。
 
 use std::collections::BTreeMap;
@@ -21,6 +25,9 @@ pub struct State {
     /// 键是解析过软链接的绝对路径。
     #[serde(default)]
     files: BTreeMap<String, Record>,
+    /// 键是 agent 的 id。
+    #[serde(default)]
+    selections: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +63,16 @@ impl State {
             (Some(record), Some(current)) => record.sha256 == current.0,
             _ => false,
         }
+    }
+
+    /// 上次选的：`None` 是没选过，`Some(None)` 是「默认」。
+    pub fn selection(&self, agent: &str) -> Option<Option<&str>> {
+        self.selections.get(agent).map(Option::as_deref)
+    }
+
+    pub fn select(&mut self, agent: &str, provider_id: Option<&str>) {
+        self.selections
+            .insert(agent.to_string(), provider_id.map(str::to_string));
     }
 
     pub fn record(&mut self, target: &Path, written: &Digest, at: &str) {
@@ -95,6 +112,16 @@ mod tests {
         assert!(state.is_ours(target, Some(&digest)));
         assert!(!state.is_ours(target, Some(&Digest::of(b"y"))));
         assert!(!state.is_ours(target, None));
+
+        let mut state = State::load(&path);
+        assert_eq!(state.selection("codex"), None);
+        state.select("codex", None);
+        state.select("claude-code", Some("relay"));
+        state.save(&path).unwrap();
+        let state = State::load(&path);
+        assert_eq!(state.selection("codex"), Some(None));
+        assert_eq!(state.selection("claude-code"), Some(Some("relay")));
+        assert!(state.is_ours(target, Some(&digest)), "files are kept");
 
         fs::write(&path, "{ broken").unwrap();
         assert!(State::load(&path).get(target).is_none());

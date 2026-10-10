@@ -158,12 +158,8 @@ impl Provider {
     pub fn normalize(&mut self) {
         self.name = self.name.trim().to_string();
         self.key = self.key.trim().to_string();
-        for (protocol, url) in &mut self.endpoints {
-            let mut trimmed = url.trim().trim_end_matches('/');
-            if *protocol == Protocol::Anthropic {
-                trimmed = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
-            }
-            *url = trimmed.to_string();
+        for (&protocol, url) in &mut self.endpoints {
+            *url = normalize_url(protocol, url);
         }
         for model in &mut self.models {
             model.id = model.id.trim().to_string();
@@ -235,8 +231,17 @@ fn is_valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// 地址的规范写法：去掉两侧空白和末尾的 `/`，Anthropic 地址再去掉末尾的 `/v1`。
+pub fn normalize_url(protocol: Protocol, url: &str) -> String {
+    let mut trimmed = url.trim().trim_end_matches('/');
+    if protocol == Protocol::Anthropic {
+        trimmed = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    }
+    trimmed.to_string()
+}
+
 /// `http(s)://host[:port][/path]` 里的 host；不是 http(s) 地址时为 `None`。
-fn host(url: &str) -> Option<&str> {
+pub fn host(url: &str) -> Option<&str> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;

@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::slots::{self, Slot, Strength};
-use super::{AdaptError, AgentKind, choose_protocol, require_key};
+use super::{AdaptError, AgentKind, Connection, choose_protocol, require_key};
 use crate::engine::LiveFile;
 use crate::fsx::Mode;
-use crate::patch::KeyPath;
-use crate::patch::json::{ClearScope, JsonPatch};
-use crate::provider::Provider;
+use crate::patch::json::{self, ClearScope, JsonPatch};
+use crate::patch::{KeyPath, PatchError};
+use crate::provider::{Protocol, Provider, normalize_url};
 
 const AGENT: AgentKind = AgentKind::ClaudeCode;
 
@@ -179,6 +179,46 @@ pub fn patch(provider: Option<&Provider>) -> Result<JsonPatch, AdaptError> {
     Ok(patch)
 }
 
+/// 没写 `ANTHROPIC_BASE_URL` 时 Claude Code 连的地址。
+pub const OFFICIAL_URL: &str = "https://api.anthropic.com";
+
+/// 从 `settings.json` 读出现在连的是哪。只看地址和凭据，不看模型名：
+/// 在 Claude Code 里用 `/model` 换个模型，不算换了供应商。
+pub fn connection(path: &Path, bytes: Option<&[u8]>) -> Result<Connection, PatchError> {
+    let (doc, _) = json::parse(path, bytes, false)?;
+    let env = doc.get("env").and_then(Value::as_object);
+    let env_value = |key: &str| {
+        env.and_then(|env| env.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let selector_on = PROTOCOL_SELECTORS
+        .iter()
+        .any(|key| env_value(key).is_some_and(|value| !matches!(value, "0" | "false")));
+    if selector_on {
+        return Ok(Connection::Other { host: None });
+    }
+
+    let credential = env_value("ANTHROPIC_AUTH_TOKEN")
+        .or_else(|| env_value("ANTHROPIC_API_KEY"))
+        .map(str::to_string)
+        .or_else(|| {
+            doc.get("apiKeyHelper")
+                .and_then(Value::as_str)
+                .map(|command| format!("apiKeyHelper: {command}"))
+        });
+    let base_url =
+        env_value("ANTHROPIC_BASE_URL").map(|url| normalize_url(Protocol::Anthropic, url));
+    Ok(match (base_url, credential) {
+        (None, None) => Connection::Default,
+        (base_url, credential) => Connection::Endpoint {
+            base_url: base_url.unwrap_or_else(|| OFFICIAL_URL.to_string()),
+            credential,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -333,6 +373,69 @@ mod tests {
             patch(Some(&provider)),
             Err(AdaptError::RawUnsupported { .. })
         ));
+    }
+
+    fn read(text: &str) -> Connection {
+        connection(Path::new("settings.json"), Some(text.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn connection_reads_the_address_and_credential() {
+        assert_eq!(
+            connection(Path::new("s.json"), None).unwrap(),
+            Connection::Default
+        );
+        assert_eq!(
+            read(r#"{"env": {"ANTHROPIC_MODEL": "opus"}, "model": "x"}"#),
+            Connection::Default
+        );
+        assert_eq!(
+            read(
+                r#"{"env": {"ANTHROPIC_BASE_URL": "https://relay.example/v1/", "ANTHROPIC_AUTH_TOKEN": "sk"}}"#
+            ),
+            Connection::Endpoint {
+                base_url: "https://relay.example".into(),
+                credential: Some("sk".into())
+            }
+        );
+        assert_eq!(
+            read(r#"{"env": {"ANTHROPIC_API_KEY": "sk-ant"}}"#),
+            Connection::Endpoint {
+                base_url: OFFICIAL_URL.into(),
+                credential: Some("sk-ant".into())
+            }
+        );
+        assert_eq!(
+            read(r#"{"apiKeyHelper": "~/bin/key"}"#),
+            Connection::Endpoint {
+                base_url: OFFICIAL_URL.into(),
+                credential: Some("apiKeyHelper: ~/bin/key".into())
+            }
+        );
+        assert_eq!(
+            read(r#"{"env": {"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-east-1"}}"#),
+            Connection::Other { host: None }
+        );
+        assert_eq!(
+            read(r#"{"env": {"CLAUDE_CODE_USE_BEDROCK": "0"}}"#),
+            Connection::Default
+        );
+    }
+
+    #[test]
+    fn what_patch_writes_reads_back_as_the_same_connection() {
+        let provider = relay();
+        let out = patch(Some(&provider))
+            .unwrap()
+            .apply(Path::new("s.json"), None)
+            .unwrap();
+        assert_eq!(
+            connection(Path::new("s.json"), Some(&out)).unwrap(),
+            Connection::Endpoint {
+                base_url: "https://relay.example".into(),
+                credential: Some("sk-relay".into())
+            }
+        );
     }
 
     #[test]

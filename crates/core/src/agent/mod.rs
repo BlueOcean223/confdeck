@@ -82,6 +82,30 @@ impl fmt::Display for AgentKind {
     }
 }
 
+/// 从 agent 的配置文件里读出来的「现在连的是哪」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Connection {
+    /// 没有指定地址和凭据：agent 自带的登录。
+    Default,
+    /// 连到一个地址。凭据是 Key 本身，或者 `apiKeyHelper: 命令`、`env: 变量名` 这类说明。
+    Endpoint {
+        base_url: String,
+        credential: Option<String>,
+    },
+    /// confdeck 不写的接法：Claude Code 走 Bedrock / Vertex、Codex 用内置的 ollama 等。
+    Other { host: Option<String> },
+}
+
+impl Connection {
+    pub fn host(&self) -> Option<String> {
+        match self {
+            Self::Default => None,
+            Self::Endpoint { base_url, .. } => crate::provider::host(base_url).map(str::to_string),
+            Self::Other { host } => host.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AdaptError {
     #[error(

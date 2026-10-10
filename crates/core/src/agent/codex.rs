@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use serde_json::Value as Json;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use super::{AdaptError, AgentKind, choose_protocol, default_model, require_key};
+use super::{AdaptError, AgentKind, Connection, choose_protocol, default_model, require_key};
 use crate::engine::LiveFile;
 use crate::fsx::Mode;
 use crate::patch::PatchError;
-use crate::patch::toml::{TomlDocPatch, put_value, remove_key, shape_error};
-use crate::provider::Provider;
+use crate::patch::toml::{self, TomlDocPatch, put_value, remove_key, shape_error};
+use crate::provider::{Protocol, Provider, normalize_url};
 
 const AGENT: AgentKind = AgentKind::Codex;
 
@@ -275,6 +275,45 @@ fn put_table(providers: &mut dyn TableLike, id: &str, table: Table, container_in
     }
 }
 
+/// 从 `config.toml` 读出现在连的是哪。只看选的路由和它的地址、凭据，不看模型名。
+pub fn connection(path: &Path, bytes: Option<&[u8]>) -> Result<Connection, PatchError> {
+    let doc = toml::parse(path, bytes)?;
+    let text = |item: Option<&Item>| {
+        item.and_then(Item::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let selected = text(doc.get("model_provider")).unwrap_or_else(|| "openai".to_string());
+    if selected == "openai" {
+        // `openai_base_url` 把内置的 openai 路由改道到别的地址。
+        return Ok(match text(doc.get("openai_base_url")) {
+            Some(url) => Connection::Endpoint {
+                base_url: normalize_url(Protocol::OpenaiResponses, &url),
+                credential: None,
+            },
+            None => Connection::Default,
+        });
+    }
+    let table = doc
+        .get("model_providers")
+        .and_then(|providers| providers.get(&selected))
+        .and_then(Item::as_table_like);
+    let Some(table) = table else {
+        // 没有表的是 Codex 内置的 ollama、lmstudio 等。
+        return Ok(Connection::Other { host: None });
+    };
+    let Some(base_url) = text(table.get("base_url")) else {
+        return Ok(Connection::Other { host: None });
+    };
+    let credential = text(table.get("experimental_bearer_token"))
+        .or_else(|| text(table.get("env_key")).map(|name| format!("env: {name}")));
+    Ok(Connection::Endpoint {
+        base_url: normalize_url(Protocol::OpenaiResponses, &base_url),
+        credential,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -456,6 +495,60 @@ requires_openai_auth = false
             br#"{"tokens": {"refresh_token": "rt"}}"#
         )));
         assert!(login_on_disk(Some(br#"{"agent_identity": {"id": "a"}}"#)));
+    }
+
+    fn read(text: &str) -> Connection {
+        connection(Path::new("config.toml"), Some(text.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn connection_follows_the_selected_route() {
+        assert_eq!(
+            connection(Path::new("c.toml"), None).unwrap(),
+            Connection::Default
+        );
+        assert_eq!(read("model = \"gpt-5.5\"\n"), Connection::Default);
+        assert_eq!(read("model_provider = \"openai\"\n"), Connection::Default);
+        assert_eq!(
+            read("openai_base_url = \"https://proxy.example/v1/\"\n"),
+            Connection::Endpoint {
+                base_url: "https://proxy.example/v1".into(),
+                credential: None
+            }
+        );
+        assert_eq!(
+            read(LIVE),
+            Connection::Default,
+            "LIVE has no model_provider"
+        );
+        assert_eq!(
+            read(
+                "model_provider = \"ollama-local\"\n[model_providers.ollama-local]\nbase_url = \"http://localhost:11434/v1\"\nenv_key = \"OLLAMA_KEY\"\n"
+            ),
+            Connection::Endpoint {
+                base_url: "http://localhost:11434/v1".into(),
+                credential: Some("env: OLLAMA_KEY".into())
+            }
+        );
+        assert_eq!(
+            read("model_provider = \"ollama\"\n"),
+            Connection::Other { host: None }
+        );
+    }
+
+    #[test]
+    fn what_patch_writes_reads_back_as_the_same_connection() {
+        let out = patch(Some(&relay()), true)
+            .unwrap()
+            .apply(Path::new("c.toml"), Some(LIVE.as_bytes()))
+            .unwrap();
+        assert_eq!(
+            connection(Path::new("c.toml"), Some(&out)).unwrap(),
+            Connection::Endpoint {
+                base_url: "https://relay.example/v1".into(),
+                credential: Some("sk-relay".into())
+            }
+        );
     }
 
     #[test]

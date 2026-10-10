@@ -182,6 +182,22 @@ impl Engine {
         })
     }
 
+    /// 单选 agent 上次在 confdeck 里选的是哪家：`None` 是没选过，`Some(None)` 是「默认」。
+    pub fn selection(&self, agent: &str) -> Option<Option<String>> {
+        State::load(&self.data.state())
+            .selection(agent)
+            .map(|id| id.map(str::to_string))
+    }
+
+    /// 记下单选 agent 选了哪家（`None` 是「默认」）。只存在本机。
+    pub fn set_selection(&self, agent: &str, provider_id: Option<&str>) -> Result<(), EngineError> {
+        let _lock = self.lock()?;
+        let path = self.data.state();
+        let mut state = State::load(&path);
+        state.select(agent, provider_id);
+        state.save(&path).map_err(io_error(&path))
+    }
+
     /// 按键补丁写入：切换供应商、勾选供应商。
     pub fn write(&self, file: &LiveFile, patch: &dyn LivePatch) -> Result<Outcome, EngineError> {
         self.commit(file, Kind::Patch, &mut |pre, _| {
