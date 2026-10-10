@@ -157,7 +157,7 @@ impl Provider {
             .is_some_and(|host| host.eq_ignore_ascii_case("api.anthropic.com"))
     }
 
-    /// 整理用户输入：去掉两侧空白和地址末尾的 `/`，Anthropic 地址再去掉末尾的 `/v1`。
+    /// 整理用户输入：去掉两侧空白和地址末尾的 `/`，Anthropic 地址再去掉末尾的 `/v1`，Gemini 地址去掉 `/v1beta`。
     pub fn normalize(&mut self) {
         self.name = self.name.trim().to_string();
         self.key = self.key.trim().to_string();
@@ -234,13 +234,17 @@ fn is_valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// 地址的规范写法：去掉两侧空白和末尾的 `/`，Anthropic 地址再去掉末尾的 `/v1`。
+/// 地址的规范写法：去掉两侧空白和末尾的 `/`，Anthropic 地址再去掉末尾的 `/v1`，Gemini 地址去掉 `/v1beta`。
+/// 存的是不带版本的根地址，和 Claude Code 的 `ANTHROPIC_BASE_URL`、Gemini CLI 的 `GOOGLE_GEMINI_BASE_URL` 一样；
+/// 要带版本的 agent（OpenCode 的 Anthropic，Pi 和 OpenCode 的 Gemini）由适配器补上。
 pub fn normalize_url(protocol: Protocol, url: &str) -> String {
-    let mut trimmed = url.trim().trim_end_matches('/');
-    if protocol == Protocol::Anthropic {
-        trimmed = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
-    }
-    trimmed.to_string()
+    let trimmed = url.trim().trim_end_matches('/');
+    let version = match protocol {
+        Protocol::Anthropic => "/v1",
+        Protocol::Gemini => "/v1beta",
+        Protocol::OpenaiChat | Protocol::OpenaiResponses => return trimmed.to_string(),
+    };
+    trimmed.strip_suffix(version).unwrap_or(trimmed).to_string()
 }
 
 /// `http(s)://host[:port][/path]` 里的 host；不是 http(s) 地址时为 `None`。
@@ -345,7 +349,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn normalize_trims_and_drops_the_anthropic_v1() {
+    fn normalize_trims_and_drops_the_version() {
         let mut provider = relay();
         provider.name = "  Relay ".into();
         provider.key = " sk-relay\n".into();
@@ -355,6 +359,10 @@ pub(crate) mod tests {
         provider
             .endpoints
             .insert(Protocol::OpenaiChat, "https://relay.example/v1/".into());
+        provider.endpoints.insert(
+            Protocol::Gemini,
+            "https://generativelanguage.googleapis.com/v1beta/".into(),
+        );
         provider.normalize();
         assert_eq!(provider.name, "Relay");
         assert_eq!(provider.key, "sk-relay");
@@ -365,6 +373,10 @@ pub(crate) mod tests {
         assert_eq!(
             provider.endpoint(Protocol::OpenaiChat),
             Some("https://relay.example/v1")
+        );
+        assert_eq!(
+            provider.endpoint(Protocol::Gemini),
+            Some("https://generativelanguage.googleapis.com")
         );
     }
 

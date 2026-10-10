@@ -72,6 +72,11 @@ fn path(provider_id: &str) -> KeyPath {
 
 fn entry(provider: &Provider) -> Result<Value, AdaptError> {
     let (protocol, base_url) = choose_protocol(provider, AGENT)?;
+    let base_url = match protocol {
+        // Pi 在地址后面直接拼 `/models/<模型>:streamGenerateContent`，confdeck 存的 Gemini 地址不带版本。
+        Protocol::Gemini => format!("{base_url}/v1beta"),
+        _ => base_url.to_string(),
+    };
     let models: Vec<Value> = list_models(provider, AGENT)?
         .into_iter()
         .map(model)
@@ -131,6 +136,8 @@ pub fn enabled(path: &Path, bytes: Option<&[u8]>) -> Result<Vec<String>, PatchEr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::patch::LivePatch;
     use crate::provider::AgentOverride;
@@ -217,6 +224,14 @@ mod tests {
         let entry = &out["providers"]["confdeck-relay"];
         assert_eq!(entry["api"], json!("anthropic-messages"));
         assert_eq!(entry["baseUrl"], json!("https://relay.example"));
+
+        // Gemini 地址补上版本：Pi 在后面直接拼 `/models/...`。
+        provider.endpoints = BTreeMap::from([(Protocol::Gemini, "https://g.example".into())]);
+        provider.overrides.clear();
+        let out = apply(&add(&provider).unwrap(), None);
+        let entry = &out["providers"]["confdeck-relay"];
+        assert_eq!(entry["api"], json!("google-generative-ai"));
+        assert_eq!(entry["baseUrl"], json!("https://g.example/v1beta"));
     }
 
     #[test]

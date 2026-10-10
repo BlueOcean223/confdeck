@@ -9,7 +9,7 @@
 //!
 //! 包按协议选（官方 providers 文档）：Chat → `@ai-sdk/openai-compatible`；Responses → `@ai-sdk/openai`
 //! （自定义供应商走 `languageModel`，这个包默认发 Responses）；Anthropic → `@ai-sdk/anthropic`，地址补 `/v1`；
-//! Gemini → `@ai-sdk/google`。
+//! Gemini → `@ai-sdk/google`，地址补 `/v1beta`。
 //!
 //! 文件允许注释（JSONC），写回时注释和排版原样保留。默认模型（顶层 `model`）只读不写；
 //! 取消勾选时，`model`、`small_model` 指着这家的一并删掉，不然 OpenCode 找不到这个模型。
@@ -153,6 +153,8 @@ fn entry(provider: &Provider) -> Result<Value, AdaptError> {
     let base_url = match protocol {
         // `@ai-sdk/anthropic` 在地址后面只拼 `/messages`，confdeck 存的 Anthropic 地址不带 `/v1`。
         Protocol::Anthropic => format!("{base_url}/v1"),
+        // `@ai-sdk/google` 也一样，只拼 `/models/<模型>:streamGenerateContent`。
+        Protocol::Gemini => format!("{base_url}/v1beta"),
         _ => base_url.to_string(),
     };
     let models: Map<String, Value> = list_models(provider, AGENT)?
@@ -309,7 +311,7 @@ mod tests {
             ),
             (
                 Protocol::Gemini,
-                "https://g.example/v1beta",
+                "https://g.example",
                 "@ai-sdk/google",
                 "https://g.example/v1beta",
             ),
