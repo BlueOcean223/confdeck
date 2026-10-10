@@ -86,6 +86,47 @@ output = 262144
 input = ["text", "image"]
 reasoning = ["high"]
 
+# Kimi 开放平台海外站：模型和国内站一样，地址换成 api.moonshot.ai（ccs-lite 的各 agent 预设）。
+[[presets]]
+id = "kimi-intl"
+name = "Kimi 海外站"
+website = "https://platform.kimi.ai"
+key_url = "https://platform.kimi.ai/console/api-keys"
+
+[presets.endpoints]
+anthropic = "https://api.moonshot.ai/anthropic"
+openai-chat = "https://api.moonshot.ai/v1"
+openai-responses = "https://api.moonshot.ai/v1"
+
+[[presets.models]]
+id = "kimi-k3"
+name = "Kimi K3"
+star = true
+tier = "flagship"
+context = 1048576
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "kimi-k2.7-code"
+name = "Kimi K2.7 Code"
+star = true
+tier = "fast"
+context = 262144
+output = 262144
+input = ["text", "image"]
+reasoning = ["high"]
+
+[[presets.models]]
+id = "kimi-k2.7-code-highspeed"
+name = "Kimi K2.7 Code HighSpeed"
+tier = "fast"
+context = 262144
+output = 262144
+input = ["text", "image"]
+reasoning = ["high"]
+
 # Kimi For Coding（会员订阅）。Chat 和 Responses 都在 /coding/v1，Anthropic 在 /coding（kimi.com/code/docs 的地址表，10-10）。
 # 官方 Claude Code 配置所有槽位都用 kimi-for-coding；Pi、OpenCode 走 Anthropic（ccs-lite 的这两个预设都这么配）。
 [[presets]]
@@ -102,6 +143,66 @@ openai-responses = "https://api.kimi.com/coding/v1"
 # 2026-09-15 起是 K2.8 Preview，最高 1M 上下文（官方 Codex 指南）。官方文档没写输出上限，取 models.dev 的
 # kimi-code-plan-cn（OpenCode 内置的就是它）和 ccs-lite Pi 预设都用的 32768；其余三个的输出上限也取 models.dev。
 # 输入类型照 kimi.com/code/docs/kimi-code/models.html（视频 confdeck 不记）。
+[[presets.models]]
+id = "kimi-for-coding"
+name = "Kimi For Coding"
+star = true
+tier = "flagship"
+context = 1048576
+output = 32768
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "kimi-for-coding-highspeed"
+name = "Kimi For Coding HighSpeed"
+tier = "fast"
+context = 262144
+output = 32768
+input = ["text", "image"]
+reasoning = ["high"]
+
+# K3 的 1M 上下文要看会员档位，k3-256k 固定 256K。
+[[presets.models]]
+id = "k3"
+name = "Kimi K3"
+tier = "flagship"
+context = 1048576
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "k3-256k"
+name = "Kimi K3 256K"
+tier = "flagship"
+context = 262144
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+[presets.agents.claude-code.slots]
+haiku = "kimi-for-coding"
+subagent = "kimi-for-coding"
+
+[presets.agents.pi]
+protocol = "anthropic"
+
+[presets.agents.opencode]
+protocol = "anthropic"
+
+# Kimi For Coding 海外站：地址换成 api.kimi.ai，Key 在同一个控制台建（kimi.com/code/docs 的地址表，10-10）。
+[[presets]]
+id = "kimi-coding-intl"
+name = "Kimi For Coding 海外站"
+website = "https://www.kimi.com/code/"
+key_url = "https://www.kimi.com/code/console"
+
+[presets.endpoints]
+anthropic = "https://api.kimi.ai/coding"
+openai-chat = "https://api.kimi.ai/coding/v1"
+openai-responses = "https://api.kimi.ai/coding/v1"
+
 [[presets.models]]
 id = "kimi-for-coding"
 name = "Kimi For Coding"
@@ -224,6 +325,370 @@ tier = "balanced"
 context = 204800
 input = ["text"]
 reasoning = ["max"]
+
+# Z.AI（智谱海外站，按量）。和国内站一样三个地址分开：Anthropic /api/anthropic、Chat /api/paas/v4、Responses /api/v1
+# （ccs-lite 2026-09-04 对过 docs.z.ai 的 devpack/tool/others、devpack/tool/codex；按量的 Chat 地址照 models.dev 的 zai）。
+[[presets]]
+id = "zai"
+name = "Z.AI"
+website = "https://z.ai"
+key_url = "https://z.ai/manage-apikey/apikey-list"
+
+[presets.endpoints]
+anthropic = "https://api.z.ai/api/anthropic"
+openai-chat = "https://api.z.ai/api/paas/v4"
+openai-responses = "https://api.z.ai/api/v1"
+
+[[presets.models]]
+id = "glm-5.3"
+name = "GLM-5.3"
+star = true
+tier = "flagship"
+context = 1048576
+output = 131072
+input = ["text"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "glm-5.3-flash"
+name = "GLM-5.3-Flash"
+star = true
+tier = "fast"
+context = 1048576
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+# Z.AI GLM Coding Plan。Chat 走 /api/coding/paas/v4，其余和按量共用。
+[[presets]]
+id = "zai-coding"
+name = "Z.AI GLM Coding Plan"
+website = "https://z.ai"
+key_url = "https://z.ai/subscribe"
+
+[presets.endpoints]
+anthropic = "https://api.z.ai/api/anthropic"
+openai-chat = "https://api.z.ai/api/coding/paas/v4"
+openai-responses = "https://api.z.ai/api/v1"
+
+[[presets.models]]
+id = "glm-5.3"
+name = "GLM-5.3"
+star = true
+tier = "flagship"
+context = 1048576
+output = 131072
+input = ["text"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "glm-5.3-flash"
+name = "GLM-5.3-Flash"
+star = true
+tier = "fast"
+context = 1048576
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "high", "max"]
+
+[[presets.models]]
+id = "glm-5-turbo"
+name = "GLM-5-Turbo"
+tier = "balanced"
+context = 204800
+input = ["text"]
+reasoning = ["max"]
+
+# MiniMax 国内站。地址都在 api.minimax.cn（platform.minimax.cn/docs/guides/text-generation，10-10）。Pi 内置的是
+# api.minimaxi.com，platform.minimaxi.com 上的文档还停在旧版，没用它。Responses 和 Chat 同一个地址
+# （MiniMax API 参考里的 POST /v1/responses，ccs-lite 2026-08-15 核对）。Key 页是订阅（M Plan）的，按量的 Key 走同样的地址。
+# MiniMax-M3：上下文 1M；输出上限取推荐的 131072（最大 524288，text-chat-anthropic 的 max_tokens 说明）；
+# 推理档位照官方 Codex 目录只有 none / high（effort 是思考开关）。M3.1-Flash-Preview 只给订阅用户，没放进来。
+# Pi、OpenCode 走 Anthropic，和 Pi 内置的 MiniMax、models.dev 的 minimax-cn 一样。
+[[presets]]
+id = "minimax"
+name = "MiniMax"
+website = "https://platform.minimax.cn"
+key_url = "https://platform.minimax.cn/console/plan"
+
+[presets.endpoints]
+anthropic = "https://api.minimax.cn/anthropic"
+openai-chat = "https://api.minimax.cn/v1"
+openai-responses = "https://api.minimax.cn/v1"
+
+[[presets.models]]
+id = "MiniMax-M3"
+name = "MiniMax-M3"
+star = true
+tier = "flagship"
+context = 1000000
+output = 131072
+input = ["text", "image"]
+reasoning = ["none", "high"]
+
+[presets.agents.pi]
+protocol = "anthropic"
+
+[presets.agents.opencode]
+protocol = "anthropic"
+
+# MiniMax 海外站：和国内站一样，地址换成 api.minimax.io（ccs-lite 的各 agent 预设，models.dev 的 minimax）。
+[[presets]]
+id = "minimax-intl"
+name = "MiniMax 海外站"
+website = "https://platform.minimax.io"
+key_url = "https://platform.minimax.io/console/plan"
+
+[presets.endpoints]
+anthropic = "https://api.minimax.io/anthropic"
+openai-chat = "https://api.minimax.io/v1"
+openai-responses = "https://api.minimax.io/v1"
+
+[[presets.models]]
+id = "MiniMax-M3"
+name = "MiniMax-M3"
+star = true
+tier = "flagship"
+context = 1000000
+output = 131072
+input = ["text", "image"]
+reasoning = ["none", "high"]
+
+[presets.agents.pi]
+protocol = "anthropic"
+
+[presets.agents.opencode]
+protocol = "anthropic"
+
+# 千问AI平台（阿里，按量）。Chat 和 Responses 都在 /compatible-mode/v1，Anthropic 在 /apps/anthropic
+# （platform.qianwenai.com/docs/api-reference/chat/openai-chat、chat/anthropic，10-10）。和阿里云百炼（dashscope.aliyuncs.com）
+# 是两套地址；百炼的共享域名 2026-09-30 起只维护、不加新功能。Coding Plan、Token Plan 的地址各不相同，以后再加。
+# 上下文按 1M 记（思考模式最多输入 983616，官方 Codex 目录写的是这个数）；qwen3.8 的推理档位只有 low / medium / xhigh
+# （官方 Codex 目录）；输出上限照 models.dev。Claude Code 的 Sonnet 用 qwen3.7-plus（ccs-lite 的 Claude Code 预设）。
+# Pi、OpenCode 走 Anthropic：走 Chat 时 Pi 要手动设兼容选项（thinkingFormat、developer 角色），预设还写不了。
+[[presets]]
+id = "qianwen"
+name = "千问AI平台"
+website = "https://platform.qianwenai.com"
+key_url = "https://platform.qianwenai.com/home/api-keys"
+
+[presets.endpoints]
+anthropic = "https://maas.qianwenaiapi.com/apps/anthropic"
+openai-chat = "https://maas.qianwenaiapi.com/compatible-mode/v1"
+openai-responses = "https://maas.qianwenaiapi.com/compatible-mode/v1"
+
+[[presets.models]]
+id = "qwen3.8-max"
+name = "Qwen3.8 Max"
+star = true
+tier = "flagship"
+context = 1000000
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "medium", "xhigh"]
+
+[[presets.models]]
+id = "qwen3.8-flash"
+name = "Qwen3.8 Flash"
+star = true
+tier = "fast"
+context = 1000000
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "medium", "xhigh"]
+
+[[presets.models]]
+id = "qwen3.7-plus"
+name = "Qwen3.7 Plus"
+tier = "balanced"
+context = 1000000
+output = 64000
+input = ["text", "image"]
+
+[presets.agents.claude-code.slots]
+sonnet = "qwen3.7-plus"
+
+[presets.agents.pi]
+protocol = "anthropic"
+
+[presets.agents.opencode]
+protocol = "anthropic"
+
+# QwenCloud（阿里海外站，按量）：路径和千问AI平台一样，域名是 maas.qwencloudapi.com（ccs-lite 的各 agent 预设）。
+[[presets]]
+id = "qwencloud"
+name = "QwenCloud"
+website = "https://home.qwencloud.com"
+key_url = "https://home.qwencloud.com/api-keys"
+
+[presets.endpoints]
+anthropic = "https://maas.qwencloudapi.com/apps/anthropic"
+openai-chat = "https://maas.qwencloudapi.com/compatible-mode/v1"
+openai-responses = "https://maas.qwencloudapi.com/compatible-mode/v1"
+
+[[presets.models]]
+id = "qwen3.8-max"
+name = "Qwen3.8 Max"
+star = true
+tier = "flagship"
+context = 1000000
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "medium", "xhigh"]
+
+[[presets.models]]
+id = "qwen3.8-flash"
+name = "Qwen3.8 Flash"
+star = true
+tier = "fast"
+context = 1000000
+output = 131072
+input = ["text", "image"]
+reasoning = ["low", "medium", "xhigh"]
+
+[[presets.models]]
+id = "qwen3.7-plus"
+name = "Qwen3.7 Plus"
+tier = "balanced"
+context = 1000000
+output = 131072
+input = ["text", "image"]
+
+[presets.agents.claude-code.slots]
+sonnet = "qwen3.7-plus"
+
+[presets.agents.pi]
+protocol = "anthropic"
+
+[presets.agents.opencode]
+protocol = "anthropic"
+
+# 火山方舟（按量）。Anthropic 在 /api/compatible，Chat 和 Responses 在 /api/v3（ccs-lite 的各 agent 预设）。
+# 模型 ID 带日期，换代快：doubao-seed-2-1-pro-260915，上下文 1024K、最多输出 256K，推理档位 minimal（不思考）/ low / medium / high
+# （方舟模型列表 82379/1330310、深度思考文档 82379/1449737，ccs-lite 2026-09-28 核对）。
+[[presets]]
+id = "volcengine"
+name = "火山方舟"
+website = "https://www.volcengine.com/product/ark"
+key_url = "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey"
+
+[presets.endpoints]
+anthropic = "https://ark.cn-beijing.volces.com/api/compatible"
+openai-chat = "https://ark.cn-beijing.volces.com/api/v3"
+openai-responses = "https://ark.cn-beijing.volces.com/api/v3"
+
+[[presets.models]]
+id = "doubao-seed-2-1-pro-260915"
+name = "Doubao Seed 2.1 Pro"
+star = true
+tier = "flagship"
+context = 1048576
+output = 262144
+input = ["text", "image"]
+reasoning = ["minimal", "low", "medium", "high"]
+
+# 火山方舟 Coding Plan。地址都在 /api/coding 下：Anthropic /api/coding，Chat 和 Responses /api/coding/v3。按量的 /api/v3
+# 不扣套餐额度、另外计费（官方 Codex 文档 volcengine.com/docs/82379/2556056，ccs-lite 核对）。Agent Plan 是另一份订阅，以后再加。
+# ark-code-latest 是别名，指向控制台里选的模型：上下文按 256K 记，推理档位官方 Codex 文档只许 low / medium / high，输入类型看选的模型，不写。
+[[presets]]
+id = "volcengine-coding"
+name = "火山方舟 Coding Plan"
+website = "https://www.volcengine.com/activity/codingplan"
+key_url = "https://www.volcengine.com/activity/codingplan"
+
+[presets.endpoints]
+anthropic = "https://ark.cn-beijing.volces.com/api/coding"
+openai-chat = "https://ark.cn-beijing.volces.com/api/coding/v3"
+openai-responses = "https://ark.cn-beijing.volces.com/api/coding/v3"
+
+[[presets.models]]
+id = "ark-code-latest"
+name = "Ark Code Latest"
+star = true
+tier = "flagship"
+context = 256000
+reasoning = ["low", "medium", "high"]
+
+# BytePlus ModelArk Coding Plan（火山海外站）：路径和国内 Coding Plan 一样，域名是 ark.ap-southeast.bytepluses.com
+# （BytePlus 官方 Codex 文档，ccs-lite 2026-08-15 核对）。
+[[presets]]
+id = "byteplus-coding"
+name = "BytePlus Coding Plan"
+website = "https://www.byteplus.com/en/product/modelark"
+key_url = "https://www.byteplus.com/en/product/modelark"
+
+[presets.endpoints]
+anthropic = "https://ark.ap-southeast.bytepluses.com/api/coding"
+openai-chat = "https://ark.ap-southeast.bytepluses.com/api/coding/v3"
+openai-responses = "https://ark.ap-southeast.bytepluses.com/api/coding/v3"
+
+[[presets.models]]
+id = "ark-code-latest"
+name = "Ark Code Latest"
+star = true
+tier = "flagship"
+context = 256000
+reasoning = ["low", "medium", "high"]
+
+# 硅基流动。Anthropic 和 Chat 两种协议，没有 Responses，Codex 用不了（官方 Codex 接入文档）。Anthropic 接口不限模型
+# （api-docs.siliconflow.cn/docs/api/messages-post，10-10）。模型目录只放 DeepSeek V4 两个，其余的以后从供应商拉；
+# 上下文按 1M、输出上限按 DeepSeek 官方的 384K 记。推理档位不写：没核实硅基流动收不收 effort。
+[[presets]]
+id = "siliconflow"
+name = "硅基流动"
+website = "https://siliconflow.cn"
+key_url = "https://cloud.siliconflow.cn/account/ak"
+
+[presets.endpoints]
+anthropic = "https://api.siliconflow.cn"
+openai-chat = "https://api.siliconflow.cn/v1"
+
+[[presets.models]]
+id = "deepseek-ai/DeepSeek-V4-Pro"
+name = "DeepSeek V4 Pro"
+star = true
+tier = "flagship"
+context = 1000000
+output = 384000
+input = ["text"]
+
+[[presets.models]]
+id = "deepseek-ai/DeepSeek-V4-Flash"
+name = "DeepSeek V4 Flash"
+star = true
+tier = "fast"
+context = 1000000
+output = 384000
+input = ["text"]
+
+# SiliconFlow（硅基流动海外站）：和国内站一样，域名是 api.siliconflow.com（ccs-lite 的 Claude Code 预设、models.dev 的 siliconflow）。
+[[presets]]
+id = "siliconflow-intl"
+name = "SiliconFlow"
+website = "https://siliconflow.com"
+key_url = "https://cloud.siliconflow.com/account/ak"
+
+[presets.endpoints]
+anthropic = "https://api.siliconflow.com"
+openai-chat = "https://api.siliconflow.com/v1"
+
+[[presets.models]]
+id = "deepseek-ai/DeepSeek-V4-Pro"
+name = "DeepSeek V4 Pro"
+star = true
+tier = "flagship"
+context = 1000000
+output = 384000
+input = ["text"]
+
+[[presets.models]]
+id = "deepseek-ai/DeepSeek-V4-Flash"
+name = "DeepSeek V4 Flash"
+star = true
+tier = "fast"
+context = 1000000
+output = 384000
+input = ["text"]
 
 # OpenRouter。Claude 模型走 Anthropic 协议（ccs-lite 的 Pi、OpenCode 预设都这么配）；主模型用 Sonnet（ccs-lite 的 Claude Code 预设）。
 # Codex 默认用 GPT、Grok 默认用 Grok（ccs-lite 的 Codex、Grok Build 预设，2026-10-07 对过 OpenRouter 的模型列表），

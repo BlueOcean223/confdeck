@@ -181,6 +181,15 @@ mod tests {
             matching(Protocol::OpenaiChat, "https://open.bigmodel.cn/api/paas/v4").map(|p| &p.id),
             Some(&"zhipu".to_string())
         );
+        assert_eq!(
+            matching(Protocol::Anthropic, "https://api.minimax.io/anthropic").map(|p| &p.id),
+            Some(&"minimax-intl".to_string())
+        );
+        assert_eq!(
+            matching(Protocol::OpenaiChat, "https://api.z.ai/api/coding/paas/v4").map(|p| &p.id),
+            Some(&"zai-coding".to_string())
+        );
+        assert!(matching(Protocol::Anthropic, "https://api.z.ai/api/anthropic").is_none());
         assert!(matching(Protocol::OpenaiChat, "https://relay.example/v1").is_none());
     }
 }
