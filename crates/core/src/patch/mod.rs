@@ -118,6 +118,15 @@ pub enum PatchError {
     },
 }
 
+/// 整份写成这些字节：confdeck 自己的文件（Codex 的模型目录），不用保留别的内容。
+pub struct Whole(pub Vec<u8>);
+
+impl LivePatch for Whole {
+    fn apply(&self, _: &Path, _: Option<&[u8]>) -> Result<Vec<u8>, PatchError> {
+        Ok(self.0.clone())
+    }
+}
+
 /// 字节偏移 → (行, 列)，都从 1 开始。
 pub(crate) fn line_column(text: &str, offset: usize) -> (usize, usize) {
     let offset = offset.min(text.len());

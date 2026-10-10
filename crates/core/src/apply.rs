@@ -38,7 +38,7 @@ fn mode_name(agent: AgentKind) -> &'static str {
 pub fn live_files(home: &Path, agent: AgentKind) -> Vec<LiveFile> {
     match agent {
         AgentKind::ClaudeCode => vec![claude::live_file(home)],
-        AgentKind::Codex => vec![codex::live_file(home)],
+        AgentKind::Codex => vec![codex::live_file(home), codex::catalog::live_file(home)],
         AgentKind::Pi => vec![pi::live_file(home)],
         AgentKind::GrokBuild => vec![grok::live_file(home)],
         AgentKind::Opencode => vec![opencode::live_file(home)],
@@ -71,8 +71,21 @@ fn write_switch(
             Ok(outcome)
         }
         AgentKind::Codex => {
+            let config = codex::live_file(home);
             let patch = codex::patch(provider, codex_login(home)?)?;
-            Ok(engine.write(&codex::live_file(home), &patch)?)
+            let catalog = match provider {
+                Some(provider) => codex::catalog::generate(home, &codex::catalog_models(provider)?),
+                None => None,
+            };
+            let Some(catalog) = catalog else {
+                return Ok(engine.write(&config, &patch)?);
+            };
+            // 先试着改 config.toml：改不了（解析不了、profile 盖过了路由）就什么都不写。
+            // 再先写目录、后改指针：指针指着不存在的文件，Codex 起不来。
+            let patch = patch.with_catalog();
+            patch.apply(&config.path, engine.read(&config)?.bytes.as_deref())?;
+            engine.write(&codex::catalog::live_file(home), &patch::Whole(catalog))?;
+            Ok(engine.write(&config, &patch)?)
         }
         AgentKind::GrokBuild => Ok(engine.write(&grok::live_file(home), &grok::patch(provider)?)?),
         AgentKind::Pi | AgentKind::Opencode => Err(ApplyError::WrongMode { agent }),
@@ -137,9 +150,19 @@ pub(crate) fn writer(home: &Path, agent: AgentKind) -> Result<Writer, ApplyError
         ),
         AgentKind::Codex => {
             let login = codex_login(home)?;
+            let file = codex::live_file(home);
+            // 现在指着 confdeck 的模型目录就照样指着：认当前是哪家时逐字比较，改供应商时这一项不变。
+            let current = fsx::read_optional(&file.path).map_err(|source| EngineError::Io {
+                path: file.path.clone(),
+                source,
+            })?;
+            let catalog = codex::uses_catalog(&file.path, current.as_deref());
             (
-                codex::live_file(home),
-                Box::new(move |provider| Ok(Box::new(codex::patch(Some(provider), login)?))),
+                file,
+                Box::new(move |provider| {
+                    let patch = codex::patch(Some(provider), login)?;
+                    Ok(Box::new(if catalog { patch.with_catalog() } else { patch }))
+                }),
             )
         }
         AgentKind::GrokBuild => (
@@ -328,6 +351,13 @@ fn write_changes(
     };
     let new = new.apply(&file.path, None)?;
     let delta = patch::delta(file.format, &file.path, &old, &new)?;
+    // Codex 的模型列表在目录文件里，先重写目录（找不到 `codex` 就留着旧的）。
+    if agent == AgentKind::Codex
+        && codex::uses_catalog(&file.path, engine.read(&file)?.bytes.as_deref())
+        && let Some(catalog) = codex::catalog::generate(home, &codex::catalog_models(after)?)
+    {
+        engine.write(&codex::catalog::live_file(home), &patch::Whole(catalog))?;
+    }
     let outcome = engine.write(&file, delta.as_ref())?;
     if agent == AgentKind::ClaudeCode {
         engine.set_owned(agent.id(), &claude::raw_entries(Some(after))?)?;
@@ -512,6 +542,63 @@ mod tests {
         assert!(
             home.read(".codex/config.toml")
                 .contains("requires_openai_auth = true")
+        );
+    }
+
+    #[test]
+    fn codex_writes_the_catalog_before_pointing_at_it() {
+        let home = Home::new();
+        // 测试里默认找不到 `codex`：不写目录，也不指过去。
+        switch(&home.engine, home.path(), AgentKind::Codex, Some(&relay())).unwrap();
+        assert!(
+            !home
+                .read(".codex/config.toml")
+                .contains("model_catalog_json")
+        );
+        assert!(!home.path().join(".codex/confdeck-models.json").exists());
+
+        codex::catalog::tests::use_codex(home.path(), &codex::catalog::tests::sample());
+        switch(&home.engine, home.path(), AgentKind::Codex, Some(&relay())).unwrap();
+        assert!(
+            home.read(".codex/config.toml")
+                .contains("model_catalog_json = \"confdeck-models.json\"")
+        );
+        let slugs = |home: &Home| -> Vec<String> {
+            let catalog: Value =
+                serde_json::from_str(&home.read(".codex/confdeck-models.json")).unwrap();
+            catalog["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["slug"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(slugs(&home), ["glm-4.5-air", "glm-4.6"]);
+
+        // 改了模型目录：目录文件跟着重写。
+        let providers = vec![relay()];
+        let mut edited = relay();
+        edited.models[2].star = true;
+        save_provider(&home.engine, home.path(), &providers, &edited).unwrap();
+        assert_eq!(slugs(&home), ["glm-4.5-air", "glm-4.6", "glm-4.5"]);
+
+        // 改不了 config.toml 时目录文件也不动。
+        let before = home.read(".codex/confdeck-models.json");
+        home.write(
+            ".codex/config.toml",
+            "profile = \"work\"\n[profiles.work]\nmodel_provider = \"azure\"\n",
+        );
+        let mut other = relay();
+        other.models.retain(|model| model.id == "glm-4.6");
+        assert!(switch(&home.engine, home.path(), AgentKind::Codex, Some(&other)).is_err());
+        assert_eq!(home.read(".codex/confdeck-models.json"), before);
+
+        home.write(".codex/config.toml", "");
+        switch(&home.engine, home.path(), AgentKind::Codex, None).unwrap();
+        assert!(
+            !home
+                .read(".codex/config.toml")
+                .contains("model_catalog_json")
         );
     }
 

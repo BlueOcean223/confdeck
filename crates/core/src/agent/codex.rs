@@ -1,4 +1,5 @@
-//! Codex：`~/.codex/config.toml`。单选 agent，现在只写默认模型；模型列表要写进模型目录文件（`model_catalog_json`），还没做。
+//! Codex：`~/.codex/config.toml`。单选 agent，列表 + 默认：列表写进模型目录文件（[`catalog`]），
+//! `model_catalog_json` 指向它；默认模型写 `model`。
 //!
 //! `model_context_window`、`model_auto_compact_token_limit` 是用户自己的设置，不写也不清：官方模型可以用它把窗口调大
 //! （gpt-5.6-sol 默认 272K，最大 872K），Codex 会把它截到每个模型的上限。第三方模型的窗口写进模型目录。
@@ -11,6 +12,8 @@
 //! Codex 0.153.4 上试过：删了表，`codex exec resume` 照样续上原来走 `custom` 的会话，请求按当前配置发；
 //! 没生效的 profile 选着不存在的表也能正常加载。所以这里直接删。
 
+pub mod catalog;
+
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
@@ -18,13 +21,14 @@ use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use super::{
     AdaptError, AgentKind, Connection, Credential, FileSetup, choose_protocol, default_model,
-    require_key,
+    list_models, require_key,
 };
 use crate::engine::LiveFile;
+use crate::fsx;
 use crate::fsx::Mode;
 use crate::patch::toml::{self, TomlDocPatch, put_table, put_value, remove_key, shape_error};
 use crate::patch::{Format, PatchError};
-use crate::provider::{Model, Protocol, Provider, normalize_url};
+use crate::provider::{Modality, Model, Protocol, Provider, normalize_url};
 
 const AGENT: AgentKind = AgentKind::Codex;
 
@@ -158,7 +162,7 @@ struct Route {
 }
 
 /// 切到这家供应商的补丁；`None` 是「默认」。`login_on_disk`：`~/.codex/auth.json`
-/// 里有没有 ChatGPT 登录。
+/// 里有没有 ChatGPT 登录。模型目录文件写好了再加上 [`CodexPatch::with_catalog`]。
 pub fn patch(provider: Option<&Provider>, login_on_disk: bool) -> Result<CodexPatch, AdaptError> {
     let Some(provider) = provider else {
         return Ok(CodexPatch {
@@ -206,6 +210,17 @@ pub fn patch(provider: Option<&Provider>, login_on_disk: bool) -> Result<CodexPa
         route: Some(Route { table, stamp }),
         login_on_disk,
     })
+}
+
+impl CodexPatch {
+    /// `model_catalog_json` 指向 confdeck 的模型目录文件。目录要先写好：指着不存在的文件 Codex 起不来。
+    pub fn with_catalog(mut self) -> Self {
+        if self.route.is_some() {
+            self.top
+                .push(("model_catalog_json", Value::from(catalog::FILE_NAME)));
+        }
+        self
+    }
 }
 
 impl TomlDocPatch for CodexPatch {
@@ -334,6 +349,79 @@ fn rename_reserved(providers: &mut dyn TableLike) {
     }
 }
 
+/// 写进模型目录的模型：列表（覆盖里选的，或打星的），默认模型不在列表里时排在最前面。
+pub fn catalog_models(provider: &Provider) -> Result<Vec<&Model>, AdaptError> {
+    let mut models = list_models(provider, AGENT)?;
+    let default = default_model(provider, AGENT)?;
+    if !models.iter().any(|model| model.id == default.id) {
+        models.insert(0, default);
+    }
+    Ok(models)
+}
+
+/// `config.toml` 的 `model_catalog_json` 指向的文件。相对路径按配置文件所在目录（`CODEX_HOME`）算。
+fn catalog_path(path: &Path, doc: &DocumentMut) -> Option<PathBuf> {
+    let value = text(doc.get("model_catalog_json"))?;
+    let dir = path.parent().unwrap_or(Path::new(""));
+    Some(dir.join(value))
+}
+
+/// 现在的 `config.toml` 指着 confdeck 的模型目录文件：改了供应商的模型以后要跟着重写目录。
+pub fn uses_catalog(path: &Path, bytes: Option<&[u8]>) -> bool {
+    toml::parse(path, bytes)
+        .is_ok_and(|doc| text(doc.get("model_catalog_json")).as_deref() == Some(catalog::FILE_NAME))
+}
+
+/// 模型目录文件里的模型（confdeck 写的，或别的工具写的）：ID、显示名、窗口、图片输入、推理档位。读不了为空。
+fn catalog_entries(path: &Path) -> Vec<Model> {
+    let catalog: Option<Json> = fsx::read_optional(path)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let entries = catalog
+        .as_ref()
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(Json::as_array);
+    entries
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let id = entry.get("slug")?.as_str()?.trim();
+            let text = |key: &str| entry.get(key).and_then(Json::as_str);
+            let name = text("display_name").filter(|name| *name != id);
+            let context = ["context_window", "max_context_window"]
+                .iter()
+                .find_map(|key| entry.get(*key).and_then(Json::as_u64))
+                .filter(|&context| context > 0);
+            let image = entry
+                .get("input_modalities")
+                .and_then(Json::as_array)
+                .is_some_and(|input| input.iter().any(|m| m == "image"));
+            let reasoning = entry
+                .get("supported_reasoning_levels")
+                .and_then(Json::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|level| level.get("effort")?.as_str())
+                .map(str::to_string)
+                .collect();
+            Some(Model {
+                id: id.to_string(),
+                name: name.map(str::to_string),
+                context,
+                input: if image {
+                    vec![Modality::Text, Modality::Image]
+                } else {
+                    Vec::new()
+                },
+                reasoning,
+                ..Model::default()
+            })
+            .filter(|model| !model.id.is_empty())
+        })
+        .collect()
+}
+
 /// 从 `config.toml` 读出现在连的是哪。只看选的路由和它的地址、凭据，不看模型名。
 /// 旧写法的 profile 生效时按它盖过的值算。
 pub fn connection(path: &Path, bytes: Option<&[u8]>) -> Result<Connection, PatchError> {
@@ -369,7 +457,7 @@ pub fn connection(path: &Path, bytes: Option<&[u8]>) -> Result<Connection, Patch
     })
 }
 
-/// 「把当前配置存成供应商」：读出地址、Key 和 `model`。连的不是一个地址时为 `None`。
+/// 「把当前配置存成供应商」：读出地址、Key、`model`，和模型目录文件里的模型。连的不是一个地址时为 `None`。
 pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, PatchError> {
     let Connection::Endpoint {
         base_url,
@@ -380,6 +468,20 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
     };
     let doc = toml::parse(path, bytes)?;
     let model = text(effective(&doc, "model"));
+    let mut models = catalog_path(path, &doc)
+        .map(|catalog| catalog_entries(&catalog))
+        .unwrap_or_default();
+    if let Some(id) = &model
+        && !models.iter().any(|known| known.id == *id)
+    {
+        models.insert(
+            0,
+            Model {
+                id: id.clone(),
+                ..Model::default()
+            },
+        );
+    }
     Ok(Some(FileSetup {
         protocol: Protocol::OpenaiResponses,
         base_url,
@@ -387,13 +489,7 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
             .as_ref()
             .and_then(Credential::key)
             .map(str::to_string),
-        models: model
-            .iter()
-            .map(|id| Model {
-                id: id.clone(),
-                ..Model::default()
-            })
-            .collect(),
+        models,
         slots: Default::default(),
         default_model: model,
     }))
@@ -686,6 +782,90 @@ requires_openai_auth = false
             patch(Some(&provider), true),
             Err(AdaptError::MissingKey { .. })
         ));
+    }
+
+    #[test]
+    fn the_catalog_pointer_comes_and_goes_with_the_route() {
+        let with = apply(&patch(Some(&relay()), false).unwrap().with_catalog(), None);
+        assert!(
+            with.contains("model_catalog_json = \"confdeck-models.json\""),
+            "{with}"
+        );
+        assert!(uses_catalog(
+            Path::new("config.toml"),
+            Some(with.as_bytes())
+        ));
+        // 换一家没写目录的、切回默认，都清掉。
+        let without = apply(&patch(Some(&relay()), false).unwrap(), Some(&with));
+        assert!(!without.contains("model_catalog_json"), "{without}");
+        assert!(
+            !apply(&patch(None, false).unwrap().with_catalog(), Some(&with))
+                .contains("model_catalog_json")
+        );
+        assert!(!uses_catalog(
+            Path::new("config.toml"),
+            Some(b"model_catalog_json = \"cc-switch-model-catalog.json\"\n")
+        ));
+    }
+
+    #[test]
+    fn setup_reads_the_models_from_the_catalog_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            dir.path().join("cc-switch-model-catalog.json"),
+            serde_json::to_vec(&json!({"models": [
+                {"slug": "glm-5.3", "display_name": "GLM-5.3", "context_window": 1048576,
+                 "input_modalities": ["text"],
+                 "supported_reasoning_levels": [{"effort": "low"}, {"effort": "max"}]},
+                {"slug": "glm-5.3-flash", "display_name": "glm-5.3-flash",
+                 "input_modalities": ["text", "image"]}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let text = "model = \"glm-5-turbo\"\nmodel_provider = \"custom\"\nmodel_catalog_json = \"cc-switch-model-catalog.json\"\n\n[model_providers.custom]\nbase_url = \"https://open.bigmodel.cn/api/v1\"\nexperimental_bearer_token = \"sk\"\n";
+        let found = setup(&config, Some(text.as_bytes())).unwrap().unwrap();
+        assert_eq!(
+            found.models,
+            [
+                Model {
+                    id: "glm-5-turbo".into(),
+                    ..Model::default()
+                },
+                Model {
+                    id: "glm-5.3".into(),
+                    name: Some("GLM-5.3".into()),
+                    context: Some(1_048_576),
+                    reasoning: vec!["low".into(), "max".into()],
+                    ..Model::default()
+                },
+                Model {
+                    id: "glm-5.3-flash".into(),
+                    input: vec![Modality::Text, Modality::Image],
+                    ..Model::default()
+                },
+            ]
+        );
+        assert_eq!(found.default_model.as_deref(), Some("glm-5-turbo"));
+    }
+
+    #[test]
+    fn the_catalog_lists_the_default_model_first_when_it_is_not_starred() {
+        let mut provider = relay();
+        provider.overrides.insert(
+            AGENT,
+            AgentOverride {
+                default_model: Some("glm-4.5".into()),
+                ..AgentOverride::default()
+            },
+        );
+        let ids: Vec<&str> = catalog_models(&provider)
+            .unwrap()
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert_eq!(ids, ["glm-4.5", "glm-4.5-air", "glm-4.6"]);
     }
 
     #[test]
