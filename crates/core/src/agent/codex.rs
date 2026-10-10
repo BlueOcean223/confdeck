@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use serde_json::Value as Json;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use super::{AdaptError, AgentKind, Connection, choose_protocol, default_model, require_key};
+use super::{
+    AdaptError, AgentKind, Connection, Credential, FileSetup, choose_protocol, default_model,
+    require_key,
+};
 use crate::engine::LiveFile;
 use crate::fsx::Mode;
 use crate::patch::PatchError;
@@ -307,11 +310,41 @@ pub fn connection(path: &Path, bytes: Option<&[u8]>) -> Result<Connection, Patch
         return Ok(Connection::Other { host: None });
     };
     let credential = text(table.get("experimental_bearer_token"))
-        .or_else(|| text(table.get("env_key")).map(|name| format!("env: {name}")));
+        .map(Credential::Key)
+        .or_else(|| text(table.get("env_key")).map(Credential::EnvVar));
     Ok(Connection::Endpoint {
         base_url: normalize_url(Protocol::OpenaiResponses, &base_url),
         credential,
     })
+}
+
+/// 「把当前配置存成供应商」：读出地址、Key 和 `model`。连的不是一个地址时为 `None`。
+pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, PatchError> {
+    let Connection::Endpoint {
+        base_url,
+        credential,
+    } = connection(path, bytes)?
+    else {
+        return Ok(None);
+    };
+    let doc = toml::parse(path, bytes)?;
+    let model = doc
+        .get("model")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    Ok(Some(FileSetup {
+        protocol: Protocol::OpenaiResponses,
+        base_url,
+        key: credential
+            .as_ref()
+            .and_then(Credential::key)
+            .map(str::to_string),
+        models: model.iter().cloned().collect(),
+        slots: Default::default(),
+        default_model: model,
+    }))
 }
 
 #[cfg(test)]
@@ -527,12 +560,30 @@ requires_openai_auth = false
             ),
             Connection::Endpoint {
                 base_url: "http://localhost:11434/v1".into(),
-                credential: Some("env: OLLAMA_KEY".into())
+                credential: Some(Credential::EnvVar("OLLAMA_KEY".into()))
             }
         );
         assert_eq!(
             read("model_provider = \"ollama\"\n"),
             Connection::Other { host: None }
+        );
+    }
+
+    #[test]
+    fn setup_reads_the_route_and_the_model() {
+        let text = "model = \"glm-4.6\"\nmodel_provider = \"relay\"\n\n[model_providers.relay]\nbase_url = \"https://relay.elsewhere.io/v1\"\nexperimental_bearer_token = \"sk-x\"\n";
+        let read = setup(Path::new("c.toml"), Some(text.as_bytes()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.protocol, Protocol::OpenaiResponses);
+        assert_eq!(read.base_url, "https://relay.elsewhere.io/v1");
+        assert_eq!(read.key.as_deref(), Some("sk-x"));
+        assert_eq!(read.models, ["glm-4.6"]);
+        assert_eq!(read.default_model.as_deref(), Some("glm-4.6"));
+        assert!(read.slots.is_empty());
+        assert_eq!(
+            setup(Path::new("c.toml"), Some(LIVE.as_bytes())).unwrap(),
+            None
         );
     }
 
@@ -546,7 +597,7 @@ requires_openai_auth = false
             connection(Path::new("c.toml"), Some(&out)).unwrap(),
             Connection::Endpoint {
                 base_url: "https://relay.example/v1".into(),
-                credential: Some("sk-relay".into())
+                credential: Some(Credential::Key("sk-relay".into()))
             }
         );
     }

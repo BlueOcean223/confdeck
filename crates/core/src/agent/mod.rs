@@ -8,6 +8,7 @@ pub mod codex;
 pub mod pi;
 pub mod slots;
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -87,16 +88,65 @@ impl fmt::Display for AgentKind {
 pub enum Connection {
     /// 没有指定地址和凭据：agent 自带的登录。
     Default,
-    /// 连到一个地址。凭据是 Key 本身，或者 `apiKeyHelper: 命令`、`env: 变量名` 这类说明。
+    /// 连到一个地址。
     Endpoint {
         base_url: String,
-        credential: Option<String>,
+        credential: Option<Credential>,
     },
     /// confdeck 不写的接法：Claude Code 走 Bedrock / Vertex、Codex 用内置的 ollama 等。
     Other { host: Option<String> },
 }
 
+/// 配置文件里的凭据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Credential {
+    /// Key 本身。
+    Key(String),
+    /// Claude Code 的 `apiKeyHelper`：运行这个命令拿 Key。
+    Helper(String),
+    /// Codex 的 `env_key`：Key 在这个环境变量里。
+    EnvVar(String),
+}
+
+impl Credential {
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            Self::Key(key) => Some(key),
+            Self::Helper(_) | Self::EnvVar(_) => None,
+        }
+    }
+}
+
+/// 从配置文件里读出的一套设置，用来「把当前配置存成供应商」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSetup {
+    pub protocol: Protocol,
+    pub base_url: String,
+    /// 文件里是 Key 本身时才有；`apiKeyHelper`、`env_key` 这类读不到 Key。
+    pub key: Option<String>,
+    /// 文件里出现的模型名，按出现顺序，去重。
+    pub models: Vec<String>,
+    /// 槽位型 agent 的槽位 → 模型名。
+    pub slots: BTreeMap<String, String>,
+    /// 列表型 agent 的默认模型。
+    pub default_model: Option<String>,
+}
+
 impl Connection {
+    pub fn base_url(&self) -> Option<&str> {
+        match self {
+            Self::Endpoint { base_url, .. } => Some(base_url),
+            Self::Default | Self::Other { .. } => None,
+        }
+    }
+
+    pub fn credential(&self) -> Option<&Credential> {
+        match self {
+            Self::Endpoint { credential, .. } => credential.as_ref(),
+            Self::Default | Self::Other { .. } => None,
+        }
+    }
+
     pub fn host(&self) -> Option<String> {
         match self {
             Self::Default => None,

@@ -2,12 +2,15 @@
 //!
 //! 关键字段的清单移植自 ccs-lite 的 `live/floor.rs`（Claude Code 2.1.282 核实）。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use super::slots::{self, Slot, Strength};
-use super::{AdaptError, AgentKind, Connection, choose_protocol, require_key};
+use super::{
+    AdaptError, AgentKind, Connection, Credential, FileSetup, choose_protocol, require_key,
+};
 use crate::engine::LiveFile;
 use crate::fsx::Mode;
 use crate::patch::json::{self, ClearScope, JsonPatch};
@@ -202,11 +205,11 @@ pub fn connection(path: &Path, bytes: Option<&[u8]>) -> Result<Connection, Patch
 
     let credential = env_value("ANTHROPIC_AUTH_TOKEN")
         .or_else(|| env_value("ANTHROPIC_API_KEY"))
-        .map(str::to_string)
+        .map(|key| Credential::Key(key.to_string()))
         .or_else(|| {
             doc.get("apiKeyHelper")
                 .and_then(Value::as_str)
-                .map(|command| format!("apiKeyHelper: {command}"))
+                .map(|command| Credential::Helper(command.to_string()))
         });
     let base_url =
         env_value("ANTHROPIC_BASE_URL").map(|url| normalize_url(Protocol::Anthropic, url));
@@ -219,10 +222,47 @@ pub fn connection(path: &Path, bytes: Option<&[u8]>) -> Result<Connection, Patch
     })
 }
 
+/// 「把当前配置存成供应商」：读出地址、Key 和各槽位的模型名。连的不是一个地址时为 `None`。
+pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, PatchError> {
+    let Connection::Endpoint {
+        base_url,
+        credential,
+    } = connection(path, bytes)?
+    else {
+        return Ok(None);
+    };
+    let (doc, _) = json::parse(path, bytes, false)?;
+    let env = doc.get("env").and_then(Value::as_object);
+    let mut models: Vec<String> = Vec::new();
+    let mut slots = BTreeMap::new();
+    for (slot, name) in SLOTS {
+        let model = env
+            .and_then(|env| env.get(*name))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        if let Some(model) = model {
+            slots.insert(slot.key.to_string(), model.to_string());
+            if !models.iter().any(|seen| seen == model) {
+                models.push(model.to_string());
+            }
+        }
+    }
+    Ok(Some(FileSetup {
+        protocol: Protocol::Anthropic,
+        base_url,
+        key: credential
+            .as_ref()
+            .and_then(Credential::key)
+            .map(str::to_string),
+        models,
+        slots,
+        default_model: None,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use serde_json::json;
 
     use super::*;
@@ -395,21 +435,21 @@ mod tests {
             ),
             Connection::Endpoint {
                 base_url: "https://relay.example".into(),
-                credential: Some("sk".into())
+                credential: Some(Credential::Key("sk".into()))
             }
         );
         assert_eq!(
             read(r#"{"env": {"ANTHROPIC_API_KEY": "sk-ant"}}"#),
             Connection::Endpoint {
                 base_url: OFFICIAL_URL.into(),
-                credential: Some("sk-ant".into())
+                credential: Some(Credential::Key("sk-ant".into()))
             }
         );
         assert_eq!(
             read(r#"{"apiKeyHelper": "~/bin/key"}"#),
             Connection::Endpoint {
                 base_url: OFFICIAL_URL.into(),
-                credential: Some("apiKeyHelper: ~/bin/key".into())
+                credential: Some(Credential::Helper("~/bin/key".into()))
             }
         );
         assert_eq!(
@@ -423,6 +463,48 @@ mod tests {
     }
 
     #[test]
+    fn setup_reads_the_address_key_and_slots() {
+        let text = r#"{"env": {
+            "ANTHROPIC_BASE_URL": "https://relay.elsewhere.io",
+            "ANTHROPIC_AUTH_TOKEN": "sk-x",
+            "ANTHROPIC_MODEL": "glm-4.6",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5-air",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.6"
+        }}"#;
+        let read = setup(Path::new("s.json"), Some(text.as_bytes()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.base_url, "https://relay.elsewhere.io");
+        assert_eq!(read.key.as_deref(), Some("sk-x"));
+        assert_eq!(read.models, ["glm-4.6", "glm-4.5-air"]);
+        assert_eq!(
+            read.slots,
+            BTreeMap::from([
+                ("main".into(), "glm-4.6".into()),
+                ("opus".into(), "glm-4.6".into()),
+                ("haiku".into(), "glm-4.5-air".into()),
+            ])
+        );
+
+        let helper =
+            r#"{"env": {"ANTHROPIC_BASE_URL": "https://r.example"}, "apiKeyHelper": "~/bin/key"}"#;
+        let read = setup(Path::new("s.json"), Some(helper.as_bytes()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.key, None, "a helper command is not a key");
+
+        assert_eq!(setup_of("{}"), None);
+        assert_eq!(
+            setup_of(r#"{"env": {"CLAUDE_CODE_USE_VERTEX": "1"}}"#),
+            None
+        );
+    }
+
+    fn setup_of(text: &str) -> Option<FileSetup> {
+        setup(Path::new("s.json"), Some(text.as_bytes())).unwrap()
+    }
+
+    #[test]
     fn what_patch_writes_reads_back_as_the_same_connection() {
         let provider = relay();
         let out = patch(Some(&provider))
@@ -433,7 +515,7 @@ mod tests {
             connection(Path::new("s.json"), Some(&out)).unwrap(),
             Connection::Endpoint {
                 base_url: "https://relay.example".into(),
-                credential: Some("sk-relay".into())
+                credential: Some(Credential::Key("sk-relay".into()))
             }
         );
     }
