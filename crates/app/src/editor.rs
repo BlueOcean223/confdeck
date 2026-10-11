@@ -862,22 +862,15 @@ impl Editor {
             self.form_row(
                 t,
                 t!("editor.id").into(),
-                div()
-                    .v_flex()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .h(px(30.))
-                            .flex()
-                            .items_center()
-                            .font_family("Menlo")
-                            .text_size(px(12.5))
-                            .child(self.initial.id.clone()),
-                    )
-                    .child(ui::hint(
-                        t,
-                        t!("editor.id_hint", id = self.initial.id.clone()),
-                    )),
+                div().v_flex().gap(px(2.)).child(
+                    div()
+                        .h(px(30.))
+                        .flex()
+                        .items_center()
+                        .font_family("Menlo")
+                        .text_size(px(12.5))
+                        .child(self.initial.id.clone()),
+                ),
             )
         };
 
@@ -951,11 +944,7 @@ impl Editor {
             body = body.child(self.form_row(t, protocol.to_string().into(), field(state, true)));
         }
         body = body
-            .child(self.section(
-                t,
-                t!("editor.models").into(),
-                Some(t!("editor.models_hint").into()),
-            ))
+            .child(self.section(t, t!("editor.models").into(), None))
             .child(self.model_rows(t, window, cx))
             .child(
                 ui::text_button("add-model", t)

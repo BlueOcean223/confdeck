@@ -336,7 +336,7 @@ impl Picker {
             group(&mut rows, t!("picker.available").into(), &rest);
         } else if now.is_some() {
             // 有「现在」那组时「默认」也归到供应商那组底下，不然它会像是「现在」的一部分。
-            rows.push(Row::Header(t!("picker.group_backup").into()));
+            rows.push(Row::Header(t!("picker.group_providers").into()));
             rows.extend(default_row);
             rows.extend(usable.iter().map(|&p| Row::Option {
                 option: Some(p),

@@ -158,8 +158,8 @@ picker:
   # 配置不是 confdeck 写的时候（「自定义 · 主机名」「Key 不一致」），列表最上面的一组：
   # 第一行写现在连到哪，下面挂着能做的动作（decisions「『自定义』的样子」）。有过滤词时不显示。
   now:
-    en: Now · not written by confdeck
-    zh-CN: 现在 · 不是 confdeck 写的
+    en: Current config
+    zh-CN: 当前配置
   # 「自定义」没有地址可显示时（Bedrock、Vertex、Codex 内置的 ollama）的小字；有地址时小字就是地址。
   other_setup:
     en: Bedrock, Vertex, a built-in provider or similar
@@ -188,9 +188,9 @@ picker:
     en: Save the current setup as a provider…
     zh-CN: 把当前配置存成供应商…
   # 配置不是 confdeck 写的时候，供应商那组的标题多说一句。
-  group_backup:
-    en: Providers · picking one backs the file up first
-    zh-CN: 供应商 · 选一家会先备份再改写
+  group_providers:
+    en: Providers
+    zh-CN: 供应商
 
 panel:
   open:
@@ -223,11 +223,8 @@ editor:
     en: ID
     zh-CN: ID
   id_hint_new:
-    en: Generated from the name, editable now; fixed after saving
-    zh-CN: 从名字生成，可以改；建好后不能改
-  id_hint:
-    en: "Can't change later; Pi stores it as confdeck-%{id}"
-    zh-CN: "建好后不能改：Pi 里的键是 confdeck-%{id}，选了哪家也按它记"
+    en: Can't be changed after saving
+    zh-CN: 保存后不能改
   key:
     en: Key
     zh-CN: Key
@@ -241,26 +238,23 @@ editor:
     en: Hide
     zh-CN: 隐藏
   key_hint_in_use:
-    en: "Changes are written into the config of %{agents}"
-    zh-CN: "改了会写进 %{agents} 的配置文件"
+    en: "Changes sync to %{agents}"
+    zh-CN: "改了会同步到 %{agents}"
   endpoints:
     en: Endpoints
     zh-CN: 接口地址
   endpoints_hint:
-    en: Empty means not offered. Root URLs only; confdeck adds /v1 and /v1beta itself
-    zh-CN: 空着就是不提供。存根地址，Anthropic 的 /v1、Gemini 的 /v1beta 由 confdeck 补上
+    en: Leave empty if the protocol isn't supported
+    zh-CN: 留空则表示不支持该协议
   not_offered:
     en: Not offered
     zh-CN: 不提供
   models:
     en: Models
     zh-CN: 模型目录
-  models_hint:
-    en: These are written into the agents. The mark at the front picks the default model.
-    zh-CN: 这些会写进 agent；最前面的标记是默认模型
   models_empty:
-    en: Empty catalog. List-type agents would get no models.
-    zh-CN: 目录是空的，列表型 agent 会没有模型
+    en: No models yet
+    zh-CN: 还没有模型
   default_model:
     en: Default model
     zh-CN: 默认模型
@@ -304,8 +298,8 @@ editor:
     en: Remove model
     zh-CN: 删掉这个模型
   footer_hint:
-    en: Saved changes are written into the agents using this provider
-    zh-CN: 保存后写进在用的 agent
+    en: Changes sync to the agents using this provider
+    zh-CN: 保存后同步到在用的 agent
   delete:
     en: Delete
     zh-CN: 删除
@@ -388,7 +382,7 @@ toast:
     en: "%{agent} was not written: %{error}"
     zh-CN: "%{agent} 没写成：%{error}"
 
-# 选了一家以后的提示（主窗口的提示条、面板的底栏）：前半句说换成了什么，后半句接着说写了哪个文件。
+# 选了一家以后的提示（主窗口的提示条、面板的底栏）：只说换成了什么，不说写了哪个文件（用户 10-11：太啰嗦）。
 write:
   switched:
     en: "%{agent} now uses %{provider}"
@@ -402,15 +396,6 @@ write:
   disabled:
     en: "%{provider} removed from %{agent}"
     zh-CN: "%{agent} 去掉了 %{provider}"
-  wrote:
-    en: " · wrote %{files}"
-    zh-CN: " · 写了 %{files}"
-  wrote_backup:
-    en: " · wrote %{files}, backed up first"
-    zh-CN: " · 写了 %{files}，先备份了"
-  unchanged:
-    en: " · the file already matched, nothing written"
-    zh-CN: " · 文件本来就是这样，没有写"
   # 「Key 不一致」时把文件里的 Key 存进这家：这个 agent 的文件不用写，别的在用这家的 agent 跟着换。
   key_adopted:
     en: "%{provider} now has the key from %{agent}'s config"

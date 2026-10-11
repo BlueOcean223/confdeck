@@ -13,7 +13,7 @@ use confdeck_core::agent::{self, AgentKind, Connection, Mode};
 use confdeck_core::apply::{self, ApplyError, Switched, Synced, UsedBy};
 use confdeck_core::current::{self, Current};
 use confdeck_core::data::DataDir;
-use confdeck_core::engine::{Engine, LiveFile, Outcome};
+use confdeck_core::engine::{Engine, Outcome};
 use confdeck_core::preset;
 use confdeck_core::provider::{self, Protocol, Provider};
 use confdeck_core::store::{self, StoreError};
@@ -550,19 +550,11 @@ impl Store {
                 ))];
             }
         };
-        let files = apply::live_files(&self.home, kind);
-        let mut outcomes = vec![switched.outcome];
-        if let Some(Ok(catalog)) = &switched.catalog {
-            outcomes.push(catalog.clone());
-        }
         let headline = match name {
             Some(name) => t!("write.switched", agent = agent, provider = name),
             None => t!("write.restored", agent = agent),
         };
-        let mut notices = vec![Notice::ok(format!(
-            "{headline}{}",
-            self.file_note(&files, &outcomes)
-        ))];
+        let mut notices = vec![Notice::ok(headline)];
         // Codex 的模型目录没写成：config.toml 已经切过去了，但 `/model` 列的还是 GPT 模型，要说一声。
         if let Some(Err(skipped)) = switched.catalog {
             notices.push(Notice::err(t!(
@@ -582,17 +574,13 @@ impl Store {
     ) -> Vec<Notice> {
         let agent = kind.to_string();
         match result {
-            Ok(outcome) => {
+            Ok(_) => {
                 let headline = if enabling {
                     t!("write.enabled", agent = agent, provider = name)
                 } else {
                     t!("write.disabled", agent = agent, provider = name)
                 };
-                let files = apply::live_files(&self.home, kind);
-                vec![Notice::ok(format!(
-                    "{headline}{}",
-                    self.file_note(&files, &[outcome])
-                ))]
+                vec![Notice::ok(headline)]
             }
             Err(err) => vec![Notice::err(t!(
                 "toast.sync_failed",
@@ -650,29 +638,6 @@ impl Store {
             )));
         }
         notices
-    }
-
-    /// 提示的后半句「 · 写了 ~/.claude/settings.json，先备份了」：只说实际写了的文件。
-    fn file_note(&self, files: &[LiveFile], outcomes: &[Outcome]) -> String {
-        let written: Vec<(String, bool)> = files
-            .iter()
-            .zip(outcomes)
-            .filter(|(_, outcome)| outcome.changed)
-            .map(|(file, outcome)| (self.tilde(&file.path), outcome.backup.is_some()))
-            .collect();
-        if written.is_empty() {
-            return t!("write.unchanged").into_owned();
-        }
-        let names = written
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>()
-            .join(&t!("common.list_separator"));
-        if written.iter().any(|(_, backup)| *backup) {
-            t!("write.wrote_backup", files = names).into_owned()
-        } else {
-            t!("write.wrote", files = names).into_owned()
-        }
     }
 
     fn announce(&self, notices: &[Notice], cx: &mut Context<Self>) {
