@@ -96,7 +96,7 @@ fn shown_agents(store: &Store) -> Vec<usize> {
     (0..store.agents.len())
         .filter(|&i| {
             let agent = &store.agents[i];
-            agent.installed && agent.mode == Mode::Switch && agent.chosen
+            agent.selectable() && agent.mode == Mode::Switch && agent.chosen
         })
         .collect()
 }

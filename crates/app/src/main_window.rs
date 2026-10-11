@@ -1,13 +1,16 @@
 //! 主窗口，布局照 magpie：左上是标志，顶栏中间是分段标签，下面是圆角卡片列表。
 
-use std::borrow::Cow;
+use std::time::Duration;
 
+use confdeck_core::apply::Synced;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::Store;
+use crate::add_provider::{AddEvent, AddProvider};
+use crate::data::{self, Store};
+use crate::editor::{Editor, EditorEvent};
 use crate::picker::{Picker, PickerEvent};
 use crate::theme::Theme;
 use crate::ui;
@@ -75,10 +78,42 @@ struct OpenPicker {
     _subscription: Subscription,
 }
 
+/// 盖在页面上的弹层：添加供应商的卡片表，或一家供应商的编辑器。
+enum Overlay {
+    Add {
+        sheet: Entity<AddProvider>,
+        _subscription: Subscription,
+    },
+    Edit {
+        editor: Entity<Editor>,
+        _subscription: Subscription,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    /// 几秒后自己消失。
+    Success,
+    /// 留着，点 × 才关（写失败的要让人看见）。
+    Error,
+}
+
+struct Toast {
+    id: u64,
+    kind: ToastKind,
+    text: SharedString,
+}
+
+/// 成功提示多久后消失。
+const TOAST_LIFETIME: Duration = Duration::from_secs(5);
+
 pub struct MainWindow {
     store: Entity<Store>,
     tab: Tab,
     picker: Option<OpenPicker>,
+    overlay: Option<Overlay>,
+    toasts: Vec<Toast>,
+    toast_seq: u64,
     /// 刚被「点外面」关掉的选择器。点的正好是它的下拉框时，不要立刻再打开。
     just_closed: Option<usize>,
     /// 上一个标签和这次切换的编号，给分段标签的滑块放动画。
@@ -99,6 +134,9 @@ impl MainWindow {
             store,
             tab: Tab::Agents,
             picker: None,
+            overlay: None,
+            toasts: Vec::new(),
+            toast_seq: 0,
             just_closed: None,
             tab_anim: None,
             clicks: 0,
@@ -194,7 +232,7 @@ impl MainWindow {
     fn agents_page(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let (installed, others): (Vec<usize>, Vec<usize>) =
-            (0..store.agents.len()).partition(|&i| store.agents[i].installed);
+            (0..store.agents.len()).partition(|&i| store.agents[i].selectable());
         let hidden = others.len();
 
         let mut list = ui::list(t, false);
@@ -284,8 +322,10 @@ impl MainWindow {
         let open = self.picker.as_ref().filter(|p| p.agent == i);
         let (logos, label) = store.pill(i);
         // 状态行只写文件在哪。连到哪、是不是 confdeck 写的，都在胶囊里（decisions「没有『接管』」）。
-        let status: SharedString = if agent.installed {
-            agent.config.into()
+        let status: SharedString = if agent.kind.is_none() {
+            t!("agents.not_supported").into()
+        } else if agent.installed {
+            agent.config_path().into()
         } else {
             t!("agents.no_config").into()
         };
@@ -307,7 +347,7 @@ impl MainWindow {
                             .child(status),
                     ),
             )
-            .when(agent.installed, |row| {
+            .when(agent.selectable(), |row| {
                 row.child(
                     ui::text_button(ElementId::named_usize("config", i), t)
                         .mr(px(14.))
@@ -359,24 +399,122 @@ impl MainWindow {
 
     fn providers_page(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
+        let count = store.providers.len();
+        let mut page = div().v_flex().gap(px(10.));
+
+        if let Some(error) = &store.load_error {
+            page = page.child(
+                div()
+                    .h_flex()
+                    .items_start()
+                    .gap(px(8.))
+                    .px(px(14.))
+                    .py(px(10.))
+                    .rounded(px(10.))
+                    .bg(t.danger.opacity(0.1))
+                    .text_size(px(12.))
+                    .text_color(t.danger)
+                    .child(ui::icon("circle-alert", 14., t.danger).mt(px(1.)))
+                    .child(t!("providers.load_error", error = error.clone())),
+            );
+        }
+
+        page = page.child(
+            div()
+                .h_flex()
+                .items_center()
+                .px(px(4.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(t.muted)
+                        .child(if count == 1 {
+                            t!("providers.count_one")
+                        } else {
+                            t!("providers.count_other", count = count)
+                        }),
+                )
+                .child(div().flex_1())
+                .when(store.load_error.is_none(), |row| {
+                    row.child(
+                        ui::text_button("add-provider", t)
+                            .child(ui::icon("plus", 13., t.ctl_fg))
+                            .child(t!("providers.add"))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_add(window, cx))),
+                    )
+                }),
+        );
+
+        if store.providers.is_empty() {
+            return page.child(
+                ui::list(t, false).child(
+                    div()
+                        .v_flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .py(px(32.))
+                        .child(div().text_color(t.muted).child(t!("providers.empty"))),
+                ),
+            );
+        }
+
         let mut list = ui::list(t, false);
         for (i, provider) in store.providers.iter().enumerate() {
-            let users = store.users_of(i);
-            let sub = if users.is_empty() {
-                Cow::Borrowed(provider.host)
+            let last = i + 1 == count;
+            let host = data::host(provider).unwrap_or_default().to_string();
+            let models = provider.models.len();
+            let sub: SharedString = if models == 1 {
+                t!("providers.summary_one", host = host).into()
             } else {
-                let agents = users.join(&t!("common.list_separator"));
-                t!("providers.used_by", host = provider.host, agents = agents)
+                t!("providers.summary_other", host = host, count = models).into()
             };
+            let users = store.users_of(i);
+            let hover_bg = t.card_2;
+            let provider_clone = provider.clone();
+
+            let key_pill = match data::key_tail(provider) {
+                Some(tail) => div()
+                    .font_family("Menlo")
+                    .text_size(px(11.5))
+                    .text_color(t.fg_2)
+                    .bg(t.pill)
+                    .child(tail),
+                None => div()
+                    .text_size(px(11.5))
+                    .text_color(t.muted)
+                    .border_1()
+                    .border_color(t.line)
+                    .child(t!("providers.no_key")),
+            }
+            .flex_none()
+            .h(px(22.))
+            .px(px(8.))
+            .rounded(px(6.))
+            .flex()
+            .items_center();
+
             list = list.child(
                 ui::row(t, false, i == 0)
-                    .child(ui::logo(provider.logo, 22., t, window, cx))
+                    .id(ElementId::named_usize("provider", i))
+                    .when(i == 0, |row| row.rounded_t(px(11.)))
+                    .when(last, |row| row.rounded_b(px(11.)))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_editor(provider_clone.clone(), window, cx)
+                    }))
+                    .child(ui::logo(data::logo(provider), 22., t, window, cx))
                     .child(
                         div()
                             .v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().font_weight(FontWeight::MEDIUM).child(provider.name))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .truncate()
+                                    .child(provider.name.clone()),
+                            )
                             .child(
                                 div()
                                     .mt(px(1.))
@@ -386,22 +524,247 @@ impl MainWindow {
                                     .child(sub),
                             ),
                     )
-                    .child(
-                        div()
-                            .font_family("Menlo")
-                            .text_size(px(12.))
-                            .text_color(t.muted)
-                            .child(provider.key),
-                    )
-                    .child(ui::icon("chevron-right", 13., t.faint).ml(px(10.))),
+                    // 在用的 agent 只画小图标，悬停显示「Claude Code · 模型名」，不响应点击（提案 10）。
+                    .when(!users.is_empty(), |row| {
+                        row.child(div().h_flex().items_center().gap(px(6.)).mr(px(6.)).children(
+                            users.iter().map(|&a| {
+                                let agent = &store.agents[a];
+                                let tip = match store.model_for(a, i) {
+                                    Some(model) => format!("{} · {model}", agent.name),
+                                    None => agent.name.to_string(),
+                                };
+                                div()
+                                    .id(ElementId::Name(format!("user-{i}-{a}").into()))
+                                    .flex_none()
+                                    .size(px(20.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(5.))
+                                    .bg(t.card_2)
+                                    .border_1()
+                                    .border_color(t.line_2)
+                                    .tooltip(ui::tooltip(tip))
+                                    .child(ui::logo(agent.logo, 13., t, window, cx))
+                            }),
+                        ))
+                    })
+                    .child(key_pill)
+                    .child(ui::icon("chevron-right", 13., t.faint).ml(px(4.))),
             );
         }
 
-        div().v_flex().gap(px(10.)).child(list).child(
-            ui::text_button("add-provider", t)
+        page.child(list)
+    }
+
+    fn open_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let sheet = cx.new(|cx| AddProvider::new(store, window, cx));
+        let _subscription = cx.subscribe_in(
+            &sheet,
+            window,
+            |this, _, event: &AddEvent, window, cx| match event {
+                AddEvent::Chosen(preset) => {
+                    let store = this.store.clone();
+                    let preset = *preset;
+                    let editor = cx.new(|cx| Editor::create(store, preset, window, cx));
+                    this.show_editor(editor, cx);
+                }
+                AddEvent::Closed => {
+                    this.overlay = None;
+                    cx.notify();
+                }
+            },
+        );
+        self.overlay = Some(Overlay::Add {
+            sheet,
+            _subscription,
+        });
+        cx.notify();
+    }
+
+    fn open_editor(
+        &mut self,
+        provider: confdeck_core::provider::Provider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let editor = cx.new(|cx| Editor::edit(store, provider, window, cx));
+        self.show_editor(editor, cx);
+    }
+
+    fn show_editor(&mut self, editor: Entity<Editor>, cx: &mut Context<Self>) {
+        let _subscription = cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| {
+            match event {
+                EditorEvent::Saved { name, synced } => {
+                    this.report("toast.saved", "toast.saved_synced", name, synced, cx);
+                }
+                EditorEvent::Deleted { name, synced } => {
+                    this.report("toast.deleted", "toast.deleted_synced", name, synced, cx);
+                }
+                EditorEvent::Closed => {}
+            }
+            this.overlay = None;
+            cx.notify();
+        });
+        self.overlay = Some(Overlay::Edit {
+            editor,
+            _subscription,
+        });
+        cx.notify();
+    }
+
+    /// 保存、删除以后的提示：写了哪些 agent 一条，写失败的每个一条、不自动消失（提案 10 第四节）。
+    fn report(
+        &mut self,
+        plain: &str,
+        with_agents: &str,
+        name: &str,
+        synced: &[Synced],
+        cx: &mut Context<Self>,
+    ) {
+        let written: Vec<String> = synced
+            .iter()
+            .filter(|s| s.result.as_ref().is_ok_and(|outcome| outcome.changed))
+            .map(|s| s.agent.to_string())
+            .collect();
+        let text = if written.is_empty() {
+            t!(plain, name = name)
+        } else {
+            t!(with_agents, agents = written.join(&t!("common.list_separator")))
+        };
+        self.toast(ToastKind::Success, text.into(), cx);
+        for failed in synced.iter().filter(|s| s.result.is_err()) {
+            let error = failed.result.as_ref().err().map(ToString::to_string).unwrap_or_default();
+            self.toast(
+                ToastKind::Error,
+                t!("toast.sync_failed", agent = failed.agent.to_string(), error = error).into(),
+                cx,
+            );
+        }
+    }
+
+    fn toast(&mut self, kind: ToastKind, text: SharedString, cx: &mut Context<Self>) {
+        self.toast_seq += 1;
+        let id = self.toast_seq;
+        self.toasts.push(Toast { id, kind, text });
+        if kind == ToastKind::Success {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(TOAST_LIFETIME).await;
+                this.update(cx, |this, cx| this.dismiss_toast(id, cx)).ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.toasts.retain(|toast| toast.id != id);
+        cx.notify();
+    }
+
+    /// 点弹层外面：编辑器有改动会先问，卡片表直接关。
+    fn close_overlay(&mut self, cx: &mut Context<Self>) {
+        match &self.overlay {
+            Some(Overlay::Edit { editor, .. }) => {
+                editor.update(cx, |editor, cx| editor.request_close(cx));
+            }
+            Some(Overlay::Add { .. }) => {
+                self.overlay = None;
+                cx.notify();
+            }
+            None => {}
+        }
+    }
+
+    fn overlay_layer(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let content: AnyElement = match self.overlay.as_ref()? {
+            Overlay::Add { sheet, .. } => sheet.clone().into_any_element(),
+            Overlay::Edit { editor, .. } => editor.clone().into_any_element(),
+        };
+        Some(
+            deferred(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_start()
+                    .justify_center()
+                    .pt(px(36.))
+                    .bg(t.backdrop)
+                    .occlude()
+                    .child(
+                        div()
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_overlay(cx)))
+                            .child(content)
+                            // 出现时淡入、从上方落下（和选择器一样）。
+                            .with_animation(
+                                "overlay-card",
+                                Animation::new(Duration::from_millis(260))
+                                    .with_easing(ui::ease_out_quart),
+                                |el, d| el.opacity((d * 1.6).min(1.)).mt(px(-10. * (1. - d))),
+                            ),
+                    ),
+            )
+            .with_priority(2)
+            .into_any_element(),
+        )
+    }
+
+    fn toast_layer(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.toasts.is_empty() {
+            return None;
+        }
+        let toasts = self.toasts.iter().map(|toast| {
+            let id = toast.id;
+            let (icon, color) = match toast.kind {
+                ToastKind::Success => ("circle-check", t.success),
+                ToastKind::Error => ("circle-alert", t.danger),
+            };
+            div()
+                .id(ElementId::NamedInteger("toast".into(), id))
+                .h_flex()
+                .items_center()
+                .gap(px(8.))
+                .max_w(px(620.))
                 .pl(px(12.))
-                .child(ui::icon("plus", 13., t.ctl_fg))
-                .child(t!("providers.add")),
+                .pr(px(if toast.kind == ToastKind::Error { 8. } else { 14. }))
+                .py(px(9.))
+                .rounded(px(10.))
+                .bg(Hsla { a: 1., ..t.pop_bg })
+                .border_1()
+                .border_color(t.line)
+                .shadow(t.pop_shadow())
+                .text_size(px(12.5))
+                .text_color(t.fg)
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx)))
+                .child(ui::icon(icon, 15., color))
+                .child(div().min_w_0().child(toast.text.clone()))
+                .when(toast.kind == ToastKind::Error, |d| {
+                    d.child(ui::icon("x", 13., t.muted).ml(px(4.)))
+                })
+                .with_animation(
+                    ElementId::NamedInteger("toast-in".into(), id),
+                    Animation::new(Duration::from_millis(240)).with_easing(ui::ease_out_quart),
+                    |el, d| el.opacity(d).mt(px(8. * (1. - d))),
+                )
+        });
+        Some(
+            deferred(
+                div()
+                    .absolute()
+                    .bottom(px(14.))
+                    .left_0()
+                    .right_0()
+                    .v_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .children(toasts),
+            )
+            .with_priority(3)
+            .into_any_element(),
         )
     }
 
@@ -432,6 +795,7 @@ impl Render for MainWindow {
         };
 
         div()
+            .relative()
             .size_full()
             .v_flex()
             .bg(t.bg)
@@ -452,6 +816,8 @@ impl Render for MainWindow {
                     .pb(px(16.))
                     .child(page),
             )
+            .children(self.overlay_layer(&t, cx))
+            .children(self.toast_layer(&t, cx))
     }
 }
 

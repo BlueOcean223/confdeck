@@ -23,6 +23,14 @@ pub struct Theme {
     pub accent: Hsla,
     pub sel: Hsla,
     pub pop_bg: Hsla,
+    /// 删除、出错。
+    pub danger: Hsla,
+    /// 保存成功的提示。
+    pub success: Hsla,
+    /// 弹层编辑器底下盖住列表的那层。
+    pub backdrop: Hsla,
+    /// 输入框的底色。
+    pub field: Hsla,
 }
 
 fn hex(c: u32) -> Hsla {
@@ -101,6 +109,10 @@ impl Theme {
             accent: hex(0x4f46e5),
             sel: hex(0xecebfb),
             pop_bg: hexa(0xfffffff0),
+            danger: hex(0xdc2626),
+            success: hex(0x15803d),
+            backdrop: hexa(0x1c1c2140),
+            field: hex(0xffffff),
         }
     }
 
@@ -124,6 +136,10 @@ impl Theme {
             accent: hex(0xa5b4fc),
             sel: hex(0x33345a),
             pop_bg: hexa(0x26262bf5),
+            danger: hex(0xf87171),
+            success: hex(0x4ade80),
+            backdrop: hexa(0x00000080),
+            field: hex(0x1c1c20),
         }
     }
 

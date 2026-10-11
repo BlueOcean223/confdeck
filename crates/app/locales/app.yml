@@ -33,6 +33,21 @@ common:
   list_separator:
     en: ", "
     zh-CN: "、"
+  cancel:
+    en: Cancel
+    zh-CN: 取消
+  save:
+    en: Save
+    zh-CN: 保存
+
+# 单选 agent 胶囊里的两种特殊状态（预览 09）。
+pill:
+  custom:
+    en: "Custom · %{host}"
+    zh-CN: "自定义 · %{host}"
+  key_mismatch:
+    en: "%{name} · key differs"
+    zh-CN: "%{name} · Key 不一致"
 
 agents:
   show_more:
@@ -47,14 +62,38 @@ agents:
   configure:
     en: Configure
     zh-CN: 配置
+  # 还没有适配器的 agent（阶段 7）。
+  not_supported:
+    en: Not supported yet
+    zh-CN: 还没接上
 
 providers:
-  used_by:
-    en: "%{host} · used by %{agents}"
-    zh-CN: "%{host} · %{agents} 在用"
+  count_one:
+    en: 1 provider
+    zh-CN: 1 家供应商
+  count_other:
+    en: "%{count} providers"
+    zh-CN: "%{count} 家供应商"
+  # 名字下面：第一个接口的主机名和目录里有几个模型。
+  summary_one:
+    en: "%{host} · 1 model"
+    zh-CN: "%{host} · 1 个模型"
+  summary_other:
+    en: "%{host} · %{count} models"
+    zh-CN: "%{host} · %{count} 个模型"
+  no_key:
+    en: No key
+    zh-CN: 没有 Key
   add:
     en: Add provider
     zh-CN: 添加供应商
+  empty:
+    en: No providers yet. Add one to get started.
+    zh-CN: 还没有供应商，先添加一家
+  # providers.json 读不了：列表空着，不许改，不然会把文件盖掉。
+  load_error:
+    en: "The provider list could not be read. Fix the file before editing: %{error}"
+    zh-CN: "供应商列表读不了，先修好文件再改：%{error}"
 
 placeholder:
   not_built:
@@ -101,6 +140,10 @@ picker:
   incompatible:
     en: No %{protocols} endpoint
     zh-CN: 没有 %{protocols} 接口
+  # 必须有 Key 的 agent（Claude Code、Codex、Grok Build）遇到没填 Key 的供应商。
+  no_key:
+    en: No key set
+    zh-CN: 没填 Key
   empty:
     en: No matching providers
     zh-CN: 没有匹配的供应商
@@ -120,3 +163,216 @@ tray:
   quit:
     en: Quit confdeck
     zh-CN: 退出 confdeck
+
+# 供应商的弹层编辑器。
+editor:
+  title_new:
+    en: New provider
+    zh-CN: 新供应商
+  in_use:
+    en: In use
+    zh-CN: 在用
+  name:
+    en: Name
+    zh-CN: 名字
+  id:
+    en: ID
+    zh-CN: ID
+  id_hint_new:
+    en: Generated from the name, editable now; fixed after saving
+    zh-CN: 从名字生成，可以改；建好后不能改
+  id_hint:
+    en: "Can't change later; Pi stores it as confdeck-%{id}"
+    zh-CN: "建好后不能改：Pi 里的键是 confdeck-%{id}，选了哪家也按它记"
+  key:
+    en: Key
+    zh-CN: Key
+  key_placeholder:
+    en: sk-…
+    zh-CN: sk-…
+  key_show:
+    en: Show
+    zh-CN: 显示
+  key_hide:
+    en: Hide
+    zh-CN: 隐藏
+  key_hint_in_use:
+    en: "Changes are written into the config of %{agents}"
+    zh-CN: "改了会写进 %{agents} 的配置文件"
+  endpoints:
+    en: Endpoints
+    zh-CN: 接口地址
+  endpoints_hint:
+    en: Empty means not offered. Root URLs only; confdeck adds /v1 and /v1beta itself
+    zh-CN: 空着就是不提供。存根地址，Anthropic 的 /v1、Gemini 的 /v1beta 由 confdeck 补上
+  not_offered:
+    en: Not offered
+    zh-CN: 不提供
+  models:
+    en: Models
+    zh-CN: 模型目录
+  models_hint:
+    en: These are written into the agents. The mark at the front picks the default model.
+    zh-CN: 这些会写进 agent；最前面的标记是默认模型
+  models_empty:
+    en: Empty catalog. List-type agents would get no models.
+    zh-CN: 目录是空的，列表型 agent 会没有模型
+  default_model:
+    en: Default model
+    zh-CN: 默认模型
+  add_model:
+    en: Add model
+    zh-CN: 添加模型
+  model_id:
+    en: Model ID
+    zh-CN: 模型 ID
+  model_name:
+    en: Display name (optional)
+    zh-CN: 显示名（可不填）
+  model_unnamed:
+    en: (no ID yet)
+    zh-CN: （还没填 ID）
+  model_no_details:
+    en: No details
+    zh-CN: 没有详情
+  context:
+    en: Context
+    zh-CN: 上下文
+  output:
+    en: Max output
+    zh-CN: 输出上限
+  image:
+    en: image
+    zh-CN: 图像
+  image_input:
+    en: Accepts image input
+    zh-CN: 接受图像输入
+  reasoning:
+    en: Reasoning
+    zh-CN: 推理档位
+  reasoning_placeholder:
+    en: "low, high (empty = none)"
+    zh-CN: "low, high（空着 = 不支持）"
+  reasoning_line:
+    en: "reasoning %{levels}"
+    zh-CN: "推理 %{levels}"
+  remove_model:
+    en: Remove model
+    zh-CN: 删掉这个模型
+  footer_hint:
+    en: Saved changes are written into the agents using this provider
+    zh-CN: 保存后写进在用的 agent
+  delete:
+    en: Delete
+    zh-CN: 删除
+  discard_title:
+    en: Discard changes?
+    zh-CN: 放弃改动？
+  discard_body:
+    en: This provider has unsaved changes.
+    zh-CN: 这家供应商改了还没保存。
+  discard:
+    en: Discard
+    zh-CN: 放弃
+  keep_editing:
+    en: Keep editing
+    zh-CN: 继续编辑
+  delete_title:
+    en: "Delete %{name}?"
+    zh-CN: "删除 %{name}？"
+  delete_unused:
+    en: No agent is using it.
+    zh-CN: 没有 agent 在用它。
+  delete_used_by:
+    en: "These agents are using it:"
+    zh-CN: 这几个 agent 在用它：
+  delete_switch_note:
+    en: "%{agents}: the config file is left alone and will show as Custom · %{host}"
+    zh-CN: "%{agents} 的文件不动，之后显示「自定义 · %{host}」"
+  delete_coexist_note:
+    en: "%{agents}: this provider's entry is removed"
+    zh-CN: "%{agents} 里的这一项会删掉"
+  delete_unknown:
+    en: "%{agent}: could not read its config, so it is unknown whether it uses this provider: %{error}"
+    zh-CN: "%{agent} 的配置读不了，不知道在不在用：%{error}"
+
+# 校验错误（core 的 ProviderError）。
+errors:
+  bad_id:
+    en: The ID may only use lowercase letters, digits and hyphens, and may not start or end with a hyphen
+    zh-CN: ID 只能用小写字母、数字和连字符，不能以连字符开头或结尾
+  duplicate_id:
+    en: "The ID %{id} is already taken"
+    zh-CN: "ID %{id} 已经有了"
+  empty_name:
+    en: The name is empty
+    zh-CN: 名字不能空
+  no_endpoint:
+    en: Fill in at least one endpoint
+    zh-CN: 至少填一个接口地址
+  bad_url:
+    en: "The %{protocol} endpoint is not an http(s) URL: %{url}"
+    zh-CN: "%{protocol} 地址不是 http(s) 地址：%{url}"
+  empty_model_id:
+    en: A model has no ID
+    zh-CN: 有个模型没填 ID
+  duplicate_model:
+    en: "The model %{model} appears more than once"
+    zh-CN: "模型 %{model} 出现了不止一次"
+  unknown_model:
+    en: "The override for %{agent} uses %{model}, which is not in the catalog"
+    zh-CN: "给 %{agent} 的覆盖用了目录里没有的模型 %{model}"
+  unknown_default_model:
+    en: "The default model %{model} is not in the catalog"
+    zh-CN: "默认模型 %{model} 不在目录里"
+
+# 保存、删除以后的提示。
+toast:
+  saved:
+    en: "Saved %{name}"
+    zh-CN: "已保存 %{name}"
+  saved_synced:
+    en: "Saved · synced to %{agents}"
+    zh-CN: "已保存 · 同步到 %{agents}"
+  deleted:
+    en: "Deleted %{name}"
+    zh-CN: "已删除 %{name}"
+  deleted_synced:
+    en: "Deleted · removed from %{agents}"
+    zh-CN: "已删除 · 从 %{agents} 里移掉"
+  sync_failed:
+    en: "%{agent} was not written: %{error}"
+    zh-CN: "%{agent} 没写成：%{error}"
+
+# 添加供应商的预设卡片表。
+add:
+  title:
+    en: Add provider
+    zh-CN: 添加供应商
+  search:
+    en: Find a provider…
+    zh-CN: 找一家…
+  domestic:
+    en: China
+    zh-CN: 国内
+  overseas:
+    en: International
+    zh-CN: 海外站
+  relay:
+    en: Relays
+    zh-CN: 中转
+  custom_group:
+    en: Your own
+    zh-CN: 自己填
+  custom:
+    en: Custom
+    zh-CN: 自定义
+  custom_hint:
+    en: Any compatible endpoint
+    zh-CN: 任意兼容的地址
+  added:
+    en: Added
+    zh-CN: 已加
+  empty:
+    en: No matching presets
+    zh-CN: 没有匹配的预设

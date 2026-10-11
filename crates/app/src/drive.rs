@@ -8,6 +8,7 @@
 //! on main           之后的事件送到主窗口（默认）；`on panel` 送到菜单栏面板
 //! click 402 25      在窗口坐标（单位是点）处左键单击
 //! move 402 25       把鼠标移过去（触发悬停）
+//! scroll 480 300 -120   在窗口坐标处滚动：第三个数是纵向的像素差，负数往下看
 //! key escape        按一个键，写法同 GPUI 的快捷键：down、enter、cmd-a
 //! type deep         逐字输入
 //! shot tabs         当前窗口截图，存成 tabs.png
@@ -80,6 +81,12 @@ pub fn start(cx: &mut App) {
             cx.background_executor()
                 .timer(Duration::from_millis(pause))
                 .await;
+            // 等完也补画一帧：不然动画（比如编辑器落下来那 260ms）停在开头那帧上，
+            // 下一次点击按旧帧的位置命中，差几个像素就点不到输入框。
+            #[cfg(feature = "shots")]
+            if let Err(err) = cx.update(|cx| run("redraw", "", target, &shots, cx)) {
+                eprintln!("drive: redraw: {err:#}");
+            }
         }
     })
     .detach();
@@ -109,7 +116,22 @@ fn run(cmd: &str, arg: &str, target: Target, shots: &Path, cx: &mut App) -> anyh
 
     handle.update(cx, |_, window, cx| {
         match cmd {
+            // 什么都不做，只走下面那句补画。
+            "redraw" => {}
             "move" => mouse_move(point_arg(arg)?, window, cx),
+            "scroll" => {
+                let (at, dy) = arg.rsplit_once(' ').context("expected `x y dy`")?;
+                let position = point_arg(at)?;
+                window.dispatch_event(
+                    PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.), px(dy.trim().parse()?))),
+                        modifiers: Modifiers::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }),
+                    cx,
+                );
+            }
             "click" => click(point_arg(arg)?, window, cx),
             "key" => {
                 window.dispatch_keystroke(Keystroke::parse(arg)?, cx);
@@ -120,9 +142,13 @@ fn run(cmd: &str, arg: &str, target: Target, shots: &Path, cx: &mut App) -> anyh
                     window.dispatch_keystroke(Keystroke::parse(&key)?, cx);
                 }
             }
-            "shot" => shot(window, &shots.join(format!("{arg}.png")))?,
+            "shot" => shot(window, cx, &shots.join(format!("{arg}.png")))?,
             _ => bail!("unknown command"),
         }
+        // 屏幕锁着、窗口被挡住时 macOS 停掉了 display link，GPUI 不再画新帧，命中区域就停在旧的一帧上。
+        // 开了 shots 特性就每条命令后自己画一帧，脚本在锁屏时也能跑。
+        #[cfg(feature = "shots")]
+        window.draw(cx).clear(cx);
         Ok(())
     })?
 }
@@ -168,8 +194,21 @@ fn click(position: Point<Pixels>, window: &mut Window, cx: &mut App) {
 }
 
 /// 按窗口编号截图：只截这个窗口，被别的窗口挡住也照样截得到。
-#[cfg(target_os = "macos")]
-fn shot(window: &Window, path: &Path) -> anyhow::Result<()> {
+/// 截图。开了 `shots` 特性就让 GPUI 把刚画好的那一帧渲染成图片（不碰屏幕，不要屏幕录制权限）；
+/// 不然在 macOS 上用 `screencapture` 按窗口编号截。
+#[cfg(feature = "shots")]
+fn shot(window: &mut Window, cx: &mut App, path: &Path) -> anyhow::Result<()> {
+    // 画两帧，中间等一下：淡入之类的动画从第一次画它开始计时，第二帧才是动画结束的样子。
+    window.draw(cx).clear(cx);
+    std::thread::sleep(Duration::from_millis(400));
+    window.draw(cx).clear(cx);
+    let image = window.render_to_image()?;
+    image.save(path)?;
+    Ok(())
+}
+
+#[cfg(all(not(feature = "shots"), target_os = "macos"))]
+fn shot(window: &Window, _: &mut App, path: &Path) -> anyhow::Result<()> {
     let id = crate::mac::window_number(window).context("no native window")?;
     let status = std::process::Command::new("screencapture")
         .args(["-x", "-o", &format!("-l{id}")])
@@ -179,7 +218,7 @@ fn shot(window: &Window, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn shot(_: &Window, _: &Path) -> anyhow::Result<()> {
+#[cfg(all(not(feature = "shots"), not(target_os = "macos")))]
+fn shot(_: &Window, _: &mut App, _: &Path) -> anyhow::Result<()> {
     bail!("shot is only implemented on macOS")
 }

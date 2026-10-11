@@ -1,7 +1,9 @@
+mod add_provider;
 mod assets;
 mod data;
 #[cfg(debug_assertions)]
 mod drive;
+mod editor;
 mod i18n;
 mod icons;
 #[cfg(target_os = "macos")]
@@ -13,6 +15,9 @@ mod theme;
 mod tray;
 mod ui;
 
+use std::path::PathBuf;
+
+use confdeck_core::data::DataDir;
 use gpui_kit::*;
 
 use crate::data::Store;
@@ -36,10 +41,30 @@ fn main() {
                 mac::force_appearance(&name);
             }
 
-            let store = cx.new(|_| Store::demo());
+            let (data, home) = locations();
+            let store = cx.new(|_| Store::load(data, home));
             main_window::show(store.clone(), cx);
             tray::install(store, cx).expect("failed to create tray icon");
             #[cfg(debug_assertions)]
             drive::start(cx);
         });
+}
+
+/// 数据目录和家目录。debug 构建里 `CONFDECK_DATA`、`CONFDECK_HOME` 可以指到别处，
+/// 测试时不碰真实的 `~/.confdeck/` 和各 agent 的配置文件。
+fn locations() -> (DataDir, PathBuf) {
+    let home = std::env::home_dir().expect("home directory");
+    let data = DataDir::default_location().expect("home directory");
+    #[cfg(debug_assertions)]
+    {
+        let data = std::env::var_os("CONFDECK_DATA")
+            .map(|dir| DataDir::new(PathBuf::from(dir)))
+            .unwrap_or(data);
+        let home = std::env::var_os("CONFDECK_HOME")
+            .map(PathBuf::from)
+            .unwrap_or(home);
+        return (data, home);
+    }
+    #[allow(unreachable_code)]
+    (data, home)
 }

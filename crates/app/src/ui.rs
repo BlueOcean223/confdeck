@@ -7,25 +7,44 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use gpui_kit::component::input::{Input, InputState};
+
 use crate::data::Logo;
 use crate::icons;
 use crate::theme::Theme;
 
 pub fn logo(logo: Logo, size: f32, t: &Theme, window: &Window, cx: &App) -> AnyElement {
-    if logo.colored {
-        // 按实际像素栅格化（见 icons.rs），画不了就让 GPUI 自己画。
-        let source: ImageSource = match icons::raster(logo.path, px(size), window, cx) {
-            Some(image) => image.into(),
-            None => logo.path.into(),
-        };
-        img(source).size(px(size)).flex_none().into_any_element()
-    } else {
-        svg()
-            .path(logo.path)
+    match logo {
+        Logo::Color(path) => {
+            // 按实际像素栅格化（见 icons.rs），画不了就让 GPUI 自己画。
+            let source: ImageSource = match icons::raster(path, px(size), window, cx) {
+                Some(image) => image.into(),
+                None => path.into(),
+            };
+            img(source).size(px(size)).flex_none().into_any_element()
+        }
+        Logo::Mono(path) => svg()
+            .path(path)
             .size(px(size))
             .flex_none()
             .text_color(t.fg)
-            .into_any_element()
+            .into_any_element(),
+        // 还没有图标的供应商：首字装在小方块里。
+        Logo::Letter(ch) => div()
+            .flex_none()
+            .size(px(size))
+            .rounded(px((size * 0.27).round()))
+            .bg(t.pill)
+            .border_1()
+            .border_color(t.line)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px((size * 0.5).round()))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(t.fg_2)
+            .child(ch.to_string())
+            .into_any_element(),
     }
 }
 
@@ -313,4 +332,114 @@ pub fn icon_button(id: impl Into<ElementId>, t: &Theme, name: &str) -> Stateful<
         .hover(move |s| s.bg(hover))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(icon(name, 16., t.ctl_fg))
+}
+
+/// 按钮的几种样子。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Button {
+    /// 强调色底：保存、确认。
+    Primary,
+    /// 灰底：取消、次要操作。
+    Secondary,
+    /// 红字无底：删除。
+    Danger,
+}
+
+/// 弹层里的按钮（magpie 的 `.btn`）：高 28，圆角 7。
+pub fn button(id: impl Into<ElementId>, t: &Theme, kind: Button) -> Stateful<Div> {
+    let on_accent = if t.dark { t.bg } else { gpui_kit::white() };
+    let (bg, fg, hover_bg) = match kind {
+        Button::Primary => (t.accent, on_accent, t.accent.opacity(0.85)),
+        Button::Secondary => (t.pill, t.fg, t.pill_hover),
+        Button::Danger => (gpui_kit::transparent_black(), t.danger, t.danger.opacity(0.1)),
+    };
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .justify_center()
+        .gap(px(5.))
+        .h(px(28.))
+        .px(px(12.))
+        .rounded(px(7.))
+        .bg(bg)
+        .text_size(px(12.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(fg)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg))
+}
+
+/// 表单里的输入框：自己画的框（底色、细描边、聚焦时强调色），里面放 gpui-component 的 `Input`。
+/// `suffix` 放在右边（Key 的「显示」按钮等）。
+pub fn field(
+    t: &Theme,
+    state: &Entity<InputState>,
+    mono: bool,
+    suffix: Option<AnyElement>,
+    window: &Window,
+    cx: &App,
+) -> Div {
+    let focused = state.read(cx).focus_handle(cx).is_focused(window);
+    div()
+        .h_flex()
+        .items_center()
+        .gap(px(6.))
+        .h(px(30.))
+        .px(px(9.))
+        .rounded(px(7.))
+        .bg(t.field)
+        .border_1()
+        .border_color(if focused { t.accent } else { t.line })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(12.5))
+                .when(mono, |d| d.font_family("Menlo"))
+                .child(Input::new(state).appearance(false).xsmall().text_size(px(12.5))),
+        )
+        .children(suffix)
+}
+
+/// 悬停提示。用在 `.tooltip(ui::tooltip(text))`。
+pub fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
+    let text = text.into();
+    move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)
+}
+
+/// 小芯片（在用的 agent：图标 + 名字 + 模型名）。
+pub fn chip(t: &Theme) -> Div {
+    div()
+        .h_flex()
+        .items_center()
+        .gap(px(5.))
+        .h(px(24.))
+        .pl(px(6.))
+        .pr(px(8.))
+        .rounded(px(6.))
+        .bg(t.pill)
+        .text_size(px(11.5))
+}
+
+/// 表单一行的标签（左边定宽）。
+pub fn label(t: &Theme, text: impl Into<SharedString>) -> Div {
+    // 和 `field` 一样高、文字居中，这样行里 items_start 时标签正对着输入框。
+    div()
+        .flex_none()
+        .w(px(128.))
+        .h(px(30.))
+        .flex()
+        .items_center()
+        .text_size(px(12.5))
+        .text_color(t.fg_2)
+        .child(text.into())
+}
+
+/// 字段下面的小字说明。
+pub fn hint(t: &Theme, text: impl Into<SharedString>) -> Div {
+    div()
+        .text_size(px(11.))
+        .text_color(t.muted)
+        .child(text.into())
 }

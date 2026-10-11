@@ -17,7 +17,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::{Logo, Selection, Store};
+use crate::data::{self, Logo, Selection, Store, Unusable};
 use crate::theme::Theme;
 use crate::ui;
 
@@ -173,11 +173,14 @@ impl Picker {
         }
 
         let shown: Vec<usize> = (0..store.providers.len())
-            .filter(|&p| matches(store.providers[p].name) || matches(store.providers[p].host))
+            .filter(|&p| {
+                let provider = &store.providers[p];
+                matches(&provider.name) || data::host(provider).is_some_and(matches)
+            })
             .collect();
-        let (usable, incompatible): (Vec<usize>, Vec<usize>) = shown
+        let (usable, unusable): (Vec<usize>, Vec<usize>) = shown
             .iter()
-            .partition(|&&p| store.protocol_for(self.agent, p).is_some());
+            .partition(|&&p| store.unusable(self.agent, p).is_none());
 
         let group = |rows: &mut Vec<Row>, label: SharedString, providers: &[usize]| {
             if providers.is_empty() {
@@ -201,20 +204,25 @@ impl Picker {
         } else {
             group(&mut rows, t!("picker.group").into(), &usable);
         }
-        if !incompatible.is_empty() {
+        if !unusable.is_empty() {
             let protocols = agent
                 .protocols
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(&t!("common.list_separator"));
-            let reason: SharedString = t!("picker.incompatible", protocols = protocols).into();
+            let incompatible: SharedString =
+                t!("picker.incompatible", protocols = protocols).into();
+            let no_key: SharedString = t!("picker.no_key").into();
             if rows.is_empty() || self.multi {
                 rows.push(Row::Header(t!("picker.incompatible_group").into()));
             }
-            rows.extend(incompatible.into_iter().map(|p| Row::Option {
+            rows.extend(unusable.into_iter().map(|p| Row::Option {
                 option: Some(p),
-                reason: Some(reason.clone()),
+                reason: Some(match store.unusable(self.agent, p) {
+                    Some(Unusable::NoKey) => no_key.clone(),
+                    _ => incompatible.clone(),
+                }),
             }));
         }
         rows
@@ -304,15 +312,16 @@ impl Picker {
         let (logo, name, sub): (Logo, SharedString, SharedString) = match option {
             Some(p) => {
                 let provider = &store.providers[p];
+                let host = data::host(provider).unwrap_or_default();
                 let sub = match (&reason, store.protocol_for(self.agent, p)) {
                     (Some(reason), _) => reason.clone(),
                     // 多协议的 agent 才需要说明走哪种协议（decisions「供应商和 agent 的关系」）。
                     (None, Some(protocol)) if agent.protocols.len() > 1 => {
-                        format!("{} · {protocol}", provider.host).into()
+                        format!("{host} · {protocol}").into()
                     }
-                    (None, _) => provider.host.into(),
+                    (None, _) => host.to_string().into(),
                 };
-                (provider.logo, provider.name.into(), sub)
+                (data::logo(provider), provider.name.clone().into(), sub)
             }
             None => (
                 agent.logo,

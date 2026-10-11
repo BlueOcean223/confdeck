@@ -67,6 +67,7 @@ pub fn set_height_keep_top(window: &Window, height: f64, cx: &App) {
 
 /// 窗口在窗口服务器里的编号（`screencapture -l` 用的就是它）。
 #[cfg(debug_assertions)]
+#[cfg_attr(feature = "shots", allow(dead_code))]
 pub fn window_number(window: &Window) -> Option<isize> {
     ns_window(window).map(|w| w.windowNumber())
 }
