@@ -200,6 +200,16 @@ impl Theme {
 /// 过滤框用的是 gpui-component 的输入框，它的文字、占位符、光标和选区颜色取自
 /// gpui-component 的全局主题，这里换成 magpie 的配色。
 pub fn sync_component_theme(t: &Theme, cx: &mut App) {
+    use gpui_kit::component::ThemeMode;
+    // 代码编辑器（「原始文件」）的底色、行号栏、着色跟着 gpui-component 的明暗模式走，先切到和窗口一样的。
+    let mode = if t.dark {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    };
+    if gpui_kit::component::Theme::global(cx).mode != mode {
+        gpui_kit::component::Theme::change(mode, None, cx);
+    }
     let theme = gpui_kit::component::Theme::global_mut(cx);
     theme.foreground = t.fg;
     theme.muted_foreground = t.faint;

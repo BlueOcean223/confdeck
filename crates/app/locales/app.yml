@@ -406,6 +406,13 @@ write:
   key_adopt_failed:
     en: "Could not save the key into %{provider}: %{error}"
     zh-CN: "没能把 Key 存进 %{provider}：%{error}"
+  # 「配置 ›」页：改了模型以后写进了这个 agent 的文件；原始文件保存好了。
+  updated:
+    en: "%{agent} updated"
+    zh-CN: "%{agent} 已更新"
+  file_saved:
+    en: "Saved %{file}"
+    zh-CN: "已保存 %{file}"
   codex_catalog_skipped:
     en: "Codex model catalog not written (%{reason}): /model still lists GPT models and this provider's models get a 272K window"
     zh-CN: "Codex 的模型目录没写成（%{reason}）：/model 列的还是 GPT 模型，这家的模型按 272K 窗口算"
@@ -460,3 +467,52 @@ add:
   empty:
     en: No matching presets
     zh-CN: 没有匹配的预设
+
+# 「配置 ›」页（decisions「配置页」）：一个 agent 用当前这家时写什么。卡片标题一个词，没有说明条。
+config:
+  models:
+    en: Models
+    zh-CN: 模型
+  # Claude Code 的六个槽位（core 的 claude::SLOTS）。
+  slot_main:
+    en: Main model
+    zh-CN: 主模型
+  slot_opus:
+    en: Opus
+    zh-CN: Opus
+  slot_sonnet:
+    en: Sonnet
+    zh-CN: Sonnet
+  slot_fable:
+    en: Fable
+    zh-CN: Fable
+  slot_haiku:
+    en: Haiku
+    zh-CN: Haiku
+  slot_subagent:
+    en: Subagent
+    zh-CN: 子代理
+  # 有改过的槽位时才出现，点了清掉这个 agent 对这家的 slots。
+  reset_slots:
+    en: Reset
+    zh-CN: 恢复默认
+  # 下拉框和列表底下手填目录里没有的模型，回车加进目录。
+  other_model:
+    en: Another model…
+    zh-CN: 其他模型…
+  # 多选 agent 每家一块，头上的小字：几个模型、走哪种接口。
+  count_one:
+    en: 1 model
+    zh-CN: 1 个模型
+  count_other:
+    en: "%{count} models"
+    zh-CN: "%{count} 个模型"
+  protocol:
+    en: Protocol
+    zh-CN: 接口
+  raw_file:
+    en: Raw file
+    zh-CN: 原始文件
+  open:
+    en: Open
+    zh-CN: 打开

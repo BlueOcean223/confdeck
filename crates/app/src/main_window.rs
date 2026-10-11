@@ -10,6 +10,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::add_provider::{AddEvent, AddProvider};
+use crate::config_page::{ConfigEvent, ConfigPage};
 use crate::data::{self, Notice, NoticeKind, Store};
 use crate::editor::{Editor, EditorEvent};
 use crate::picker::{Picker, PickerEvent};
@@ -104,6 +105,12 @@ struct OpenPicker {
     _subscription: Subscription,
 }
 
+/// Agent 页上点了「配置 ›」：这一页换成那个 agent 的配置页，面包屑回来。
+struct OpenConfig {
+    page: Entity<ConfigPage>,
+    _subscription: Subscription,
+}
+
 /// 盖在页面上的弹层：添加供应商的卡片表，或一家供应商的编辑器。
 enum Overlay {
     Add {
@@ -129,6 +136,7 @@ pub struct MainWindow {
     store: Entity<Store>,
     tab: Tab,
     picker: Option<OpenPicker>,
+    config: Option<OpenConfig>,
     overlay: Option<Overlay>,
     toasts: Vec<Toast>,
     toast_seq: u64,
@@ -156,6 +164,7 @@ impl MainWindow {
             store,
             tab: Tab::Agents,
             picker: None,
+            config: None,
             overlay: None,
             toasts: Vec::new(),
             toast_seq: 0,
@@ -242,6 +251,7 @@ impl MainWindow {
                             this.tab_anim = Some((from, this.clicks));
                             this.tab = *tab;
                             this.picker = None;
+                            this.config = None;
                             cx.notify();
                         }),
                     )),
@@ -401,7 +411,10 @@ impl MainWindow {
                     ui::text_button(ElementId::named_usize("config", i), t)
                         .mr(px(14.))
                         .child(t!("agents.configure"))
-                        .child(ui::icon("chevron-right", 11., t.faint)),
+                        .child(ui::icon("chevron-right", 11., t.faint))
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.open_config(i, window, cx)),
+                        ),
                 )
                 .child(
                     // 要放得下「DeepSeek · Key 不一致」（预览 09 的胶囊是 228）。
@@ -448,6 +461,29 @@ impl MainWindow {
                         }),
                 )
             })
+    }
+
+    /// 「配置 ›」：Agent 页换成这个 agent 的配置页。面包屑回来；选择器里的「存成供应商…」和 Agent 页一样处理。
+    fn open_config(&mut self, agent: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let page = cx.new(|cx| ConfigPage::new(store, agent, window, cx));
+        let _subscription = cx.subscribe_in(
+            &page,
+            window,
+            move |this, _, event: &ConfigEvent, window, cx| match event {
+                ConfigEvent::Back => {
+                    this.config = None;
+                    cx.notify();
+                }
+                ConfigEvent::SaveAs(draft) => this.open_draft(agent, draft.clone(), window, cx),
+            },
+        );
+        self.picker = None;
+        self.config = Some(OpenConfig {
+            page,
+            _subscription,
+        });
+        cx.notify();
     }
 
     fn providers_page(
@@ -898,9 +934,10 @@ impl MainWindow {
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Theme::window(window.appearance());
-        let page = match self.tab {
-            Tab::Agents => self.agents_page(&t, window, cx).into_any_element(),
-            Tab::Providers => self.providers_page(&t, window, cx).into_any_element(),
+        let page = match (self.tab, &self.config) {
+            (Tab::Agents, Some(config)) => config.page.clone().into_any_element(),
+            (Tab::Agents, None) => self.agents_page(&t, window, cx).into_any_element(),
+            (Tab::Providers, _) => self.providers_page(&t, window, cx).into_any_element(),
             _ => self.placeholder(&t).into_any_element(),
         };
 

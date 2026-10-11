@@ -266,21 +266,23 @@ pub fn list_models(provider: &Provider, agent: AgentKind) -> Result<Vec<&Model>,
     Ok(chosen)
 }
 
-/// 默认模型：用户覆盖的 > 预设推荐的（目录里还有的）> 这家的默认模型（在这个 agent 的列表里时）> 列表第一个。
+/// 默认模型：用户覆盖的 > 预设推荐的 > 这家的默认模型 > 列表第一个。
+/// 推荐的和这家的默认模型都要在这个 agent 的列表里（[`list_models`]）才算，不然写进去的默认模型不在列表里。
 pub fn default_model(provider: &Provider, agent: AgentKind) -> Result<&Model, AdaptError> {
     if let Some(id) = override_of(provider, agent).and_then(|o| o.default_model.as_ref()) {
         return resolve(provider, id);
     }
+    let list = list_models(provider, agent)?;
+    let listed = |id: &str| list.iter().copied().find(|model| model.id == id);
     if let Some(model) = recommended(provider, agent)
         .and_then(|r| r.default_model.as_deref())
-        .and_then(|id| provider.model(id))
+        .and_then(listed)
     {
         return Ok(model);
     }
-    let list = list_models(provider, agent)?;
     let preferred = provider
         .default_or_first()
-        .filter(|model| list.iter().any(|listed| listed.id == model.id));
+        .and_then(|model| listed(&model.id));
     Ok(preferred.unwrap_or(list[0]))
 }
 
@@ -501,6 +503,20 @@ mod tests {
         );
         assert_eq!(
             default_model(&chosen, AgentKind::Codex).unwrap().id,
+            "deepseek-v4-pro"
+        );
+
+        // 推荐的模型还在目录里、但这个 agent 的列表里没勾它（配置页里取消了）：列表第一个。
+        let mut unlisted = provider.clone();
+        unlisted.overrides.insert(
+            AgentKind::Codex,
+            AgentOverride {
+                models: Some(vec!["deepseek-v4-pro".into()]),
+                ..AgentOverride::default()
+            },
+        );
+        assert_eq!(
+            default_model(&unlisted, AgentKind::Codex).unwrap().id,
             "deepseek-v4-pro"
         );
 

@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use confdeck_core::agent::codex::catalog::Skipped;
-use confdeck_core::agent::{self, AgentKind, Connection, Mode};
+use confdeck_core::agent::{self, AgentKind, Connection, FileSetup, Mode};
 use confdeck_core::apply::{self, ApplyError, Switched, Synced, UsedBy};
 use confdeck_core::current::{self, Current};
 use confdeck_core::data::DataDir;
-use confdeck_core::engine::{Engine, Outcome};
+use confdeck_core::engine::{Engine, EngineError, LiveFile, Outcome, Snapshot};
 use confdeck_core::preset;
 use confdeck_core::provider::{self, Protocol, Provider};
 use confdeck_core::store::{self, StoreError};
@@ -314,6 +314,85 @@ impl Store {
         current::draft(&self.engine, &self.home, kind, &self.providers)
             .ok()
             .flatten()
+    }
+
+    /// 单选 agent 的配置文件里现在写的模型（「配置 ›」页的下拉框显示文件里的值）。
+    /// 读不了、连的不是一个地址、多选 agent 都是 `None`。
+    pub fn setup(&self, agent: usize) -> Option<FileSetup> {
+        let kind = self.agents[agent].kind?;
+        // 刚选了别家、文件还没写完时，文件里还是上一家的模型，不拿来显示。
+        let on_disk = current::current(&self.engine, &self.home, kind, &self.providers).ok()?;
+        if Some(&on_disk) != self.agents[agent].current.as_ref() {
+            return None;
+        }
+        current::setup(&self.engine, &self.home, kind)
+            .ok()
+            .flatten()
+    }
+
+    /// 这个 agent 的配置文件（Codex 有两个，「原始文件」只编辑 config.toml）。
+    pub fn live_file(&self, agent: usize) -> Option<LiveFile> {
+        let kind = self.agents[agent].kind?;
+        apply::live_files(&self.home, kind).into_iter().next()
+    }
+
+    pub fn read_file(&self, file: &LiveFile) -> Result<Snapshot, EngineError> {
+        self.engine.read(file)
+    }
+
+    /// 「原始文件」保存：整份替换，打开后文件被改过就报冲突、解析不了报行列（core 的 `Engine::replace`），
+    /// 都不写。写了就重读一遍、说一声「已保存 settings.json」。
+    pub fn replace_file(
+        &mut self,
+        file: &LiveFile,
+        bytes: &[u8],
+        base: &Snapshot,
+        cx: &mut Context<Self>,
+    ) -> Result<Outcome, EngineError> {
+        let outcome = self.engine.replace(file, bytes, base)?;
+        self.reload();
+        let name = file
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.announce(&[Notice::ok(t!("write.file_saved", file = name))], cx);
+        Ok(outcome)
+    }
+
+    /// 「配置 ›」页改了一项（槽位、列表、默认模型、接口）：`provider` 是改好覆盖的那家。
+    /// 内存里先换掉，界面立刻显示新值；文件在后台写（Codex 要重写模型目录，不能卡住界面），
+    /// 写完按文件重读。写了这个 agent 就说一句「Claude Code 已更新」，没写成的单独报。
+    pub fn save_override(
+        &mut self,
+        agent: usize,
+        provider: Provider,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let Some(kind) = self.agents[agent].kind else {
+            return Task::ready(());
+        };
+        // `save_provider` 要拿改之前的列表认出在用这家的 agent。
+        let before = self.providers.clone();
+        if let Some(slot) = self.providers.iter_mut().find(|p| p.id == provider.id) {
+            *slot = provider.clone();
+        }
+        cx.notify();
+
+        let engine = self.engine.clone();
+        let home = self.home.clone();
+        let write = cx
+            .background_executor()
+            .spawn(async move { apply::save_provider(&engine, &home, &before, &provider) });
+        cx.spawn(async move |this, cx| {
+            let result = write.await;
+            this.update(cx, |store, cx| {
+                store.reload();
+                let notices = store.describe_update(kind, result);
+                store.announce(&notices, cx);
+            })
+            .ok();
+        })
     }
 
     /// 胶囊画成虚线边框：文件连的和列表里哪家都对不上（decisions「『自定义』的样子」）。
@@ -636,6 +715,39 @@ impl Store {
                 agent = failed.agent.to_string(),
                 error = error
             )));
+        }
+        notices
+    }
+
+    fn describe_update(
+        &self,
+        kind: AgentKind,
+        result: Result<Vec<Synced>, StoreError>,
+    ) -> Vec<Notice> {
+        let synced = match result {
+            Ok(synced) => synced,
+            Err(err) => {
+                return vec![Notice::err(t!(
+                    "toast.sync_failed",
+                    agent = kind.to_string(),
+                    error = err.to_string()
+                ))];
+            }
+        };
+        let mut notices = Vec::new();
+        for entry in &synced {
+            match &entry.result {
+                // 只有改的这个 agent 的文件会变；别的在用这家的 agent 覆盖没动，`changed` 为假。
+                Ok(outcome) if outcome.changed && entry.agent == kind => {
+                    notices.push(Notice::ok(t!("write.updated", agent = kind.to_string())));
+                }
+                Ok(_) => {}
+                Err(err) => notices.push(Notice::err(t!(
+                    "toast.sync_failed",
+                    agent = entry.agent.to_string(),
+                    error = err.to_string()
+                ))),
+            }
         }
         notices
     }

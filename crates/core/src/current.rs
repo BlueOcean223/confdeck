@@ -150,6 +150,21 @@ pub fn draft(
     Ok(Some(draft))
 }
 
+/// 单选 agent 的配置文件里现在写的模型：槽位型是槽位 → 模型名，列表型是模型列表和默认模型
+/// （「配置 ›」页的下拉框显示文件里的值，不显示覆盖里的）。文件连的不是一个地址（「默认」、Bedrock 等）时为 `None`。
+pub fn setup(
+    engine: &Engine,
+    home: &Path,
+    agent: AgentKind,
+) -> Result<Option<FileSetup>, ApplyError> {
+    let source = source(home, agent)?;
+    let snapshot = engine.read(&source.file)?;
+    Ok((source.setup)(
+        &source.file.path,
+        snapshot.bytes.as_deref(),
+    )?)
+}
+
 /// 单选 agent 的配置文件，和读它、往里写某一家的办法。
 struct Source {
     file: LiveFile,

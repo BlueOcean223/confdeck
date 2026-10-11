@@ -470,3 +470,72 @@ pub fn hint(t: &Theme, text: impl Into<SharedString>) -> Div {
         .text_color(t.muted)
         .child(text.into())
 }
+
+/// 没有图标的下拉按钮（配置页里选模型）：文字和向下的箭头，打开时描一圈强调色。
+pub fn menu_pill(
+    id: impl Into<ElementId>,
+    t: &Theme,
+    label: impl Into<SharedString>,
+    open: bool,
+) -> Stateful<Div> {
+    let hover = t.pill_hover;
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .gap(px(5.))
+        .h(px(25.))
+        .pl(px(8.))
+        .pr(px(5.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(if open {
+            t.accent
+        } else {
+            gpui_kit::transparent_black()
+        })
+        .bg(if open { t.pill_hover } else { t.pill })
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_family("Menlo")
+                .text_size(px(12.))
+                .child(label.into()),
+        )
+        .child(div().flex_1())
+        .child(icon("chevron-down", 10., if open { t.muted } else { t.faint }).ml(px(1.)))
+}
+
+/// 单选点（默认模型）：选中是强调色圈加实心点，没选是细灰圈。
+pub fn radio(t: &Theme, on: bool) -> Div {
+    div()
+        .flex_none()
+        .size(px(14.))
+        .rounded_full()
+        .border_1()
+        .border_color(if on { t.accent } else { t.faint })
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(on, |r| {
+            r.child(div().size(px(7.)).rounded_full().bg(t.accent))
+        })
+}
+
+/// 卡片顶上的标题行（配置页：「模型」「原始文件」），右边可以放一个动作。
+pub fn card_title(t: &Theme, title: impl Into<SharedString>) -> Div {
+    div()
+        .h_flex()
+        .items_center()
+        .gap(px(8.))
+        .h(px(42.))
+        .pl(px(14.))
+        .pr(px(12.))
+        .text_size(px(12.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(t.fg)
+        .child(title.into())
+}
