@@ -3,6 +3,7 @@
 
 use std::time::{Duration, Instant};
 
+use confdeck_core::agent::Mode;
 use gpui_kit::component::*;
 use gpui_kit::*;
 use rust_i18n::t;
@@ -89,9 +90,14 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     }
 }
 
+/// 面板只列「有 confdeck 选的供应商」的单选 agent（decisions「没有『接管』」）；
+/// 多选 agent 没有「现在用的那一家」可换，去主窗口管。
 fn shown_agents(store: &Store) -> Vec<usize> {
     (0..store.agents.len())
-        .filter(|&i| store.agents[i].installed && store.agents[i].managed)
+        .filter(|&i| {
+            let agent = &store.agents[i];
+            agent.installed && agent.mode == Mode::Switch && agent.chosen
+        })
         .collect()
 }
 
@@ -181,9 +187,14 @@ impl Panel {
                 &picker,
                 window,
                 move |this, _, event: &PickerEvent, window, cx| {
-                    if let PickerEvent::Picked(option) = event {
-                        let option = *option;
-                        this.store.update(cx, |s, cx| s.set_provider(agent, option, cx));
+                    match event {
+                        PickerEvent::Picked(option) => {
+                            let option = *option;
+                            this.store.update(cx, |s, cx| s.set_provider(agent, option, cx));
+                        }
+                        // 面板里没有多选 agent，不会收到。
+                        PickerEvent::Toggled(_) => return,
+                        PickerEvent::Dismissed => {}
                     }
                     this.close_picker(window, cx);
                 },
@@ -236,13 +247,21 @@ impl Panel {
             .child(ui::icon_button("settings", t, "settings"))
     }
 
-    fn agent_row(&self, i: usize, n: usize, store: &Store, t: &Theme, cx: &Context<Self>) -> Div {
+    fn agent_row(
+        &self,
+        i: usize,
+        n: usize,
+        store: &Store,
+        t: &Theme,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
         let agent = &store.agents[i];
         let open = self.picker.as_ref().is_some_and(|p| p.agent == i);
-        let (logo, label) = store.provider_label(i);
+        let (logos, label) = store.pill(i);
 
         ui::row(t, true, n == 0)
-            .child(ui::logo(agent.logo, 18., t))
+            .child(ui::logo(agent.logo, 18., t, window, cx))
             .child(
                 div()
                     .flex_1()
@@ -254,7 +273,16 @@ impl Panel {
             // 宽度随内容，靠右对齐；名字太长时截断（magpie 面板里的下拉框也是这样）。
             .child(
                 div().flex_none().max_w(px(230.)).child(
-                    ui::select_pill(ElementId::named_usize("pick", i), t, true, logo, label, open)
+                    ui::select_pill(
+                        ElementId::named_usize("pick", i),
+                        t,
+                        true,
+                        &logos,
+                        label,
+                        open,
+                        window,
+                        cx,
+                    )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if this.just_closed == Some(i) {
                                 return;
@@ -291,7 +319,7 @@ impl Render for Panel {
 
         let mut list = ui::list(&t, true);
         for (n, &i) in shown.iter().enumerate() {
-            list = list.child(self.agent_row(i, n, store, &t, cx));
+            list = list.child(self.agent_row(i, n, store, &t, window, cx));
         }
         let open_store = self.store.clone();
 

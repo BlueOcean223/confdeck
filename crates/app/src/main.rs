@@ -3,6 +3,7 @@ mod data;
 #[cfg(debug_assertions)]
 mod drive;
 mod i18n;
+mod icons;
 #[cfg(target_os = "macos")]
 mod mac;
 mod main_window;
@@ -25,9 +26,15 @@ fn main() {
         .with_assets(assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            icons::init(cx);
             panel::init(cx);
             // 关掉窗口后继续留在菜单栏，只有「退出」会结束进程。
             cx.set_quit_mode(QuitMode::Explicit);
+
+            #[cfg(all(debug_assertions, target_os = "macos"))]
+            if let Ok(name) = std::env::var("CONFDECK_APPEARANCE") {
+                mac::force_appearance(&name);
+            }
 
             let store = cx.new(|_| Store::demo());
             main_window::show(store.clone(), cx);

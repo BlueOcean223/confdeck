@@ -81,8 +81,6 @@ pub struct MainWindow {
     picker: Option<OpenPicker>,
     /// 刚被「点外面」关掉的选择器。点的正好是它的下拉框时，不要立刻再打开。
     just_closed: Option<usize>,
-    /// 刚被点过的开关（agent 下标、第几次点击），只给它放滑动动画。
-    switch_anim: Option<(usize, u64)>,
     /// 上一个标签和这次切换的编号，给分段标签的滑块放动画。
     tab_anim: Option<(usize, u64)>,
     clicks: u64,
@@ -102,7 +100,6 @@ impl MainWindow {
             tab: Tab::Agents,
             picker: None,
             just_closed: None,
-            switch_anim: None,
             tab_anim: None,
             clicks: 0,
             show_more: false,
@@ -194,7 +191,7 @@ impl MainWindow {
             .child(ui::icon_button("settings", t, "settings"))
     }
 
-    fn agents_page(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn agents_page(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let (installed, others): (Vec<usize>, Vec<usize>) =
             (0..store.agents.len()).partition(|&i| store.agents[i].installed);
@@ -202,7 +199,7 @@ impl MainWindow {
 
         let mut list = ui::list(t, false);
         for (n, &i) in installed.iter().enumerate() {
-            list = list.child(self.agent_row(i, n == 0, store, t, cx));
+            list = list.child(self.agent_row(i, n == 0, store, t, window, cx));
         }
         if hidden > 0 {
             let hover_bg = t.card_2;
@@ -238,30 +235,30 @@ impl MainWindow {
             );
             if self.show_more {
                 for &i in &others {
-                    list = list.child(self.agent_row(i, false, store, t, cx));
+                    list = list.child(self.agent_row(i, false, store, t, window, cx));
                 }
             }
         }
 
-        div()
-            .v_flex()
-            .gap(px(10.))
-            .child(
-                div()
-                    .text_size(px(13.))
-                    .text_color(t.fg_2)
-                    .child(t!("agents.intro")),
-            )
-            .child(list)
+        div().v_flex().gap(px(10.)).child(list)
     }
 
     fn open_picker(&mut self, agent: usize, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.clone();
         let picker = cx.new(|cx| Picker::new(store, agent, false, window, cx));
         let _subscription = cx.subscribe(&picker, move |this, _, event: &PickerEvent, cx| {
-            if let PickerEvent::Picked(option) = event {
-                let option = *option;
-                this.store.update(cx, |s, cx| s.set_provider(agent, option, cx));
+            match event {
+                PickerEvent::Picked(option) => {
+                    let option = *option;
+                    this.store.update(cx, |s, cx| s.set_provider(agent, option, cx));
+                }
+                // 勾一下写一次，浮层不关（提案 01）。
+                PickerEvent::Toggled(provider) => {
+                    let provider = *provider;
+                    this.store.update(cx, |s, cx| s.toggle_provider(agent, provider, cx));
+                    return;
+                }
+                PickerEvent::Dismissed => {}
             }
             this.picker = None;
             cx.notify();
@@ -280,22 +277,21 @@ impl MainWindow {
         first: bool,
         store: &Store,
         t: &Theme,
+        window: &Window,
         cx: &Context<Self>,
     ) -> Div {
         let agent = &store.agents[i];
         let open = self.picker.as_ref().filter(|p| p.agent == i);
-        let (logo, label) = store.provider_label(i);
-        let status = if !agent.installed {
-            t!("agents.no_config")
-        } else if agent.managed {
-            t!("agents.managed", file = agent.config)
+        let (logos, label) = store.pill(i);
+        // 状态行只写文件在哪。连到哪、是不是 confdeck 写的，都在胶囊里（decisions「没有『接管』」）。
+        let status: SharedString = if agent.installed {
+            agent.config.into()
         } else {
-            t!("agents.unmanaged", file = agent.config)
+            t!("agents.no_config").into()
         };
-        let dot = if agent.installed && agent.managed { t.green } else { t.faint };
 
         ui::row(t, false, first)
-            .child(ui::logo(agent.logo, 22., t))
+            .child(ui::logo(agent.logo, 22., t, window, cx))
             .child(
                 div()
                     .v_flex()
@@ -304,14 +300,11 @@ impl MainWindow {
                     .child(div().font_weight(FontWeight::MEDIUM).truncate().child(agent.name))
                     .child(
                         div()
-                            .h_flex()
-                            .items_center()
-                            .gap(px(6.))
                             .mt(px(1.))
                             .text_size(px(11.5))
                             .text_color(t.muted)
-                            .child(div().flex_none().size(px(6.)).rounded_full().bg(dot))
-                            .child(div().truncate().child(status)),
+                            .truncate()
+                            .child(status),
                     ),
             )
             .when(agent.installed, |row| {
@@ -325,29 +318,28 @@ impl MainWindow {
                     div()
                         .relative()
                         .w(px(188.))
-                        .when(!agent.managed, |d| d.opacity(0.45))
                         .child(
                             ui::select_pill(
                                 ElementId::named_usize("pick", i),
                                 t,
                                 false,
-                                logo,
+                                &logos,
                                 label,
                                 open.is_some(),
+                                window,
+                                cx,
                             )
-                            .when(agent.managed, |pill| {
-                                pill.on_click(cx.listener(move |this, _, window, cx| {
-                                    if this.just_closed == Some(i) {
-                                        return;
-                                    }
-                                    if this.picker.as_ref().is_some_and(|p| p.agent == i) {
-                                        this.picker = None;
-                                        cx.notify();
-                                    } else {
-                                        this.open_picker(i, window, cx);
-                                    }
-                                }))
-                            }),
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.just_closed == Some(i) {
+                                    return;
+                                }
+                                if this.picker.as_ref().is_some_and(|p| p.agent == i) {
+                                    this.picker = None;
+                                    cx.notify();
+                                } else {
+                                    this.open_picker(i, window, cx);
+                                }
+                            })),
                         )
                         .when_some(open, |d, open| {
                             d.child(ui::dropdown(
@@ -362,27 +354,10 @@ impl MainWindow {
                             ))
                         }),
                 )
-                .child(
-                    ui::switch(
-                        ElementId::named_usize("managed", i),
-                        t,
-                        agent.managed,
-                        self.switch_anim.filter(|(a, _)| *a == i).map(|(_, n)| n),
-                    )
-                    .ml(px(12.))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.clicks += 1;
-                        this.switch_anim = Some((i, this.clicks));
-                        if this.picker.as_ref().is_some_and(|p| p.agent == i) {
-                            this.picker = None;
-                        }
-                        this.store.update(cx, |s, cx| s.toggle_managed(i, cx));
-                    })),
-                )
             })
     }
 
-    fn providers_page(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn providers_page(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let mut list = ui::list(t, false);
         for (i, provider) in store.providers.iter().enumerate() {
@@ -395,7 +370,7 @@ impl MainWindow {
             };
             list = list.child(
                 ui::row(t, false, i == 0)
-                    .child(ui::logo(provider.logo, 22., t))
+                    .child(ui::logo(provider.logo, 22., t, window, cx))
                     .child(
                         div()
                             .v_flex()
@@ -411,7 +386,6 @@ impl MainWindow {
                                     .child(sub),
                             ),
                     )
-                    .child(div().flex_none().size(px(6.)).rounded_full().bg(t.green))
                     .child(
                         div()
                             .font_family("Menlo")
@@ -452,8 +426,8 @@ impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Theme::window(window.appearance());
         let page = match self.tab {
-            Tab::Agents => self.agents_page(&t, cx).into_any_element(),
-            Tab::Providers => self.providers_page(&t, cx).into_any_element(),
+            Tab::Agents => self.agents_page(&t, window, cx).into_any_element(),
+            Tab::Providers => self.providers_page(&t, window, cx).into_any_element(),
             _ => self.placeholder(&t).into_any_element(),
         };
 

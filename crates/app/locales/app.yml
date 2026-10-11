@@ -35,9 +35,6 @@ common:
     zh-CN: "、"
 
 agents:
-  intro:
-    en: Pick a provider for each agent. confdeck only changes the connection keys in each config file and leaves everything else as it is.
-    zh-CN: 为每个 agent 选一个供应商。confdeck 只改配置文件里与连接相关的几个键，其余内容原样保留。
   show_more:
     en: Show %{count} more
     zh-CN: 显示其余 %{count} 个
@@ -47,12 +44,6 @@ agents:
   no_config:
     en: No config file found
     zh-CN: 未检测到配置文件
-  managed:
-    en: Managed · %{file}
-    zh-CN: 已接管 · %{file}
-  unmanaged:
-    en: Not managed · %{file} is left untouched
-    zh-CN: 未接管 · 不会改动 %{file}
   configure:
     en: Configure
     zh-CN: 配置
@@ -70,6 +61,18 @@ placeholder:
     en: Prototype stage, this page is not built yet
     zh-CN: 原型阶段，这一页还没做
 
+# 多选 agent 胶囊里的文字：勾了几家。
+multi:
+  none:
+    en: No providers
+    zh-CN: 没有供应商
+  count_one:
+    en: 1 provider
+    zh-CN: 1 个供应商
+  count_other:
+    en: "%{count} providers"
+    zh-CN: "%{count} 个供应商"
+
 picker:
   filter:
     en: Filter providers…
@@ -84,6 +87,20 @@ picker:
   group:
     en: Providers
     zh-CN: 供应商
+  # 多选浮层的两组：打开时已经勾着的，和还能勾的。
+  in_config:
+    en: In %{agent}'s config
+    zh-CN: 写进 %{agent} 的配置
+  available:
+    en: Available
+    zh-CN: 可添加
+  # 接口对不上的一组和每行的原因。%{protocols} 是这个 agent 能用的协议，不止一种时用 common.list_separator 连起来。
+  incompatible_group:
+    en: Not usable
+    zh-CN: 用不了
+  incompatible:
+    en: No %{protocols} endpoint
+    zh-CN: 没有 %{protocols} 接口
   empty:
     en: No matching providers
     zh-CN: 没有匹配的供应商

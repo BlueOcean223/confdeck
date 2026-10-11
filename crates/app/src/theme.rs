@@ -22,7 +22,6 @@ pub struct Theme {
     pub faint: Hsla,
     pub accent: Hsla,
     pub sel: Hsla,
-    pub green: Hsla,
     pub pop_bg: Hsla,
 }
 
@@ -101,7 +100,6 @@ impl Theme {
             faint: hex(0xb9b9c2),
             accent: hex(0x4f46e5),
             sel: hex(0xecebfb),
-            green: hex(0x189a58),
             pop_bg: hexa(0xfffffff0),
         }
     }
@@ -125,7 +123,6 @@ impl Theme {
             faint: hex(0x56565f),
             accent: hex(0xa5b4fc),
             sel: hex(0x33345a),
-            green: hex(0x6fd99b),
             pop_bg: hexa(0x26262bf5),
         }
     }

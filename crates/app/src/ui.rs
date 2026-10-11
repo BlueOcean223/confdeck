@@ -8,11 +8,17 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::data::Logo;
+use crate::icons;
 use crate::theme::Theme;
 
-pub fn logo(logo: Logo, size: f32, t: &Theme) -> AnyElement {
+pub fn logo(logo: Logo, size: f32, t: &Theme, window: &Window, cx: &App) -> AnyElement {
     if logo.colored {
-        img(logo.path).size(px(size)).flex_none().into_any_element()
+        // 按实际像素栅格化（见 icons.rs），画不了就让 GPUI 自己画。
+        let source: ImageSource = match icons::raster(logo.path, px(size), window, cx) {
+            Some(image) => image.into(),
+            None => logo.path.into(),
+        };
+        img(source).size(px(size)).flex_none().into_any_element()
     } else {
         svg()
             .path(logo.path)
@@ -59,13 +65,18 @@ pub fn row(t: &Theme, panel: bool, first: bool) -> Div {
 
 /// 下拉框（magpie 的 `.field`）：图标、文字、向下的箭头。打开时描一圈强调色。
 /// 面板里的更像系统的弹出按钮：白底、细描边、一点阴影。
+/// `logos` 是前面的图标：一个就直接画，几个就叠起来（多选 agent 勾了哪几家），见 [`logo_stack`]。
+// 图标和文字一起传进来，拆成结构体也还是这些东西。
+#[allow(clippy::too_many_arguments)]
 pub fn select_pill(
     id: impl Into<ElementId>,
     t: &Theme,
     panel: bool,
-    logo: Logo,
+    logos: &[Logo],
     label: impl Into<SharedString>,
     open: bool,
+    window: &Window,
+    cx: &App,
 ) -> Stateful<Div> {
     let hover = t.pill_hover;
     let edge = if open {
@@ -90,7 +101,10 @@ pub fn select_pill(
         .when(panel, |pill| pill.shadow(t.pill_shadow()))
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
-        .child(self::logo(logo, 14., t))
+        .child(match logos {
+            [logo] => self::logo(*logo, 14., t, window, cx),
+            logos => logo_stack(logos, t, window, cx).into_any_element(),
+        })
         .child(
             div()
                 .min_w_0()
@@ -103,47 +117,54 @@ pub fn select_pill(
         .child(icon("chevron-down", 10., if open { t.muted } else { t.faint }).ml(px(1.)))
 }
 
-/// 开关（magpie 的 `.lib-switch`）：关时轨道是分隔线色，开时是文字色，圆钮是卡片色。
-/// `animate` 为真时圆钮从另一头滑过来，只在刚被点过的那个开关上用。
-pub fn switch(id: impl Into<ElementId>, t: &Theme, on: bool, animate: Option<u64>) -> Stateful<Div> {
-    const TRAVEL: f32 = 13.;
-    let knob = div()
-        .absolute()
-        .top(px(2.))
-        .size(px(15.))
-        .rounded_full()
-        .bg(if on { t.card } else { gpui_kit::white() })
-        .shadow(vec![BoxShadow {
-            color: gpui_kit::black().opacity(0.25),
-            offset: point(px(0.), px(1.)),
-            blur_radius: px(2.),
-            spread_radius: px(0.),
-            inset: false,
-        }]);
-    let rest = if on { 2. + TRAVEL } else { 2. };
-    let knob = match animate {
-        Some(n) => knob
-            .with_animation(
-                ElementId::NamedInteger("knob".into(), n),
-                Animation::new(Duration::from_millis(220)).with_easing(ease_out_quart),
-                move |knob, delta| {
-                    let from = if on { 2. } else { 2. + TRAVEL };
-                    knob.left(px(from + (rest - from) * delta))
-                },
-            )
-            .into_any_element(),
-        None => knob.left(px(rest)).into_any_element(),
-    };
+/// 叠起来的图标（多选 agent 的胶囊）：最多三个，每个装在一个小圆角方块里，往左叠四分之一，
+/// 后面的压在前面的上面。几家都写进了配置，看图标就知道个大概，全名在胶囊的文字里。
+/// 容器定宽、方块绝对定位：用负边距叠的话 Taffy 会把容器算成零宽，文字压到图标上。
+pub fn logo_stack(logos: &[Logo], t: &Theme, window: &Window, cx: &App) -> Div {
+    const CHIP: f32 = 18.;
+    const STEP: f32 = 13.;
+    let shown = &logos[..logos.len().min(3)];
+    let width = CHIP + STEP * shown.len().saturating_sub(1) as f32;
     div()
-        .id(id)
         .relative()
         .flex_none()
-        .w(px(32.))
-        .h(px(19.))
-        .rounded_full()
-        .bg(if on { t.fg } else { t.line })
-        .cursor_pointer()
-        .child(knob)
+        .w(px(width))
+        .h(px(CHIP))
+        .children(shown.iter().enumerate().map(|(i, &logo)| {
+            div()
+                .absolute()
+                .top_0()
+                .left(px(STEP * i as f32))
+                .size(px(CHIP))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .bg(t.card)
+                .border_1()
+                .border_color(t.line)
+                .child(self::logo(logo, 12., t, window, cx))
+        }))
+}
+
+/// 勾选框（多选浮层每行前面的）：勾上是强调色底、白勾，没勾是细描边。
+pub fn checkbox(t: &Theme, checked: bool) -> Div {
+    let dark = t.dark;
+    div()
+        .flex_none()
+        .size(px(14.))
+        .rounded(px(4.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(checked, |b| {
+            b.bg(t.accent).child(icon(
+                "check",
+                10.,
+                if dark { t.bg } else { gpui_kit::white() },
+            ))
+        })
+        .when(!checked, |b| b.border_1().border_color(t.faint))
 }
 
 /// magpie 动画常用的减速曲线（cubic-bezier(.16, 1, .3, 1) 的近似）。

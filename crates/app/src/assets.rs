@@ -5,6 +5,7 @@ use gpui_kit::*;
 #[derive(rust_embed::RustEmbed)]
 #[folder = "assets"]
 #[include = "icons/**/*.svg"]
+#[include = "icons/**/*.png"]
 struct Own;
 
 /// 先找 confdeck 自己的图标，找不到再交给 gpui-kit 自带的 Lucide 图标库。

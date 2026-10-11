@@ -70,3 +70,28 @@ pub fn set_height_keep_top(window: &Window, height: f64, cx: &App) {
 pub fn window_number(window: &Window) -> Option<isize> {
     ns_window(window).map(|w| w.windowNumber())
 }
+
+/// 开发时强制整个应用用深色或浅色（`dark` / `light`），不改系统设置。
+/// 跑 drive 脚本时用 `CONFDECK_APPEARANCE` 指定，两套外观各截一遍。
+#[cfg(debug_assertions)]
+pub fn force_appearance(name: &str) {
+    use objc2_app_kit::{
+        NSAppearance, NSAppearanceNameAqua,
+        NSAppearanceNameDarkAqua, NSApplication,
+    };
+    use objc2_foundation::MainThreadMarker;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    // SAFETY: 两个名字是 AppKit 导出的只读常量字符串。
+    let name = unsafe {
+        match name {
+            "dark" => NSAppearanceNameDarkAqua,
+            "light" => NSAppearanceNameAqua,
+            _ => return,
+        }
+    };
+    let appearance = NSAppearance::appearanceNamed(name);
+    NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
+}
