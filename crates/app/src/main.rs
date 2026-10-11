@@ -2,6 +2,7 @@ mod assets;
 mod data;
 #[cfg(debug_assertions)]
 mod drive;
+mod i18n;
 #[cfg(target_os = "macos")]
 mod mac;
 mod main_window;
@@ -15,7 +16,11 @@ use gpui_kit::*;
 
 use crate::data::Store;
 
+// 界面文案在 crates/app/locales/，各模块里 `use rust_i18n::t;` 后用 `t!("键")` 取。见 i18n.rs。
+rust_i18n::i18n!("locales", fallback = "en");
+
 fn main() {
+    i18n::init();
     gpui_kit::application()
         .with_assets(assets::Assets)
         .run(|cx| {

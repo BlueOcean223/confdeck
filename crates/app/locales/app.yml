@@ -1,0 +1,105 @@
+# 界面文案。`_version: 2`：每个键下面并排写各语言，少写一种语言、代码里用了没有的键，
+# `i18n` 模块的测试会报出来。
+# 语言代号和 gpui-component 的一致（en、zh-CN），它自带的组件文案才能跟着一起换。
+# 变量写 %{name}，代码里 t!("键", name = 值)。以 % 开头的值要加引号，YAML 把 % 当指令符。
+_version: 2
+
+tabs:
+  agents:
+    en: Agents
+    zh-CN: Agent
+  providers:
+    en: Providers
+    zh-CN: 供应商
+  mcp:
+    en: MCP
+    zh-CN: MCP
+  prompts:
+    en: Prompts
+    zh-CN: 提示词
+  usage:
+    en: Usage
+    zh-CN: 用量
+  sessions:
+    en: Sessions
+    zh-CN: 会话
+
+common:
+  # 选择器和下拉框里的「默认」：交还给 agent 自带的登录。
+  default:
+    en: Default
+    zh-CN: 默认
+  # 把几个名字连成一句话时用的分隔符。
+  list_separator:
+    en: ", "
+    zh-CN: "、"
+
+agents:
+  intro:
+    en: Pick a provider for each agent. confdeck only changes the connection keys in each config file and leaves everything else as it is.
+    zh-CN: 为每个 agent 选一个供应商。confdeck 只改配置文件里与连接相关的几个键，其余内容原样保留。
+  show_more:
+    en: Show %{count} more
+    zh-CN: 显示其余 %{count} 个
+  show_less:
+    en: Show less
+    zh-CN: 收起
+  no_config:
+    en: No config file found
+    zh-CN: 未检测到配置文件
+  managed:
+    en: Managed · %{file}
+    zh-CN: 已接管 · %{file}
+  unmanaged:
+    en: Not managed · %{file} is left untouched
+    zh-CN: 未接管 · 不会改动 %{file}
+  configure:
+    en: Configure
+    zh-CN: 配置
+
+providers:
+  used_by:
+    en: "%{host} · used by %{agents}"
+    zh-CN: "%{host} · %{agents} 在用"
+  add:
+    en: Add provider
+    zh-CN: 添加供应商
+
+placeholder:
+  not_built:
+    en: Prototype stage, this page is not built yet
+    zh-CN: 原型阶段，这一页还没做
+
+picker:
+  filter:
+    en: Filter providers…
+    zh-CN: 筛选供应商…
+  # 过滤词能匹配到这些词时，「默认」这一项才留在列表里。两种语言的词都放，打哪种都能搜到。
+  default_keywords:
+    en: default official 默认 官方
+    zh-CN: 默认 官方 default official
+  default_hint:
+    en: Use the login that comes with %{agent}
+    zh-CN: 使用 %{agent} 自带的登录
+  group:
+    en: Providers
+    zh-CN: 供应商
+  empty:
+    en: No matching providers
+    zh-CN: 没有匹配的供应商
+
+panel:
+  open:
+    en: Open confdeck
+    zh-CN: 打开 confdeck
+  quit:
+    en: Quit
+    zh-CN: 退出
+
+tray:
+  open:
+    en: Open confdeck
+    zh-CN: 打开 confdeck
+  quit:
+    en: Quit confdeck
+    zh-CN: 退出 confdeck

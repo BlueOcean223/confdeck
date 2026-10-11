@@ -12,6 +12,7 @@
 //! type deep         逐字输入
 //! shot tabs         当前窗口截图，存成 tabs.png
 //! tray              模拟左键点一下菜单栏图标
+//! lang en           切换界面语言（en、zh-CN），和设置页以后做的事一样
 //! wait 300          等 300 毫秒
 //! quit              退出
 //! ```
@@ -92,6 +93,10 @@ fn run(cmd: &str, arg: &str, target: Target, shots: &Path, cx: &mut App) -> anyh
         }
         "quit" => {
             cx.quit();
+            return Ok(());
+        }
+        "lang" => {
+            crate::i18n::set(arg, cx);
             return Ok(());
         }
         _ => {}

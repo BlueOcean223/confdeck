@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::component::*;
 use gpui_kit::*;
+use rust_i18n::t;
 
 use crate::data::Store;
 use crate::main_window;
@@ -341,7 +342,7 @@ impl Render for Panel {
                             .pr(px(4.))
                             .child(
                                 ui::text_button("open", &t)
-                                    .child("打开 confdeck")
+                                    .child(t!("panel.open"))
                                     .on_click(move |_, window, cx| {
                                         close(window, cx);
                                         main_window::show(open_store.clone(), cx);
@@ -349,7 +350,7 @@ impl Render for Panel {
                             )
                             .child(
                                 ui::text_button("quit", &t)
-                                    .child("退出")
+                                    .child(t!("panel.quit"))
                                     .on_click(|_, _, cx| cx.quit()),
                             ),
                     ),

@@ -1,6 +1,7 @@
 //! 原型阶段的假数据。以后由 confdeck-core 读写真实的配置文件。
 
 use gpui_kit::*;
+use rust_i18n::t;
 
 /// 图标资源。单色图标按文字颜色着色，彩色图标按原色绘制。
 #[derive(Clone, Copy)]
@@ -95,11 +96,11 @@ impl Store {
         cx.notify();
     }
 
-    pub fn provider_label(&self, agent: usize) -> (Logo, &'static str) {
+    pub fn provider_label(&self, agent: usize) -> (Logo, SharedString) {
         let agent = &self.agents[agent];
         match agent.provider {
-            Some(p) => (self.providers[p].logo, self.providers[p].name),
-            None => (agent.logo, "默认"),
+            Some(p) => (self.providers[p].logo, self.providers[p].name.into()),
+            None => (agent.logo, t!("common.default").into()),
         }
     }
 

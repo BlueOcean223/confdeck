@@ -7,8 +7,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use rust_i18n::t;
 
-use crate::data::Store;
+use crate::data::{Logo, Store};
 use crate::theme::Theme;
 use crate::ui;
 
@@ -38,7 +39,7 @@ fn options(store: &Store, query: &str) -> Vec<Option<usize>> {
     let query = query.trim().to_lowercase();
     let matches = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
     let mut options = Vec::new();
-    if matches("默认 default 官方") {
+    if matches(&t!("picker.default_keywords")) {
         options.push(None);
     }
     options.extend(
@@ -66,7 +67,7 @@ impl Picker {
             Theme::window(window.appearance())
         };
         crate::theme::sync_component_theme(&t, cx);
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("筛选供应商…"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(t!("picker.filter")));
         input.update(cx, |input, cx| input.focus(window, cx));
 
         let current = store.read(cx).agents[agent].provider;
@@ -176,12 +177,16 @@ impl Picker {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let agent = &store.agents[self.agent];
-        let (logo, name, sub): (_, &str, String) = match option {
+        let (logo, name, sub): (Logo, SharedString, SharedString) = match option {
             Some(p) => {
                 let provider = &store.providers[p];
-                (provider.logo, provider.name, provider.host.to_string())
+                (provider.logo, provider.name.into(), provider.host.into())
             }
-            None => (agent.logo, "默认", format!("使用 {} 自带的登录", agent.name)),
+            None => (
+                agent.logo,
+                t!("common.default").into(),
+                t!("picker.default_hint", agent = agent.name).into(),
+            ),
         };
         let current = agent.provider == option;
 
@@ -210,7 +215,7 @@ impl Picker {
                     .gap(px(9.))
                     .min_w_0()
                     .flex_1()
-                    .child(div().flex_none().text_size(px(12.5)).child(name.to_string()))
+                    .child(div().flex_none().text_size(px(12.5)).child(name))
                     .child(
                         div()
                             .min_w_0()
@@ -245,7 +250,7 @@ impl Render for Picker {
         for (n, option) in options.iter().enumerate() {
             if option.is_some() && !header_shown {
                 header_shown = true;
-                list = list.child(ui::group_label(&t, "供应商"));
+                list = list.child(ui::group_label(&t, t!("picker.group")));
             }
             list = list.child(self.option_row(n, *option, store, &t, cx));
         }
@@ -258,7 +263,7 @@ impl Render for Picker {
                     .justify_center()
                     .text_size(px(12.5))
                     .text_color(t.muted)
-                    .child("没有匹配的供应商"),
+                    .child(t!("picker.empty")),
             );
         }
 

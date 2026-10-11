@@ -14,6 +14,10 @@ gpui-kit = "0.7"
 tray-icon = "0.26"
 async-channel = "2"
 rust-embed = "8.7"
+# 界面文案的多语言。gpui-component 也用它，「当前语言」是进程级的一份，设一次两边的文案都换。
+rust-i18n = "4.2"
+# 读系统的首选语言，启动时定界面语言。
+sys-locale = "0.3"
 # 和 gpui 用同一个版本，不多编译一份；只用来把图标渲染成菜单栏图标。
 resvg = { version = "0.46", default-features = false }
 objc2 = "0.6"

@@ -165,7 +165,7 @@ pub fn dropdown(content: impl IntoElement) -> Div {
 }
 
 /// 浮层里的分组标题（`.pop li.group`）。
-pub fn group_label(t: &Theme, label: &'static str) -> Div {
+pub fn group_label(t: &Theme, label: impl Into<SharedString>) -> Div {
     div()
         .h(px(24.))
         .pt(px(8.))
@@ -173,14 +173,14 @@ pub fn group_label(t: &Theme, label: &'static str) -> Div {
         .text_size(px(10.5))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(t.faint)
-        .child(label)
+        .child(label.into())
 }
 
 /// 顶栏中间的分段标签（`.seg`）：没有灰色轨道，只有选中项下面垫一块白色滑块。
 /// 切换时滑块从上一个标签滑过来；`from` 是上一个标签的下标和这次切换的编号。
 pub fn seg<T: Copy + PartialEq + 'static>(
     t: &Theme,
-    items: &[(T, &'static str)],
+    items: &[(T, SharedString)],
     active: T,
     from: Option<(usize, u64)>,
     window: &mut Window,
@@ -203,7 +203,7 @@ pub fn seg<T: Copy + PartialEq + 'static>(
             };
             let line = window
                 .text_system()
-                .shape_line((*label).into(), px(FONT), &[run], None);
+                .shape_line(label.clone(), px(FONT), &[run], None);
             f32::from(line.width).ceil() + PAD * 2.
         })
         .collect();
@@ -243,7 +243,8 @@ pub fn seg<T: Copy + PartialEq + 'static>(
         .p(px(2.))
         .rounded(px(8.))
         .child(thumb)
-        .children(items.iter().enumerate().map(|(i, &(value, label))| {
+        .children(items.iter().enumerate().map(|(i, (value, label))| {
+            let value = *value;
             let on = value == active;
             let on_select = on_select.clone();
             let hover = t.fg_2;
@@ -259,7 +260,7 @@ pub fn seg<T: Copy + PartialEq + 'static>(
                 .when(!on, |b| b.hover(move |s| s.text_color(hover)))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |_, window, cx| on_select(&value, window, cx))
-                .child(label)
+                .child(label.clone())
         }))
 }
 

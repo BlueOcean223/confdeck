@@ -1,8 +1,11 @@
 //! 主窗口，布局照 magpie：左上是标志，顶栏中间是分段标签，下面是圆角卡片列表。
 
+use std::borrow::Cow;
+
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use rust_i18n::t;
 
 use crate::data::Store;
 use crate::picker::{Picker, PickerEvent};
@@ -19,14 +22,20 @@ enum Tab {
     Sessions,
 }
 
+/// 每个标签和它文案的键。
 const TABS: &[(Tab, &str)] = &[
-    (Tab::Agents, "Agent"),
-    (Tab::Providers, "供应商"),
-    (Tab::Mcp, "MCP"),
-    (Tab::Prompts, "提示词"),
-    (Tab::Usage, "用量"),
-    (Tab::Sessions, "会话"),
+    (Tab::Agents, "tabs.agents"),
+    (Tab::Providers, "tabs.providers"),
+    (Tab::Mcp, "tabs.mcp"),
+    (Tab::Prompts, "tabs.prompts"),
+    (Tab::Usage, "tabs.usage"),
+    (Tab::Sessions, "tabs.sessions"),
 ];
+
+/// 标签和当前语言的文案。
+fn tabs() -> Vec<(Tab, SharedString)> {
+    TABS.iter().map(|(tab, key)| (*tab, t!(*key).into())).collect()
+}
 
 /// 主窗口的句柄。窗口关掉后句柄失效，再打开时会新建。
 #[derive(Default)]
@@ -163,7 +172,7 @@ impl MainWindow {
                     .justify_center()
                     .child(ui::seg(
                         t,
-                        TABS,
+                        &tabs(),
                         self.tab,
                         self.tab_anim,
                         window,
@@ -217,9 +226,9 @@ impl MainWindow {
                         cx.notify();
                     }))
                     .child(if self.show_more {
-                        "收起".to_string()
+                        t!("agents.show_less")
                     } else {
-                        format!("显示其余 {hidden} 个")
+                        t!("agents.show_more", count = hidden)
                     })
                     .child(ui::icon(
                         if self.show_more { "chevron-up" } else { "chevron-down" },
@@ -241,7 +250,7 @@ impl MainWindow {
                 div()
                     .text_size(px(13.))
                     .text_color(t.fg_2)
-                    .child("为每个 agent 选一个供应商。confdeck 只改配置文件里与连接相关的几个键，其余内容原样保留。"),
+                    .child(t!("agents.intro")),
             )
             .child(list)
     }
@@ -277,11 +286,11 @@ impl MainWindow {
         let open = self.picker.as_ref().filter(|p| p.agent == i);
         let (logo, label) = store.provider_label(i);
         let status = if !agent.installed {
-            "未检测到配置文件".to_string()
+            t!("agents.no_config")
         } else if agent.managed {
-            format!("已接管 · {}", agent.config)
+            t!("agents.managed", file = agent.config)
         } else {
-            format!("未接管 · 不会改动 {}", agent.config)
+            t!("agents.unmanaged", file = agent.config)
         };
         let dot = if agent.installed && agent.managed { t.green } else { t.faint };
 
@@ -309,7 +318,7 @@ impl MainWindow {
                 row.child(
                     ui::text_button(ElementId::named_usize("config", i), t)
                         .mr(px(14.))
-                        .child("配置")
+                        .child(t!("agents.configure"))
                         .child(ui::icon("chevron-right", 11., t.faint)),
                 )
                 .child(
@@ -379,9 +388,10 @@ impl MainWindow {
         for (i, provider) in store.providers.iter().enumerate() {
             let users = store.users_of(i);
             let sub = if users.is_empty() {
-                provider.host.to_string()
+                Cow::Borrowed(provider.host)
             } else {
-                format!("{} · {} 在用", provider.host, users.join("、"))
+                let agents = users.join(&t!("common.list_separator"));
+                t!("providers.used_by", host = provider.host, agents = agents)
             };
             list = list.child(
                 ui::row(t, false, i == 0)
@@ -417,22 +427,23 @@ impl MainWindow {
             ui::text_button("add-provider", t)
                 .pl(px(12.))
                 .child(ui::icon("plus", 13., t.ctl_fg))
-                .child("添加供应商"),
+                .child(t!("providers.add")),
         )
     }
 
     fn placeholder(&self, t: &Theme) -> impl IntoElement {
-        let name = TABS
+        let name: SharedString = TABS
             .iter()
             .find(|(tab, _)| *tab == self.tab)
-            .map_or("", |(_, name)| *name);
+            .map(|(_, key)| t!(*key).into())
+            .unwrap_or_default();
         ui::list(t, false).child(
             div()
                 .v_flex()
                 .items_center()
                 .py(px(36.))
                 .child(div().font_weight(FontWeight::MEDIUM).mb(px(4.)).child(name))
-                .child(div().text_color(t.muted).child("原型阶段，这一页还没做")),
+                .child(div().text_color(t.muted).child(t!("placeholder.not_built"))),
         )
     }
 }
@@ -467,5 +478,22 @@ impl Render for MainWindow {
                     .pb(px(16.))
                     .child(page),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TABS;
+    use crate::i18n::LOCALES;
+
+    /// 标签的键是变量传给 `t!` 的，i18n 模块扫源码的测试找不到它们，这里单独查。
+    #[test]
+    fn tab_labels_are_translated() {
+        let backend = crate::_rust_i18n_backend();
+        for (_, key) in TABS {
+            for locale in LOCALES {
+                assert!(backend.translate(locale, key).is_some(), "{locale} is missing {key}");
+            }
+        }
     }
 }

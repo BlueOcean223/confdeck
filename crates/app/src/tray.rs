@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use gpui_kit::*;
+use rust_i18n::t;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{
     Icon, MouseButton as TrayButton, MouseButtonState, Rect, TrayIconBuilder, TrayIconEvent,
@@ -26,6 +27,22 @@ struct TrayEvents(async_channel::Sender<Event>);
 
 impl Global for TrayEvents {}
 
+/// 右键菜单里的两项，切换语言时要改它们的文字。
+struct TrayMenu {
+    open: MenuItem,
+    quit: MenuItem,
+}
+
+impl Global for TrayMenu {}
+
+/// 按当前语言重写右键菜单的文字（`i18n::set` 调）。
+pub fn relabel(cx: &App) {
+    if let Some(menu) = cx.try_global::<TrayMenu>() {
+        menu.open.set_text(t!("tray.open"));
+        menu.quit.set_text(t!("tray.quit"));
+    }
+}
+
 /// 模拟左键点一下菜单栏图标，效果和真的点一样。
 pub fn click(cx: &App) {
     if let Some(events) = cx.try_global::<TrayEvents>() {
@@ -34,10 +51,14 @@ pub fn click(cx: &App) {
 }
 
 pub fn install(store: Entity<Store>, cx: &mut App) -> anyhow::Result<()> {
-    let open = MenuItem::new("打开 confdeck", true, None);
-    let quit = MenuItem::new("退出 confdeck", true, None);
+    let open = MenuItem::new(t!("tray.open"), true, None);
+    let quit = MenuItem::new(t!("tray.quit"), true, None);
     let menu = Menu::new();
     menu.append_items(&[&open, &PredefinedMenuItem::separator(), &quit])?;
+    cx.set_global(TrayMenu {
+        open: open.clone(),
+        quit: quit.clone(),
+    });
 
     let builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
