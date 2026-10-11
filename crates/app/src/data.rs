@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use confdeck_core::agent::codex::catalog::Skipped;
-use confdeck_core::agent::{self, AgentKind, Mode};
+use confdeck_core::agent::{self, AgentKind, Connection, Mode};
 use confdeck_core::apply::{self, ApplyError, Switched, Synced, UsedBy};
 use confdeck_core::current::{self, Current};
 use confdeck_core::data::DataDir;
@@ -301,8 +301,32 @@ impl Store {
         }
     }
 
+    /// 单选 agent 的配置文件现在连到哪：地址和凭据的原样，选择器「现在」那组要用。读不了就是 `None`。
+    pub fn connection(&self, agent: usize) -> Option<Connection> {
+        let kind = self.agents[agent].kind?;
+        current::connection(&self.engine, &self.home, kind).ok()
+    }
+
+    /// 「把当前配置存成供应商」：按这个 agent 的配置文件拼好的一家新供应商（core 的 `draft`），
+    /// 交给新建表单预先填好。文件连的不是一个地址（Bedrock 这类）时是 `None`。
+    pub fn draft(&self, agent: usize) -> Option<Provider> {
+        let kind = self.agents[agent].kind?;
+        current::draft(&self.engine, &self.home, kind, &self.providers)
+            .ok()
+            .flatten()
+    }
+
+    /// 胶囊画成虚线边框：文件连的和列表里哪家都对不上（decisions「『自定义』的样子」）。
+    pub fn pill_dashed(&self, agent: usize) -> bool {
+        let agent = &self.agents[agent];
+        matches!(agent.selection, Selection::Single(None))
+            && matches!(agent.current, Some(Current::Custom { .. }))
+    }
+
     pub fn agent_index(&self, kind: AgentKind) -> Option<usize> {
-        self.agents.iter().position(|agent| agent.kind == Some(kind))
+        self.agents
+            .iter()
+            .position(|agent| agent.kind == Some(kind))
     }
 
     /// 保存一家（新建或替换同 ID 的），写进在用它的 agent，然后重新读一遍。
@@ -383,7 +407,12 @@ impl Store {
     }
 
     /// 多选 agent 勾上或取消一家：和 [`Self::switch`] 一样，勾选框先改、后台写、写完重读。
-    pub fn toggle(&mut self, agent: usize, provider: usize, cx: &mut Context<Self>) -> Task<Vec<Notice>> {
+    pub fn toggle(
+        &mut self,
+        agent: usize,
+        provider: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Vec<Notice>> {
         let Some(kind) = self.agents[agent].kind else {
             return Task::ready(Vec::new());
         };
@@ -414,6 +443,50 @@ impl Store {
             this.update(cx, |store, cx| {
                 store.reload();
                 let notices = store.describe_toggle(kind, name, enabling, result);
+                store.announce(&notices, cx);
+                notices
+            })
+            .unwrap_or_default()
+        })
+    }
+
+    /// 「Key 不一致」的第二个选项：把这个 agent 配置文件里的 Key 存进那家供应商。
+    /// 这个 agent 的文件本来就是这个 Key，不用写，只记下它选的是这家；别的在用这家的 agent
+    /// 由 core 的 `save_provider` 跟着换成新 Key（core.md「改了供应商以后」）。
+    pub fn adopt_key(
+        &mut self,
+        agent: usize,
+        provider: usize,
+        key: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Vec<Notice>> {
+        let Some(kind) = self.agents[agent].kind else {
+            return Task::ready(Vec::new());
+        };
+        let mut picked = self.providers[provider].clone();
+        picked.key = key;
+        let name = picked.name.clone();
+        let row = &mut self.agents[agent];
+        row.selection = Selection::Single(Some(provider));
+        row.current = Some(Current::Provider(picked.id.clone()));
+        row.chosen = true;
+        cx.notify();
+
+        let engine = self.engine.clone();
+        let home = self.home.clone();
+        let providers = self.providers.clone();
+        let write = cx.background_executor().spawn(async move {
+            let synced = apply::save_provider(&engine, &home, &providers, &picked)?;
+            engine
+                .set_selection(kind.id(), Some(&picked.id))
+                .map_err(StoreError::Lock)?;
+            Ok::<_, StoreError>(synced)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = write.await;
+            this.update(cx, |store, cx| {
+                store.reload();
+                let notices = store.describe_adopt(kind, name, result);
                 store.announce(&notices, cx);
                 notices
             })
@@ -469,7 +542,13 @@ impl Store {
         let agent = kind.to_string();
         let switched = match result {
             Ok(switched) => switched,
-            Err(err) => return vec![Notice::err(t!("toast.sync_failed", agent = agent, error = err.to_string()))],
+            Err(err) => {
+                return vec![Notice::err(t!(
+                    "toast.sync_failed",
+                    agent = agent,
+                    error = err.to_string()
+                ))];
+            }
         };
         let files = apply::live_files(&self.home, kind);
         let mut outcomes = vec![switched.outcome];
@@ -480,10 +559,16 @@ impl Store {
             Some(name) => t!("write.switched", agent = agent, provider = name),
             None => t!("write.restored", agent = agent),
         };
-        let mut notices = vec![Notice::ok(format!("{headline}{}", self.file_note(&files, &outcomes)))];
+        let mut notices = vec![Notice::ok(format!(
+            "{headline}{}",
+            self.file_note(&files, &outcomes)
+        ))];
         // Codex 的模型目录没写成：config.toml 已经切过去了，但 `/model` 列的还是 GPT 模型，要说一声。
         if let Some(Err(skipped)) = switched.catalog {
-            notices.push(Notice::err(t!("write.codex_catalog_skipped", reason = describe_skipped(skipped))));
+            notices.push(Notice::err(t!(
+                "write.codex_catalog_skipped",
+                reason = describe_skipped(skipped)
+            )));
         }
         notices
     }
@@ -504,10 +589,67 @@ impl Store {
                     t!("write.disabled", agent = agent, provider = name)
                 };
                 let files = apply::live_files(&self.home, kind);
-                vec![Notice::ok(format!("{headline}{}", self.file_note(&files, &[outcome])))]
+                vec![Notice::ok(format!(
+                    "{headline}{}",
+                    self.file_note(&files, &[outcome])
+                ))]
             }
-            Err(err) => vec![Notice::err(t!("toast.sync_failed", agent = agent, error = err.to_string()))],
+            Err(err) => vec![Notice::err(t!(
+                "toast.sync_failed",
+                agent = agent,
+                error = err.to_string()
+            ))],
         }
+    }
+
+    fn describe_adopt(
+        &self,
+        kind: AgentKind,
+        name: String,
+        result: Result<Vec<Synced>, StoreError>,
+    ) -> Vec<Notice> {
+        let agent = kind.to_string();
+        let synced = match result {
+            Ok(synced) => synced,
+            Err(err) => {
+                return vec![Notice::err(t!(
+                    "write.key_adopt_failed",
+                    provider = name,
+                    error = err.to_string()
+                ))];
+            }
+        };
+        let written: Vec<String> = synced
+            .iter()
+            .filter(|s| s.result.as_ref().is_ok_and(|outcome| outcome.changed))
+            .map(|s| s.agent.to_string())
+            .collect();
+        let headline = if written.is_empty() {
+            t!("write.key_adopted", provider = name, agent = agent)
+        } else {
+            let agents = written.join(&t!("common.list_separator"));
+            t!(
+                "write.key_adopted_synced",
+                provider = name,
+                agent = agent,
+                agents = agents
+            )
+        };
+        let mut notices = vec![Notice::ok(headline)];
+        for failed in synced.iter().filter(|s| s.result.is_err()) {
+            let error = failed
+                .result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            notices.push(Notice::err(t!(
+                "toast.sync_failed",
+                agent = failed.agent.to_string(),
+                error = error
+            )));
+        }
+        notices
     }
 
     /// 提示的后半句「 · 写了 ~/.claude/settings.json，先备份了」：只说实际写了的文件。
@@ -597,8 +739,11 @@ impl Store {
             // 文件连的不是列表里的哪家：「自定义 · 主机名」；地址对得上、Key 不一样：「DeepSeek · Key 不一致」。
             Selection::Single(None) => match &agent.current {
                 Some(Current::Custom { host }) => {
-                    let host = host.clone().unwrap_or_default();
-                    (vec![agent.logo], t!("pill.custom", host = host).into())
+                    let label = match host {
+                        Some(host) => t!("pill.custom", host = host),
+                        None => t!("pill.custom_bare"),
+                    };
+                    (vec![agent.logo], label.into())
                 }
                 Some(Current::KeyMismatch { provider }) => {
                     let found = self.providers.iter().find(|p| &p.id == provider);
@@ -693,7 +838,14 @@ pub fn key_tail(provider: &Provider) -> Option<String> {
     if key.is_empty() {
         return None;
     }
-    let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     Some(format!("…{tail}"))
 }
 

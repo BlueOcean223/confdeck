@@ -22,8 +22,12 @@ use crate::theme::Theme;
 use crate::ui::{self, Button};
 
 pub enum EditorEvent {
-    /// 保存好了：名字，和写进了哪些 agent（写失败的也在里面）。
-    Saved { name: String, synced: Vec<Synced> },
+    /// 保存好了：ID、名字，和写进了哪些 agent（写失败的也在里面）。
+    Saved {
+        id: String,
+        name: String,
+        synced: Vec<Synced>,
+    },
     /// 删掉了：名字，和从哪些多选 agent 里移掉了。
     Deleted { name: String, synced: Vec<Synced> },
     /// 取消、Esc、点外面。
@@ -124,6 +128,21 @@ impl Editor {
         Self::new(store, provider, true, preset, window, cx)
     }
 
+    /// 「把当前配置存成供应商」：按 agent 配置文件拼好的一家（core 的 `draft`）当新建的来编辑，
+    /// ID、名字、地址、Key、模型都填好了，用户看一眼、补个名字就能存。
+    pub fn from_draft(
+        store: Entity<Store>,
+        provider: Provider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let preset = provider
+            .preset
+            .as_deref()
+            .and_then(confdeck_core::preset::get);
+        Self::new(store, provider, true, preset, window, cx)
+    }
+
     fn new(
         store: Entity<Store>,
         provider: Provider,
@@ -180,8 +199,7 @@ impl Editor {
                     && !this.id_edited
                 {
                     let slug = slug(&this.name.read(cx).value());
-                    this.id
-                        .update(cx, |id, cx| id.set_value(slug, window, cx));
+                    this.id.update(cx, |id, cx| id.set_value(slug, window, cx));
                 }
             },
         ));
@@ -244,7 +262,11 @@ impl Editor {
         let number = |n: Option<u64>| n.map(|n| n.to_string()).unwrap_or_default();
         ModelRow {
             id: input(t!("editor.model_id").into(), &model.id, cx),
-            name: input(t!("editor.model_name").into(), model.name.as_deref().unwrap_or_default(), cx),
+            name: input(
+                t!("editor.model_name").into(),
+                model.name.as_deref().unwrap_or_default(),
+                cx,
+            ),
             context: input("128000".into(), &number(model.context), cx),
             output: input("32000".into(), &number(model.output), cx),
             image: model.input.contains(&Modality::Image),
@@ -357,16 +379,15 @@ impl Editor {
             cx.notify();
             return;
         }
+        let id = provider.id.clone();
         let name = provider.name.clone();
-        let saved = self
-            .store
-            .update(cx, |store, cx| {
-                let result = store.save_provider(&provider);
-                cx.notify();
-                result
-            });
+        let saved = self.store.update(cx, |store, cx| {
+            let result = store.save_provider(&provider);
+            cx.notify();
+            result
+        });
         match saved {
-            Ok(synced) => cx.emit(EditorEvent::Saved { name, synced }),
+            Ok(synced) => cx.emit(EditorEvent::Saved { id, name, synced }),
             Err(err) => {
                 self.error = Some(err.to_string().into());
                 cx.notify();
@@ -670,7 +691,11 @@ impl Editor {
                 .when(!expanded, |r| r.hover(move |s| s.bg(hover_bg)))
                 .when(expanded, |r| r.bg(t.card_2))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.expanded = if this.expanded == Some(n) { None } else { Some(n) };
+                    this.expanded = if this.expanded == Some(n) {
+                        None
+                    } else {
+                        Some(n)
+                    };
                     cx.notify();
                 }))
                 .child(radio)
@@ -711,7 +736,11 @@ impl Editor {
                         .child(self.model_line(row, cx)),
                 )
                 .child(ui::icon(
-                    if expanded { "chevron-up" } else { "chevron-down" },
+                    if expanded {
+                        "chevron-up"
+                    } else {
+                        "chevron-down"
+                    },
                     12.,
                     t.faint,
                 ));
@@ -731,7 +760,8 @@ impl Editor {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        let field = |state: &Entity<InputState>, mono: bool| ui::field(t, state, mono, None, window, cx);
+        let field =
+            |state: &Entity<InputState>, mono: bool| ui::field(t, state, mono, None, window, cx);
         let image = row.image;
         div()
             .v_flex()
@@ -815,7 +845,8 @@ impl Editor {
             .iter()
             .map(|(agent, _)| store.agents[*agent].name)
             .collect();
-        let field = |state: &Entity<InputState>, mono: bool| ui::field(t, state, mono, None, window, cx);
+        let field =
+            |state: &Entity<InputState>, mono: bool| ui::field(t, state, mono, None, window, cx);
 
         let id_row = if self.is_new {
             self.form_row(
@@ -843,7 +874,10 @@ impl Editor {
                             .text_size(px(12.5))
                             .child(self.initial.id.clone()),
                     )
-                    .child(ui::hint(t, t!("editor.id_hint", id = self.initial.id.clone()))),
+                    .child(ui::hint(
+                        t,
+                        t!("editor.id_hint", id = self.initial.id.clone()),
+                    )),
             )
         };
 
@@ -857,7 +891,11 @@ impl Editor {
             .text_color(t.muted)
             .cursor_pointer()
             .hover(|s| s.text_color(gpui_kit::transparent_black()))
-            .child(ui::icon(if self.key_visible { "eye-off" } else { "eye" }, 13., t.muted))
+            .child(ui::icon(
+                if self.key_visible { "eye-off" } else { "eye" },
+                13.,
+                t.muted,
+            ))
             .child(if self.key_visible {
                 t!("editor.key_hide")
             } else {
@@ -876,7 +914,14 @@ impl Editor {
             div()
                 .v_flex()
                 .gap(px(4.))
-                .child(ui::field(t, &self.key, true, Some(eye.into_any_element()), window, cx))
+                .child(ui::field(
+                    t,
+                    &self.key,
+                    true,
+                    Some(eye.into_any_element()),
+                    window,
+                    cx,
+                ))
                 .when(!user_names.is_empty(), |d| {
                     let agents = user_names.join(&t!("common.list_separator"));
                     d.child(ui::hint(t, t!("editor.key_hint_in_use", agents = agents)))
@@ -982,25 +1027,35 @@ impl Editor {
                 .child(text)
         };
         let buttons = |cancel: SharedString, ok: SharedString, on_ok: OnClick| {
-            div().h_flex().justify_end().gap(px(8.)).mt(px(4.)).child(
-                ui::button("confirm-cancel", t, Button::Secondary)
-                    .child(cancel)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.confirm = None;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                ui::button("confirm-ok", t, Button::Danger)
-                    .bg(t.danger.opacity(0.12))
-                    .child(ok)
-                    .on_click(on_ok),
-            )
+            div()
+                .h_flex()
+                .justify_end()
+                .gap(px(8.))
+                .mt(px(4.))
+                .child(
+                    ui::button("confirm-cancel", t, Button::Secondary)
+                        .child(cancel)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    ui::button("confirm-ok", t, Button::Danger)
+                        .bg(t.danger.opacity(0.12))
+                        .child(ok)
+                        .on_click(on_ok),
+                )
         };
         let card = match confirm {
             Confirm::Discard => card
                 .child(title(t!("editor.discard_title").into()))
-                .child(div().text_size(px(12.5)).text_color(t.fg_2).child(t!("editor.discard_body")))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(t.fg_2)
+                        .child(t!("editor.discard_body")),
+                )
                 .child(buttons(
                     t!("editor.keep_editing").into(),
                     t!("editor.discard").into(),
@@ -1039,21 +1094,21 @@ impl Editor {
                                 .text_color(t.fg_2)
                                 .child(t!("editor.delete_used_by")),
                         )
-                        .child(
-                            div()
-                                .h_flex()
-                                .flex_wrap()
-                                .gap(px(6.))
-                                .children(switch.iter().chain(&coexist).map(|agent| {
-                                    ui::chip(t)
-                                        .child(ui::logo(agent.logo, 14., t, window, cx))
-                                        .child(div().font_weight(FontWeight::MEDIUM).child(agent.name))
-                                })),
-                        );
+                        .child(div().h_flex().flex_wrap().gap(px(6.)).children(
+                            switch.iter().chain(&coexist).map(|agent| {
+                                ui::chip(t)
+                                    .child(ui::logo(agent.logo, 14., t, window, cx))
+                                    .child(div().font_weight(FontWeight::MEDIUM).child(agent.name))
+                            }),
+                        ));
                     if !switch.is_empty() {
                         card = card.child(ui::hint(
                             t,
-                            t!("editor.delete_switch_note", agents = names(&switch), host = host),
+                            t!(
+                                "editor.delete_switch_note",
+                                agents = names(&switch),
+                                host = host
+                            ),
                         ));
                     }
                     if !coexist.is_empty() {
@@ -1063,16 +1118,11 @@ impl Editor {
                         ));
                     }
                     for (kind, err) in &used_by.unknown {
-                        card = card.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(t.danger)
-                                .child(t!(
-                                    "editor.delete_unknown",
-                                    agent = kind.to_string(),
-                                    error = err.to_string()
-                                )),
-                        );
+                        card = card.child(div().text_size(px(11.)).text_color(t.danger).child(t!(
+                            "editor.delete_unknown",
+                            agent = kind.to_string(),
+                            error = err.to_string()
+                        )));
                     }
                 }
                 card.child(buttons(
@@ -1195,7 +1245,11 @@ fn describe(err: &ProviderError) -> SharedString {
         ProviderError::EmptyModelId { .. } => t!("errors.empty_model_id"),
         ProviderError::DuplicateModel { model, .. } => t!("errors.duplicate_model", model = model),
         ProviderError::UnknownModel { agent, model, .. } => {
-            t!("errors.unknown_model", agent = agent.to_string(), model = model)
+            t!(
+                "errors.unknown_model",
+                agent = agent.to_string(),
+                model = model
+            )
         }
         ProviderError::UnknownDefaultModel { model, .. } => {
             t!("errors.unknown_default_model", model = model)

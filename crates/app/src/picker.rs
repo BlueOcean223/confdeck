@@ -5,12 +5,18 @@
 //!   打开时勾着的排在「写进 X 的配置」一组，其余在「可添加」；之后勾、取消只改勾选框，不重新排，行不会在鼠标底下跳。
 //! - 接口对不上的供应商排在最后、置灰、写明缺哪种接口，选不了（提案 01）。
 //!
+//! - 配置不是 confdeck 写的（「自定义 · 主机名」「Key 不一致」，预览 09）：最上面多一组「现在 · 不是 confdeck 写的」，
+//!   第一行写文件连到哪，下面挂着动作行：自定义时「把当前配置存成供应商…」，Key 不一致时「用 confdeck 里的 Key 重写」
+//!   和「把文件里的 Key 存进这家」。有过滤词时这组不显示，让人专心找供应商。
+//!
 //! 打开就能直接打字过滤；上下键移动高亮、回车选定（多选时是勾 / 取消）、Esc 关闭；鼠标悬停也会移动高亮。
 //! 多选时过滤框是空的，空格也能勾 / 取消；有过滤词时空格照常输入（供应商名里有空格）。
 
 use std::time::Duration;
 
-use confdeck_core::agent::Mode;
+use confdeck_core::agent::{Connection, Credential, Mode};
+use confdeck_core::current::Current;
+use confdeck_core::provider::Provider;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -26,27 +32,66 @@ pub enum PickerEvent {
     Picked(Option<usize>),
     /// 多选 agent 勾上或取消了一家，浮层不关。
     Toggled(usize),
+    /// 「Key 不一致」：把配置文件里的 Key 存进这家（供应商下标）。
+    AdoptKey {
+        provider: usize,
+        key: String,
+    },
+    /// 「自定义」：把配置文件里的连接存成一家新供应商，打开预先填好的新建表单。
+    SaveAs(Provider),
     Dismissed,
+}
+
+/// 「现在」那组里的动作行。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Action {
+    /// 用 confdeck 里这家的 Key 重写，就是选这家。
+    Rewrite(usize),
+    /// 把文件里的 Key 存进这家。
+    AdoptKey(usize),
+    /// 把当前配置存成供应商。
+    SaveAs,
+}
+
+impl Action {
+    fn icon(self) -> &'static str {
+        match self {
+            Action::Rewrite(_) => "rotate-ccw",
+            Action::AdoptKey(_) => "key-round",
+            Action::SaveAs => "plus",
+        }
+    }
+}
+
+/// 选得了的一行：一个选项，或一个动作。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    Option(Option<usize>),
+    Action(Action),
 }
 
 /// 列表里的一行。
 enum Row {
     Header(SharedString),
+    /// 「现在」那组的第一行：文件连到哪。只是看的，选不了。
+    Now,
     Option {
         /// `None` 是「默认」。
         option: Option<usize>,
         /// 接口对不上的原因；有原因的置灰、选不了。
         reason: Option<SharedString>,
     },
+    Action(Action),
 }
 
 impl Row {
-    fn selectable(&self) -> Option<Option<usize>> {
+    fn selectable(&self) -> Option<Pick> {
         match self {
             Row::Option {
                 option,
                 reason: None,
-            } => Some(*option),
+            } => Some(Pick::Option(*option)),
+            Row::Action(action) => Some(Pick::Action(*action)),
             _ => None,
         }
     }
@@ -54,9 +99,22 @@ impl Row {
     fn height(&self) -> f32 {
         match self {
             Row::Header(_) => 24.,
-            Row::Option { .. } => 34.,
+            Row::Option { .. } | Row::Action(_) => 34.,
+            Row::Now => NOW_HEIGHT,
         }
     }
+}
+
+/// 配置不是 confdeck 写的时候，列表最上面「现在」那组的内容。打开时算一次。
+struct Now {
+    logos: Vec<Logo>,
+    title: SharedString,
+    sub: SharedString,
+    actions: Vec<Action>,
+    /// 文件里的 Key 本身，「把文件里的 Key 存进这家」要存的。
+    key: Option<String>,
+    /// 「存成供应商」交给表单的那一家。
+    draft: Option<Provider>,
 }
 
 pub struct Picker {
@@ -66,6 +124,8 @@ pub struct Picker {
     multi: bool,
     /// 多选 agent 打开时勾着的几家，决定分组。
     pinned: Vec<usize>,
+    /// 配置不是 confdeck 写的时候才有。
+    now: Option<Now>,
     input: Entity<InputState>,
     /// 高亮的是 `rows()` 里第几行，只会落在选得了的行上。
     highlighted: usize,
@@ -77,6 +137,8 @@ impl EventEmitter<PickerEvent> for Picker {}
 
 /// 没有匹配项时那行提示的高度。
 const EMPTY_HEIGHT: f32 = 56.;
+/// 「现在」那行的高度：两行，上面是胶囊上那几个字，下面是文件里的地址或 Key 差在哪（一行放不下，不截断说明）。
+const NOW_HEIGHT: f32 = 46.;
 
 impl Picker {
     pub fn new(
@@ -100,6 +162,11 @@ impl Picker {
             Selection::Multi(enabled) => (true, enabled.clone()),
         };
         debug_assert_eq!(multi, store.read(cx).agents[agent].mode == Mode::Coexist);
+        let now = if multi {
+            None
+        } else {
+            Self::now(store.read(cx), agent)
+        };
 
         // 过滤框本身绑定了上下键、回车和 Esc，会先把这几个键吃掉，
         // 所以在按键绑定生效之前就拦下来。
@@ -138,16 +205,17 @@ impl Picker {
             panel,
             multi,
             pinned,
+            now,
             input,
             highlighted: 0,
             scroll: ScrollHandle::new(),
             _subscriptions,
         };
-        // 单选时高亮现在用的那家，多选时高亮第一行。
+        // 单选时高亮现在用的那家；没有在用的（默认、自定义、多选）高亮第一个选得了的行。
         let rows = picker.rows(cx);
         let current = match &picker.store.read(cx).agents[agent].selection {
-            Selection::Single(current) => Some(*current),
-            Selection::Multi(_) => None,
+            Selection::Single(Some(p)) => Some(Pick::Option(Some(*p))),
+            _ => None,
         };
         picker.highlighted = rows
             .iter()
@@ -155,6 +223,65 @@ impl Picker {
             .or_else(|| rows.iter().position(|row| row.selectable().is_some()))
             .unwrap_or(0);
         picker
+    }
+
+    /// 「现在」那组：文件连的不是 confdeck 列表里的哪家时才有。
+    fn now(store: &Store, agent: usize) -> Option<Now> {
+        let row = &store.agents[agent];
+        if !matches!(row.selection, Selection::Single(None)) {
+            return None;
+        }
+        let (logos, title) = store.pill(agent);
+        match row.current.as_ref()? {
+            Current::Custom { .. } => {
+                // 小字是文件里的地址；Bedrock 这类没有地址的接法说一句是什么。
+                let sub: SharedString = match store.connection(agent) {
+                    Some(Connection::Endpoint { base_url, .. }) => base_url.into(),
+                    _ => t!("picker.other_setup").into(),
+                };
+                let draft = store.draft(agent);
+                let actions = draft
+                    .is_some()
+                    .then_some(Action::SaveAs)
+                    .into_iter()
+                    .collect();
+                Some(Now {
+                    logos,
+                    title,
+                    sub,
+                    actions,
+                    key: None,
+                    draft,
+                })
+            }
+            Current::KeyMismatch { provider } => {
+                let p = store.providers.iter().position(|x| &x.id == provider)?;
+                let credential = match store.connection(agent) {
+                    Some(Connection::Endpoint { credential, .. }) => credential,
+                    _ => None,
+                };
+                // 只有文件里写的是 Key 本身才能存进供应商（core.md「现在用哪家」）。
+                let (sub, key): (SharedString, Option<String>) = match credential {
+                    Some(Credential::Key(key)) => (t!("picker.key_differs").into(), Some(key)),
+                    Some(Credential::Helper(_)) => (t!("picker.key_helper").into(), None),
+                    Some(Credential::EnvVar(var)) => (t!("picker.key_env", var = var).into(), None),
+                    None => (t!("picker.key_missing").into(), None),
+                };
+                let mut actions = vec![Action::Rewrite(p)];
+                if key.is_some() {
+                    actions.push(Action::AdoptKey(p));
+                }
+                Some(Now {
+                    logos,
+                    title,
+                    sub,
+                    actions,
+                    key,
+                    draft: None,
+                })
+            }
+            Current::Default | Current::Provider(_) => None,
+        }
     }
 
     /// 过滤后的行。单选：「默认」、能用的供应商、接口对不上的；多选：勾着的、可添加的、接口对不上的。
@@ -165,12 +292,18 @@ impl Picker {
         let matches = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
 
         let mut rows = Vec::new();
-        if !self.multi && matches(&t!("picker.default_keywords")) {
-            rows.push(Row::Option {
+        // 「现在」那组只在没有过滤词时显示。
+        let now = self.now.as_ref().filter(|_| query.is_empty());
+        if let Some(now) = now {
+            rows.push(Row::Header(t!("picker.now").into()));
+            rows.push(Row::Now);
+            rows.extend(now.actions.iter().map(|&action| Row::Action(action)));
+        }
+        let default_row =
+            (!self.multi && matches(&t!("picker.default_keywords"))).then_some(Row::Option {
                 option: None,
                 reason: None,
             });
-        }
 
         let shown: Vec<usize> = (0..store.providers.len())
             .filter(|&p| {
@@ -201,7 +334,16 @@ impl Picker {
                 &pinned,
             );
             group(&mut rows, t!("picker.available").into(), &rest);
+        } else if now.is_some() {
+            // 有「现在」那组时「默认」也归到供应商那组底下，不然它会像是「现在」的一部分。
+            rows.push(Row::Header(t!("picker.group_backup").into()));
+            rows.extend(default_row);
+            rows.extend(usable.iter().map(|&p| Row::Option {
+                option: Some(p),
+                reason: None,
+            }));
         } else {
+            rows.extend(default_row);
             group(&mut rows, t!("picker.group").into(), &usable);
         }
         if !unusable.is_empty() {
@@ -261,11 +403,24 @@ impl Picker {
         from
     }
 
-    fn activate(&mut self, option: Option<usize>, cx: &mut Context<Self>) {
-        match (self.multi, option) {
-            (true, Some(p)) => cx.emit(PickerEvent::Toggled(p)),
-            (true, None) => {}
-            (false, option) => cx.emit(PickerEvent::Picked(option)),
+    fn activate(&mut self, pick: Pick, cx: &mut Context<Self>) {
+        match pick {
+            Pick::Option(option) => match (self.multi, option) {
+                (true, Some(p)) => cx.emit(PickerEvent::Toggled(p)),
+                (true, None) => {}
+                (false, option) => cx.emit(PickerEvent::Picked(option)),
+            },
+            Pick::Action(Action::Rewrite(p)) => cx.emit(PickerEvent::Picked(Some(p))),
+            Pick::Action(Action::AdoptKey(provider)) => {
+                if let Some(key) = self.now.as_ref().and_then(|now| now.key.clone()) {
+                    cx.emit(PickerEvent::AdoptKey { provider, key });
+                }
+            }
+            Pick::Action(Action::SaveAs) => {
+                if let Some(draft) = self.now.as_ref().and_then(|now| now.draft.clone()) {
+                    cx.emit(PickerEvent::SaveAs(draft));
+                }
+            }
         }
     }
 
@@ -350,7 +505,9 @@ impl Picker {
                             cx.notify();
                         }
                     }))
-                    .on_click(cx.listener(move |this, _, _, cx| this.activate(option, cx)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.activate(Pick::Option(option), cx)),
+                    )
             })
             .when(self.multi, |row| row.child(ui::checkbox(t, checked)))
             .child(ui::logo(logo, 16., t, window, cx))
@@ -375,6 +532,89 @@ impl Picker {
                 row.child(ui::icon("check", 13., t.accent))
             })
     }
+
+    /// 「现在」那组的第一行：上面是胶囊上那几个字，下面一行小字是文件里的地址或 Key 差在哪。没有悬停、选不了。
+    fn now_row(&self, now: &Now, t: &Theme, window: &Window, cx: &App) -> Div {
+        div()
+            .h_flex()
+            .items_center()
+            .gap(px(9.))
+            .h(px(NOW_HEIGHT))
+            .px(px(8.))
+            .child(match now.logos.as_slice() {
+                [logo] => ui::logo(*logo, 16., t, window, cx),
+                logos => ui::logo_stack(logos, t, window, cx).into_any_element(),
+            })
+            .child(
+                div()
+                    .v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .child(now.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(t.muted)
+                            .child(now.sub.clone()),
+                    ),
+            )
+    }
+
+    /// 动作行：图标加一句话，强调色（预览 09 的 `.item.add`）。
+    fn action_row(
+        &self,
+        n: usize,
+        action: Action,
+        store: &Store,
+        t: &Theme,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let name_of = |p: usize| store.providers[p].name.clone();
+        let label: SharedString = match action {
+            Action::Rewrite(p) => t!("picker.rewrite", name = name_of(p)).into(),
+            Action::AdoptKey(p) => t!("picker.adopt_key", name = name_of(p)).into(),
+            Action::SaveAs => t!("picker.save_as").into(),
+        };
+        div()
+            .id(ElementId::named_usize("action", n))
+            .h_flex()
+            .items_center()
+            .gap(px(9.))
+            .h(px(34.))
+            .px(px(8.))
+            .rounded(px(7.))
+            .cursor_pointer()
+            .when(n == self.highlighted, |row| row.bg(t.sel))
+            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                if this.highlighted != n {
+                    this.highlighted = n;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.activate(Pick::Action(action), cx)))
+            .child(
+                div()
+                    .size(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(ui::icon(action.icon(), 13., t.accent)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.5))
+                    .text_color(t.accent)
+                    .child(label),
+            )
+    }
 }
 
 impl Render for Picker {
@@ -397,9 +637,14 @@ impl Render for Picker {
         for (n, row) in rows.iter().enumerate() {
             list = match row {
                 Row::Header(label) => list.child(ui::group_label(&t, label.clone())),
+                Row::Now => match &self.now {
+                    Some(now) => list.child(self.now_row(now, &t, window, cx)),
+                    None => list,
+                },
                 Row::Option { option, reason } => {
                     list.child(self.option_row(n, *option, reason.clone(), store, &t, window, cx))
                 }
+                Row::Action(action) => list.child(self.action_row(n, *action, store, &t, cx)),
             };
         }
         if rows.is_empty() {

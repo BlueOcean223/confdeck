@@ -45,6 +45,10 @@ pill:
   custom:
     en: "Custom · %{host}"
     zh-CN: "自定义 · %{host}"
+  # 没有地址可显示的接法（Bedrock、Vertex、Codex 内置的 ollama）。
+  custom_bare:
+    en: Custom
+    zh-CN: 自定义
   key_mismatch:
     en: "%{name} · key differs"
     zh-CN: "%{name} · Key 不一致"
@@ -151,6 +155,42 @@ picker:
   empty:
     en: No matching providers
     zh-CN: 没有匹配的供应商
+  # 配置不是 confdeck 写的时候（「自定义 · 主机名」「Key 不一致」），列表最上面的一组：
+  # 第一行写现在连到哪，下面挂着能做的动作（decisions「『自定义』的样子」）。有过滤词时不显示。
+  now:
+    en: Now · not written by confdeck
+    zh-CN: 现在 · 不是 confdeck 写的
+  # 「自定义」没有地址可显示时（Bedrock、Vertex、Codex 内置的 ollama）的小字；有地址时小字就是地址。
+  other_setup:
+    en: Bedrock, Vertex, a built-in provider or similar
+    zh-CN: Bedrock、Vertex、内置供应商这类接法
+  # 「Key 不一致」的小字，按文件里的凭据分：有 Key 但不一样、没写、由命令取、在环境变量里。
+  key_differs:
+    en: The file's key is not the one confdeck has
+    zh-CN: 文件里的 Key 和 confdeck 存的不一样
+  key_missing:
+    en: The file has no key in it
+    zh-CN: 文件里没写 Key
+  key_helper:
+    en: The key comes from a command; confdeck can't read it
+    zh-CN: Key 由命令取，confdeck 读不到
+  key_env:
+    en: Key is in $%{var}, not readable
+    zh-CN: Key 在环境变量 %{var} 里，读不到
+  # 动作行。
+  rewrite:
+    en: Rewrite with confdeck's key for %{name}
+    zh-CN: 用 confdeck 里 %{name} 的 Key 重写
+  adopt_key:
+    en: Save the file's key into %{name}
+    zh-CN: 把文件里的 Key 存进 %{name}
+  save_as:
+    en: Save the current setup as a provider…
+    zh-CN: 把当前配置存成供应商…
+  # 配置不是 confdeck 写的时候，供应商那组的标题多说一句。
+  group_backup:
+    en: Providers · picking one backs the file up first
+    zh-CN: 供应商 · 选一家会先备份再改写
 
 panel:
   open:
@@ -371,6 +411,16 @@ write:
   unchanged:
     en: " · the file already matched, nothing written"
     zh-CN: " · 文件本来就是这样，没有写"
+  # 「Key 不一致」时把文件里的 Key 存进这家：这个 agent 的文件不用写，别的在用这家的 agent 跟着换。
+  key_adopted:
+    en: "%{provider} now has the key from %{agent}'s config"
+    zh-CN: "%{provider} 的 Key 换成了 %{agent} 配置里的"
+  key_adopted_synced:
+    en: "%{provider} now has the key from %{agent}'s config · synced to %{agents}"
+    zh-CN: "%{provider} 的 Key 换成了 %{agent} 配置里的 · 同步到 %{agents}"
+  key_adopt_failed:
+    en: "Could not save the key into %{provider}: %{error}"
+    zh-CN: "没能把 Key 存进 %{provider}：%{error}"
   codex_catalog_skipped:
     en: "Codex model catalog not written (%{reason}): /model still lists GPT models and this provider's models get a 272K window"
     zh-CN: "Codex 的模型目录没写成（%{reason}）：/model 列的还是 GPT 模型，这家的模型按 272K 窗口算"

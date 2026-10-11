@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use confdeck_core::apply::Synced;
+use confdeck_core::provider::Provider;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -37,25 +38,31 @@ const TABS: &[(Tab, &str)] = &[
 
 /// 标签和当前语言的文案。
 fn tabs() -> Vec<(Tab, SharedString)> {
-    TABS.iter().map(|(tab, key)| (*tab, t!(*key).into())).collect()
+    TABS.iter()
+        .map(|(tab, key)| (*tab, t!(*key).into()))
+        .collect()
 }
 
-/// 主窗口的句柄。窗口关掉后句柄失效，再打开时会新建。
+/// 主窗口的句柄和里面的视图（窗口的根视图是 gpui-kit 的 `Root`，从它拿不到 `MainWindow`）。
+/// 窗口关掉后句柄失效，再打开时会新建。
 #[derive(Default)]
-struct MainWindowHandle(Option<AnyWindowHandle>);
+struct MainWindowHandle {
+    window: Option<AnyWindowHandle>,
+    view: Option<WeakEntity<MainWindow>>,
+}
 
 impl Global for MainWindowHandle {}
 
 /// 主窗口开着时返回它。
 #[cfg(debug_assertions)]
 pub fn handle(cx: &App) -> Option<AnyWindowHandle> {
-    cx.try_global::<MainWindowHandle>().and_then(|h| h.0)
+    cx.try_global::<MainWindowHandle>().and_then(|h| h.window)
 }
 
 /// 有主窗口就提到前台，没有就新开一个。
 pub fn show(store: Entity<Store>, cx: &mut App) {
     cx.activate(true);
-    let existing = cx.default_global::<MainWindowHandle>().0;
+    let existing = cx.default_global::<MainWindowHandle>().window;
     if let Some(handle) = existing
         && handle
             .update(cx, |_, window, _| window.activate_window())
@@ -64,12 +71,31 @@ pub fn show(store: Entity<Store>, cx: &mut App) {
         return;
     }
 
-    let (handle, _) =
-        gpui_kit::open_window(MainWindow::options(cx), cx, |window, cx| {
-            cx.new(|cx| MainWindow::new(store, window, cx))
+    let (handle, view) = gpui_kit::open_window(MainWindow::options(cx), cx, |window, cx| {
+        cx.new(|cx| MainWindow::new(store, window, cx))
+    })
+    .expect("failed to open main window");
+    *cx.global_mut::<MainWindowHandle>() = MainWindowHandle {
+        window: Some(handle),
+        view: Some(view.downgrade()),
+    };
+}
+
+/// 面板里点了「把当前配置存成供应商」：打开主窗口，盖上预先填好的新建表单；存好后把这个 agent 切过去。
+pub fn show_draft(store: Entity<Store>, agent: usize, draft: Provider, cx: &mut App) {
+    show(store, cx);
+    let global = cx.default_global::<MainWindowHandle>();
+    let (Some(handle), Some(main)) = (
+        global.window,
+        global.view.as_ref().and_then(WeakEntity::upgrade),
+    ) else {
+        return;
+    };
+    handle
+        .update(cx, |_, window, cx| {
+            main.update(cx, |main, cx| main.open_draft(agent, draft, window, cx));
         })
-        .expect("failed to open main window");
-    cx.global_mut::<MainWindowHandle>().0 = Some(handle);
+        .ok();
 }
 
 struct OpenPicker {
@@ -262,7 +288,11 @@ impl MainWindow {
                         t!("agents.show_more", count = hidden)
                     })
                     .child(ui::icon(
-                        if self.show_more { "chevron-up" } else { "chevron-down" },
+                        if self.show_more {
+                            "chevron-up"
+                        } else {
+                            "chevron-down"
+                        },
                         12.,
                         t.muted,
                     )),
@@ -280,24 +310,41 @@ impl MainWindow {
     fn open_picker(&mut self, agent: usize, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.clone();
         let picker = cx.new(|cx| Picker::new(store, agent, false, window, cx));
-        let _subscription = cx.subscribe(&picker, move |this, _, event: &PickerEvent, cx| {
-            match event {
-                // 选了就写；结果从 Store 的 Notice 事件来，不用等这里。
-                PickerEvent::Picked(option) => {
-                    let option = *option;
-                    this.store.update(cx, |s, cx| s.switch(agent, option, cx)).detach();
+        let _subscription = cx.subscribe_in(
+            &picker,
+            window,
+            move |this, _, event: &PickerEvent, window, cx| {
+                match event {
+                    // 选了就写；结果从 Store 的 Notice 事件来，不用等这里。
+                    PickerEvent::Picked(option) => {
+                        let option = *option;
+                        this.store
+                            .update(cx, |s, cx| s.switch(agent, option, cx))
+                            .detach();
+                    }
+                    // 勾一下写一次，浮层不关（提案 01）。
+                    PickerEvent::Toggled(provider) => {
+                        let provider = *provider;
+                        this.store
+                            .update(cx, |s, cx| s.toggle(agent, provider, cx))
+                            .detach();
+                        return;
+                    }
+                    PickerEvent::AdoptKey { provider, key } => {
+                        let (provider, key) = (*provider, key.clone());
+                        this.store
+                            .update(cx, |s, cx| s.adopt_key(agent, provider, key, cx))
+                            .detach();
+                    }
+                    PickerEvent::SaveAs(draft) => {
+                        this.open_draft(agent, draft.clone(), window, cx);
+                    }
+                    PickerEvent::Dismissed => {}
                 }
-                // 勾一下写一次，浮层不关（提案 01）。
-                PickerEvent::Toggled(provider) => {
-                    let provider = *provider;
-                    this.store.update(cx, |s, cx| s.toggle(agent, provider, cx)).detach();
-                    return;
-                }
-                PickerEvent::Dismissed => {}
-            }
-            this.picker = None;
-            cx.notify();
-        });
+                this.picker = None;
+                cx.notify();
+            },
+        );
         self.picker = Some(OpenPicker {
             agent,
             picker,
@@ -334,7 +381,12 @@ impl MainWindow {
                     .v_flex()
                     .flex_1()
                     .min_w_0()
-                    .child(div().font_weight(FontWeight::MEDIUM).truncate().child(agent.name))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .truncate()
+                            .child(agent.name),
+                    )
                     .child(
                         div()
                             .mt(px(1.))
@@ -352,9 +404,10 @@ impl MainWindow {
                         .child(ui::icon("chevron-right", 11., t.faint)),
                 )
                 .child(
+                    // 要放得下「DeepSeek · Key 不一致」（预览 09 的胶囊是 228）。
                     div()
                         .relative()
-                        .w(px(188.))
+                        .w(px(224.))
                         .child(
                             ui::select_pill(
                                 ElementId::named_usize("pick", i),
@@ -363,20 +416,23 @@ impl MainWindow {
                                 &logos,
                                 label,
                                 open.is_some(),
+                                store.pill_dashed(i),
                                 window,
                                 cx,
                             )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if this.just_closed == Some(i) {
-                                    return;
-                                }
-                                if this.picker.as_ref().is_some_and(|p| p.agent == i) {
-                                    this.picker = None;
-                                    cx.notify();
-                                } else {
-                                    this.open_picker(i, window, cx);
-                                }
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    if this.just_closed == Some(i) {
+                                        return;
+                                    }
+                                    if this.picker.as_ref().is_some_and(|p| p.agent == i) {
+                                        this.picker = None;
+                                        cx.notify();
+                                    } else {
+                                        this.open_picker(i, window, cx);
+                                    }
+                                },
+                            )),
                         )
                         .when_some(open, |d, open| {
                             d.child(ui::dropdown(
@@ -394,7 +450,12 @@ impl MainWindow {
             })
     }
 
-    fn providers_page(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn providers_page(
+        &self,
+        t: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let store = self.store.read(cx);
         let count = store.providers.len();
         let mut page = div().v_flex().gap(px(10.));
@@ -523,28 +584,33 @@ impl MainWindow {
                     )
                     // 在用的 agent 只画小图标，悬停显示「Claude Code · 模型名」，不响应点击（提案 10）。
                     .when(!users.is_empty(), |row| {
-                        row.child(div().h_flex().items_center().gap(px(6.)).mr(px(6.)).children(
-                            users.iter().map(|&a| {
-                                let agent = &store.agents[a];
-                                let tip = match store.model_for(a, i) {
-                                    Some(model) => format!("{} · {model}", agent.name),
-                                    None => agent.name.to_string(),
-                                };
-                                div()
-                                    .id(ElementId::Name(format!("user-{i}-{a}").into()))
-                                    .flex_none()
-                                    .size(px(20.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(5.))
-                                    .bg(t.card_2)
-                                    .border_1()
-                                    .border_color(t.line_2)
-                                    .tooltip(ui::tooltip(tip))
-                                    .child(ui::logo(agent.logo, 13., t, window, cx))
-                            }),
-                        ))
+                        row.child(
+                            div()
+                                .h_flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .mr(px(6.))
+                                .children(users.iter().map(|&a| {
+                                    let agent = &store.agents[a];
+                                    let tip = match store.model_for(a, i) {
+                                        Some(model) => format!("{} · {model}", agent.name),
+                                        None => agent.name.to_string(),
+                                    };
+                                    div()
+                                        .id(ElementId::Name(format!("user-{i}-{a}").into()))
+                                        .flex_none()
+                                        .size(px(20.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(5.))
+                                        .bg(t.card_2)
+                                        .border_1()
+                                        .border_color(t.line_2)
+                                        .tooltip(ui::tooltip(tip))
+                                        .child(ui::logo(agent.logo, 13., t, window, cx))
+                                })),
+                        )
                     })
                     .child(key_pill)
                     .child(ui::icon("chevron-right", 13., t.faint).ml(px(4.))),
@@ -565,7 +631,7 @@ impl MainWindow {
                     let store = this.store.clone();
                     let preset = *preset;
                     let editor = cx.new(|cx| Editor::create(store, preset, window, cx));
-                    this.show_editor(editor, cx);
+                    this.show_editor(editor, None, cx);
                 }
                 AddEvent::Closed => {
                     this.overlay = None;
@@ -588,14 +654,44 @@ impl MainWindow {
     ) {
         let store = self.store.clone();
         let editor = cx.new(|cx| Editor::edit(store, provider, window, cx));
-        self.show_editor(editor, cx);
+        self.show_editor(editor, None, cx);
     }
 
-    fn show_editor(&mut self, editor: Entity<Editor>, cx: &mut Context<Self>) {
-        let _subscription = cx.subscribe(&editor, |this, _, event: &EditorEvent, cx| {
+    /// 选择器里的「把当前配置存成供应商…」：按 agent 的配置文件预先填好的新建表单。
+    /// 存好后把这个 agent 切到新建的那家：文件里写了的不变，没写的槽位按目录补（core.md「存成供应商」）。
+    fn open_draft(
+        &mut self,
+        agent: usize,
+        draft: Provider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let editor = cx.new(|cx| Editor::from_draft(store, draft, window, cx));
+        self.show_editor(editor, Some(agent), cx);
+    }
+
+    fn show_editor(
+        &mut self,
+        editor: Entity<Editor>,
+        then_switch: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let _subscription = cx.subscribe(&editor, move |this, _, event: &EditorEvent, cx| {
             match event {
-                EditorEvent::Saved { name, synced } => {
+                EditorEvent::Saved { id, name, synced } => {
                     this.report("toast.saved", "toast.saved_synced", name, synced, cx);
+                    let saved = this
+                        .store
+                        .read(cx)
+                        .providers
+                        .iter()
+                        .position(|p| &p.id == id);
+                    if let (Some(agent), Some(provider)) = (then_switch, saved) {
+                        this.store
+                            .update(cx, |s, cx| s.switch(agent, Some(provider), cx))
+                            .detach();
+                    }
                 }
                 EditorEvent::Deleted { name, synced } => {
                     this.report("toast.deleted", "toast.deleted_synced", name, synced, cx);
@@ -629,14 +725,27 @@ impl MainWindow {
         let text = if written.is_empty() {
             t!(plain, name = name)
         } else {
-            t!(with_agents, agents = written.join(&t!("common.list_separator")))
+            t!(
+                with_agents,
+                agents = written.join(&t!("common.list_separator"))
+            )
         };
         self.toast(NoticeKind::Success, text.into(), cx);
         for failed in synced.iter().filter(|s| s.result.is_err()) {
-            let error = failed.result.as_ref().err().map(ToString::to_string).unwrap_or_default();
+            let error = failed
+                .result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default();
             self.toast(
                 NoticeKind::Error,
-                t!("toast.sync_failed", agent = failed.agent.to_string(), error = error).into(),
+                t!(
+                    "toast.sync_failed",
+                    agent = failed.agent.to_string(),
+                    error = error
+                )
+                .into(),
                 cx,
             );
         }
@@ -726,7 +835,11 @@ impl MainWindow {
                 .gap(px(8.))
                 .max_w(px(620.))
                 .pl(px(12.))
-                .pr(px(if toast.kind == NoticeKind::Error { 8. } else { 14. }))
+                .pr(px(if toast.kind == NoticeKind::Error {
+                    8.
+                } else {
+                    14.
+                }))
                 .py(px(9.))
                 .rounded(px(10.))
                 .bg(Hsla { a: 1., ..t.pop_bg })
@@ -829,7 +942,10 @@ mod tests {
         let backend = crate::_rust_i18n_backend();
         for (_, key) in TABS {
             for locale in LOCALES {
-                assert!(backend.translate(locale, key).is_some(), "{locale} is missing {key}");
+                assert!(
+                    backend.translate(locale, key).is_some(),
+                    "{locale} is missing {key}"
+                );
             }
         }
     }

@@ -71,9 +71,17 @@ pub fn list(t: &Theme, panel: bool) -> Div {
 pub fn row(t: &Theme, panel: bool, first: bool) -> Div {
     let row = div().h_flex().items_center().w_full();
     let row = if panel {
-        row.min_h(px(40.)).gap(px(9.)).pl(px(11.)).pr(px(9.)).py(px(5.))
+        row.min_h(px(40.))
+            .gap(px(9.))
+            .pl(px(11.))
+            .pr(px(9.))
+            .py(px(5.))
     } else {
-        row.min_h(px(48.)).gap(px(12.)).pl(px(14.)).pr(px(12.)).py(px(7.))
+        row.min_h(px(48.))
+            .gap(px(12.))
+            .pl(px(14.))
+            .pr(px(12.))
+            .py(px(7.))
     };
     if first {
         row
@@ -94,16 +102,25 @@ pub fn select_pill(
     logos: &[Logo],
     label: impl Into<SharedString>,
     open: bool,
+    dashed: bool,
     window: &Window,
     cx: &App,
 ) -> Stateful<Div> {
     let hover = t.pill_hover;
     let edge = if open {
         t.accent
-    } else if panel {
+    } else if panel || dashed {
         t.pill_line
     } else {
         gpui_kit::transparent_black()
+    };
+    // 「自定义」：虚线边框、不垫底色，一眼看出不是 confdeck 写的（预览 09 的 `.pill.custom`）。
+    let bg = if open {
+        t.pill_hover
+    } else if dashed {
+        gpui_kit::transparent_black()
+    } else {
+        t.pill
     };
     div()
         .id(id)
@@ -116,7 +133,8 @@ pub fn select_pill(
         .rounded(px(6.))
         .border_1()
         .border_color(edge)
-        .bg(if open { t.pill_hover } else { t.pill })
+        .when(dashed, |pill| pill.border_dashed())
+        .bg(bg)
         .when(panel, |pill| pill.shadow(t.pill_shadow()))
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
@@ -351,7 +369,11 @@ pub fn button(id: impl Into<ElementId>, t: &Theme, kind: Button) -> Stateful<Div
     let (bg, fg, hover_bg) = match kind {
         Button::Primary => (t.accent, on_accent, t.accent.opacity(0.85)),
         Button::Secondary => (t.pill, t.fg, t.pill_hover),
-        Button::Danger => (gpui_kit::transparent_black(), t.danger, t.danger.opacity(0.1)),
+        Button::Danger => (
+            gpui_kit::transparent_black(),
+            t.danger,
+            t.danger.opacity(0.1),
+        ),
     };
     div()
         .id(id)
@@ -397,7 +419,12 @@ pub fn field(
                 .min_w_0()
                 .text_size(px(12.5))
                 .when(mono, |d| d.font_family("Menlo"))
-                .child(Input::new(state).appearance(false).xsmall().text_size(px(12.5))),
+                .child(
+                    Input::new(state)
+                        .appearance(false)
+                        .xsmall()
+                        .text_size(px(12.5)),
+                ),
         )
         .children(suffix)
 }

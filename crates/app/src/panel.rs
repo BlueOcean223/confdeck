@@ -56,7 +56,9 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
         .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
 
     if let Some(handle) = open
-        && handle.update(cx, |_, window, _| window.remove_window()).is_ok()
+        && handle
+            .update(cx, |_, window, _| window.remove_window())
+            .is_ok()
     {
         return;
     }
@@ -84,7 +86,9 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     // 和 Wails 一样先激活应用再显示面板。不激活的话，应用在后台、主窗口又开着时，
     // gpui 为绕开 Cocoa 的一个问题会立刻收走面板刚拿到的焦点，接着 AppKit 抛异常崩溃。
     cx.activate(true);
-    match cx.open_window(options, |window, cx| cx.new(|cx| Panel::new(store, window, cx))) {
+    match cx.open_window(options, |window, cx| {
+        cx.new(|cx| Panel::new(store, window, cx))
+    }) {
         Ok(handle) => cx.global_mut::<PanelState>().handle = Some(handle),
         Err(err) => eprintln!("failed to open panel: {err:#}"),
     }
@@ -182,7 +186,13 @@ impl Panel {
         }
     }
 
-    fn open_picker(&mut self, agent: usize, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_picker(
+        &mut self,
+        agent: usize,
+        row: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let store = self.store.clone();
         let picker = cx.new(|cx| Picker::new(store, agent, true, window, cx));
         let _subscriptions = vec![
@@ -195,15 +205,21 @@ impl Panel {
                         PickerEvent::Picked(option) => {
                             let option = *option;
                             let write = this.store.update(cx, |s, cx| s.switch(agent, option, cx));
-                            cx.spawn(async move |this, cx| {
-                                let notices = write.await;
-                                this.update(cx, |panel, cx| {
-                                    panel.status = notices.into_iter().next();
-                                    cx.notify();
-                                })
-                                .ok();
-                            })
-                            .detach();
+                            this.show_result(write, cx);
+                        }
+                        PickerEvent::AdoptKey { provider, key } => {
+                            let (provider, key) = (*provider, key.clone());
+                            let write = this
+                                .store
+                                .update(cx, |s, cx| s.adopt_key(agent, provider, key, cx));
+                            this.show_result(write, cx);
+                        }
+                        // 表单在主窗口里：关掉面板，打开主窗口盖上预先填好的表单。
+                        PickerEvent::SaveAs(draft) => {
+                            let draft = draft.clone();
+                            close(window, cx);
+                            main_window::show_draft(this.store.clone(), agent, draft, cx);
+                            return;
                         }
                         // 面板里没有多选 agent，不会收到。
                         PickerEvent::Toggled(_) => return,
@@ -213,7 +229,9 @@ impl Panel {
                 },
             ),
             // 过滤后选项变少，窗口跟着缩短。
-            cx.observe_in(&picker, window, |this, _, window, cx| this.fit_height(window, cx)),
+            cx.observe_in(&picker, window, |this, _, window, cx| {
+                this.fit_height(window, cx)
+            }),
         ];
         self.picker = Some(OpenPicker {
             agent,
@@ -223,6 +241,19 @@ impl Panel {
         });
         self.fit_height(window, cx);
         cx.notify();
+    }
+
+    /// 写完把第一句话放到底栏。
+    fn show_result(&mut self, write: Task<Vec<Notice>>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let notices = write.await;
+            this.update(cx, |panel, cx| {
+                panel.status = notices.into_iter().next();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -250,12 +281,12 @@ impl Panel {
             .child(div().flex_1())
             .child(ui::icon_button("refresh", t, "rotate-cw"))
             .child(
-                ui::icon_button("open-main", t, "square-arrow-out-up-right").on_click(
-                    cx.listener(move |_, _, window, cx| {
+                ui::icon_button("open-main", t, "square-arrow-out-up-right").on_click(cx.listener(
+                    move |_, _, window, cx| {
                         close(window, cx);
                         main_window::show(store.clone(), cx);
-                    }),
-                ),
+                    },
+                )),
             )
             .child(ui::icon_button("settings", t, "settings"))
     }
@@ -293,19 +324,20 @@ impl Panel {
                         &logos,
                         label,
                         open,
+                        store.pill_dashed(i),
                         window,
                         cx,
                     )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if this.just_closed == Some(i) {
-                                return;
-                            }
-                            if this.picker.as_ref().is_some_and(|p| p.agent == i) {
-                                this.close_picker(window, cx);
-                            } else {
-                                this.open_picker(i, n, window, cx);
-                            }
-                        })),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.just_closed == Some(i) {
+                            return;
+                        }
+                        if this.picker.as_ref().is_some_and(|p| p.agent == i) {
+                            this.close_picker(window, cx);
+                        } else {
+                            this.open_picker(i, n, window, cx);
+                        }
+                    })),
                 ),
             )
     }
@@ -337,7 +369,13 @@ impl Panel {
                 .text_size(px(11.5))
                 .text_color(text_color)
                 .child(ui::icon(icon, 12., color))
-                .child(div().flex_1().min_w_0().truncate().child(notice.text.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(notice.text.clone()),
+                )
                 .tooltip(ui::tooltip(notice.text.clone())),
         )
     }
@@ -351,7 +389,11 @@ fn close(window: &mut Window, cx: &mut App) {
     state.closed_at = Some(Instant::now());
     let handle = window.window_handle();
     cx.spawn(async move |cx| {
-        cx.update(|cx| handle.update(cx, |_, window, _| window.remove_window()).ok());
+        cx.update(|cx| {
+            handle
+                .update(cx, |_, window, _| window.remove_window())
+                .ok()
+        });
     })
     .detach();
 }
