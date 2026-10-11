@@ -9,7 +9,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::add_provider::{AddEvent, AddProvider};
-use crate::data::{self, Store};
+use crate::data::{self, Notice, NoticeKind, Store};
 use crate::editor::{Editor, EditorEvent};
 use crate::picker::{Picker, PickerEvent};
 use crate::theme::Theme;
@@ -90,17 +90,9 @@ enum Overlay {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ToastKind {
-    /// 几秒后自己消失。
-    Success,
-    /// 留着，点 × 才关（写失败的要让人看见）。
-    Error,
-}
-
 struct Toast {
     id: u64,
-    kind: ToastKind,
+    kind: NoticeKind,
     text: SharedString,
 }
 
@@ -128,6 +120,10 @@ impl MainWindow {
     fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let _subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
+            // 写了文件（这个窗口、面板或启动时的后台任务）都从这里收到一句话，做成提示条。
+            cx.subscribe(&store, |this, _, notice: &Notice, cx| {
+                this.toast(notice.kind, notice.text.clone(), cx)
+            }),
             cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
         ];
         Self {
@@ -286,14 +282,15 @@ impl MainWindow {
         let picker = cx.new(|cx| Picker::new(store, agent, false, window, cx));
         let _subscription = cx.subscribe(&picker, move |this, _, event: &PickerEvent, cx| {
             match event {
+                // 选了就写；结果从 Store 的 Notice 事件来，不用等这里。
                 PickerEvent::Picked(option) => {
                     let option = *option;
-                    this.store.update(cx, |s, cx| s.set_provider(agent, option, cx));
+                    this.store.update(cx, |s, cx| s.switch(agent, option, cx)).detach();
                 }
                 // 勾一下写一次，浮层不关（提案 01）。
                 PickerEvent::Toggled(provider) => {
                     let provider = *provider;
-                    this.store.update(cx, |s, cx| s.toggle_provider(agent, provider, cx));
+                    this.store.update(cx, |s, cx| s.toggle(agent, provider, cx)).detach();
                     return;
                 }
                 PickerEvent::Dismissed => {}
@@ -634,22 +631,22 @@ impl MainWindow {
         } else {
             t!(with_agents, agents = written.join(&t!("common.list_separator")))
         };
-        self.toast(ToastKind::Success, text.into(), cx);
+        self.toast(NoticeKind::Success, text.into(), cx);
         for failed in synced.iter().filter(|s| s.result.is_err()) {
             let error = failed.result.as_ref().err().map(ToString::to_string).unwrap_or_default();
             self.toast(
-                ToastKind::Error,
+                NoticeKind::Error,
                 t!("toast.sync_failed", agent = failed.agent.to_string(), error = error).into(),
                 cx,
             );
         }
     }
 
-    fn toast(&mut self, kind: ToastKind, text: SharedString, cx: &mut Context<Self>) {
+    fn toast(&mut self, kind: NoticeKind, text: SharedString, cx: &mut Context<Self>) {
         self.toast_seq += 1;
         let id = self.toast_seq;
         self.toasts.push(Toast { id, kind, text });
-        if kind == ToastKind::Success {
+        if kind == NoticeKind::Success {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(TOAST_LIFETIME).await;
                 this.update(cx, |this, cx| this.dismiss_toast(id, cx)).ok();
@@ -719,8 +716,8 @@ impl MainWindow {
         let toasts = self.toasts.iter().map(|toast| {
             let id = toast.id;
             let (icon, color) = match toast.kind {
-                ToastKind::Success => ("circle-check", t.success),
-                ToastKind::Error => ("circle-alert", t.danger),
+                NoticeKind::Success => ("circle-check", t.success),
+                NoticeKind::Error => ("circle-alert", t.danger),
             };
             div()
                 .id(ElementId::NamedInteger("toast".into(), id))
@@ -729,7 +726,7 @@ impl MainWindow {
                 .gap(px(8.))
                 .max_w(px(620.))
                 .pl(px(12.))
-                .pr(px(if toast.kind == ToastKind::Error { 8. } else { 14. }))
+                .pr(px(if toast.kind == NoticeKind::Error { 8. } else { 14. }))
                 .py(px(9.))
                 .rounded(px(10.))
                 .bg(Hsla { a: 1., ..t.pop_bg })
@@ -742,7 +739,7 @@ impl MainWindow {
                 .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx)))
                 .child(ui::icon(icon, 15., color))
                 .child(div().min_w_0().child(toast.text.clone()))
-                .when(toast.kind == ToastKind::Error, |d| {
+                .when(toast.kind == NoticeKind::Error, |d| {
                     d.child(ui::icon("x", 13., t.muted).ml(px(4.)))
                 })
                 .with_animation(

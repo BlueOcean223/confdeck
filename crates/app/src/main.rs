@@ -44,6 +44,8 @@ fn main() {
             let (data, home) = locations();
             let store = cx.new(|_| Store::load(data, home));
             main_window::show(store.clone(), cx);
+            // Codex 升级以后模型目录里的提示词要跟着换；每次启动在后台对一遍，内容一样就不写。
+            store.update(cx, |store, cx| store.refresh_codex_catalog(cx));
             tray::install(store, cx).expect("failed to create tray icon");
             #[cfg(debug_assertions)]
             drive::start(cx);

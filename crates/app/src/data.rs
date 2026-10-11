@@ -2,16 +2,18 @@
 //! 从它的配置文件里认出来（`current`）。agent 的清单在这里写死：core 里有适配器的五个能选供应商，
 //! 其余三个（阶段 7）只列出来。
 //!
-//! 选择器里选了一家现在只改内存，不写文件（plan「主窗口和菜单栏面板接上 `apply`」是下一步）；
-//! 供应商保存、删除以后会重新读一遍，内存里的选择会被文件里的实际状态盖掉。
+//! 选了一家就写文件（`switch` / `toggle`）：写在后台线程，写完按文件重读一遍，内存里先改的胶囊会被
+//! 文件里的实际状态盖掉；写了什么、有没有备份、失败的原因做成 [`Notice`] 事件发出去，主窗口做成提示条，面板写在底栏。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use confdeck_core::agent::codex::catalog::Skipped;
 use confdeck_core::agent::{self, AgentKind, Mode};
-use confdeck_core::apply::{self, Synced, UsedBy};
+use confdeck_core::apply::{self, ApplyError, Switched, Synced, UsedBy};
 use confdeck_core::current::{self, Current};
 use confdeck_core::data::DataDir;
-use confdeck_core::engine::Engine;
+use confdeck_core::engine::{Engine, LiveFile, Outcome};
 use confdeck_core::preset;
 use confdeck_core::provider::{self, Protocol, Provider};
 use confdeck_core::store::{self, StoreError};
@@ -186,8 +188,40 @@ pub enum Unusable {
     NoKey,
 }
 
+/// 写完文件给人看的一句话。`Store` 把它当事件发出去，谁订阅谁显示：主窗口做成底部提示条，面板写在底栏。
+#[derive(Clone, Debug)]
+pub struct Notice {
+    pub kind: NoticeKind,
+    pub text: SharedString,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    /// 几秒后自己消失。
+    Success,
+    /// 留着，点 × 才关（写失败的要让人看见）。
+    Error,
+}
+
+impl Notice {
+    fn ok(text: impl Into<SharedString>) -> Self {
+        Self {
+            kind: NoticeKind::Success,
+            text: text.into(),
+        }
+    }
+
+    fn err(text: impl Into<SharedString>) -> Self {
+        Self {
+            kind: NoticeKind::Error,
+            text: text.into(),
+        }
+    }
+}
+
 pub struct Store {
-    engine: Engine,
+    /// 写文件在后台线程，和界面线程共用一个引擎（进程内的锁才管用）。
+    engine: Arc<Engine>,
     home: PathBuf,
     pub providers: Vec<Provider>,
     pub agents: Vec<Agent>,
@@ -195,11 +229,13 @@ pub struct Store {
     pub load_error: Option<String>,
 }
 
+impl EventEmitter<Notice> for Store {}
+
 impl Store {
     /// 读数据目录和各 agent 的配置文件。
     pub fn load(data: DataDir, home: PathBuf) -> Self {
         let mut store = Self {
-            engine: Engine::new(data),
+            engine: Arc::new(Engine::new(data)),
             home,
             providers: Vec::new(),
             agents: Vec::new(),
@@ -307,28 +343,208 @@ impl Store {
             .any(|p| p.preset.as_deref() == Some(preset_id))
     }
 
-    /// 单选 agent 换一家（`None` 是「默认」）。只改内存，见模块注释。
-    pub fn set_provider(&mut self, agent: usize, provider: Option<usize>, cx: &mut Context<Self>) {
-        let agent = &mut self.agents[agent];
-        agent.selection = Selection::Single(provider);
-        agent.current = Some(match provider {
-            Some(p) => Current::Provider(self.providers[p].id.clone()),
+    /// 单选 agent 换一家（`None` 是「默认」）：在后台写文件，写完按文件重读一遍，提示发给订阅者，也返回给调用的窗口。
+    /// 胶囊先改过来，不等写完；写失败了重读会把它退回文件里的实际状态。
+    pub fn switch(
+        &mut self,
+        agent: usize,
+        provider: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> Task<Vec<Notice>> {
+        let Some(kind) = self.agents[agent].kind else {
+            return Task::ready(Vec::new());
+        };
+        let picked = provider.map(|p| self.providers[p].clone());
+        let name = picked.as_ref().map(|p| p.name.clone());
+        let row = &mut self.agents[agent];
+        row.selection = Selection::Single(provider);
+        row.current = Some(match &picked {
+            Some(p) => Current::Provider(p.id.clone()),
             None => Current::Default,
         });
-        agent.chosen = true;
+        row.chosen = true;
+        cx.notify();
+
+        let engine = self.engine.clone();
+        let home = self.home.clone();
+        let write = cx
+            .background_executor()
+            .spawn(async move { apply::switch(&engine, &home, kind, picked.as_ref()) });
+        cx.spawn(async move |this, cx| {
+            let result = write.await;
+            this.update(cx, |store, cx| {
+                store.reload();
+                let notices = store.describe_switch(kind, name, result);
+                store.announce(&notices, cx);
+                notices
+            })
+            .unwrap_or_default()
+        })
+    }
+
+    /// 多选 agent 勾上或取消一家：和 [`Self::switch`] 一样，勾选框先改、后台写、写完重读。
+    pub fn toggle(&mut self, agent: usize, provider: usize, cx: &mut Context<Self>) -> Task<Vec<Notice>> {
+        let Some(kind) = self.agents[agent].kind else {
+            return Task::ready(Vec::new());
+        };
+        let Selection::Multi(enabled) = &mut self.agents[agent].selection else {
+            return Task::ready(Vec::new());
+        };
+        let enabling = !enabled.contains(&provider);
+        if enabling {
+            enabled.push(provider);
+        } else {
+            enabled.retain(|&p| p != provider);
+        }
+        cx.notify();
+
+        let picked = self.providers[provider].clone();
+        let name = picked.name.clone();
+        let engine = self.engine.clone();
+        let home = self.home.clone();
+        let write = cx.background_executor().spawn(async move {
+            if enabling {
+                apply::enable(&engine, &home, kind, &picked)
+            } else {
+                apply::disable(&engine, &home, kind, &picked.id)
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = write.await;
+            this.update(cx, |store, cx| {
+                store.reload();
+                let notices = store.describe_toggle(kind, name, enabling, result);
+                store.announce(&notices, cx);
+                notices
+            })
+            .unwrap_or_default()
+        })
+    }
+
+    /// 启动时在后台按本机的 Codex 重写模型目录（core 的 `refresh_codex_catalog`）：
+    /// 重写了、没写成都说一声，不用写就不吭声。
+    pub fn refresh_codex_catalog(&self, cx: &mut Context<Self>) {
+        let engine = self.engine.clone();
+        let home = self.home.clone();
+        let providers = self.providers.clone();
+        let refresh = cx
+            .background_executor()
+            .spawn(async move { apply::refresh_codex_catalog(&engine, &home, &providers) });
+        cx.spawn(async move |this, cx| {
+            let result = refresh.await;
+            this.update(cx, |store, cx| {
+                let notice = match result {
+                    Ok(Some(Ok(outcome))) if outcome.changed => {
+                        let file = apply::live_files(&store.home, AgentKind::Codex)
+                            .last()
+                            .map(|file| store.tilde(&file.path))
+                            .unwrap_or_default();
+                        Some(Notice::ok(t!("write.codex_catalog_refreshed", file = file)))
+                    }
+                    Ok(Some(Err(skipped))) => Some(Notice::err(t!(
+                        "write.codex_catalog_refresh_failed",
+                        reason = describe_skipped(skipped)
+                    ))),
+                    Err(err) => Some(Notice::err(t!(
+                        "write.codex_catalog_refresh_failed",
+                        reason = err.to_string()
+                    ))),
+                    _ => None,
+                };
+                if let Some(notice) = notice {
+                    store.announce(&[notice], cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn describe_switch(
+        &self,
+        kind: AgentKind,
+        name: Option<String>,
+        result: Result<Switched, ApplyError>,
+    ) -> Vec<Notice> {
+        let agent = kind.to_string();
+        let switched = match result {
+            Ok(switched) => switched,
+            Err(err) => return vec![Notice::err(t!("toast.sync_failed", agent = agent, error = err.to_string()))],
+        };
+        let files = apply::live_files(&self.home, kind);
+        let mut outcomes = vec![switched.outcome];
+        if let Some(Ok(catalog)) = &switched.catalog {
+            outcomes.push(catalog.clone());
+        }
+        let headline = match name {
+            Some(name) => t!("write.switched", agent = agent, provider = name),
+            None => t!("write.restored", agent = agent),
+        };
+        let mut notices = vec![Notice::ok(format!("{headline}{}", self.file_note(&files, &outcomes)))];
+        // Codex 的模型目录没写成：config.toml 已经切过去了，但 `/model` 列的还是 GPT 模型，要说一声。
+        if let Some(Err(skipped)) = switched.catalog {
+            notices.push(Notice::err(t!("write.codex_catalog_skipped", reason = describe_skipped(skipped))));
+        }
+        notices
+    }
+
+    fn describe_toggle(
+        &self,
+        kind: AgentKind,
+        name: String,
+        enabling: bool,
+        result: Result<Outcome, ApplyError>,
+    ) -> Vec<Notice> {
+        let agent = kind.to_string();
+        match result {
+            Ok(outcome) => {
+                let headline = if enabling {
+                    t!("write.enabled", agent = agent, provider = name)
+                } else {
+                    t!("write.disabled", agent = agent, provider = name)
+                };
+                let files = apply::live_files(&self.home, kind);
+                vec![Notice::ok(format!("{headline}{}", self.file_note(&files, &[outcome])))]
+            }
+            Err(err) => vec![Notice::err(t!("toast.sync_failed", agent = agent, error = err.to_string()))],
+        }
+    }
+
+    /// 提示的后半句「 · 写了 ~/.claude/settings.json，先备份了」：只说实际写了的文件。
+    fn file_note(&self, files: &[LiveFile], outcomes: &[Outcome]) -> String {
+        let written: Vec<(String, bool)> = files
+            .iter()
+            .zip(outcomes)
+            .filter(|(_, outcome)| outcome.changed)
+            .map(|(file, outcome)| (self.tilde(&file.path), outcome.backup.is_some()))
+            .collect();
+        if written.is_empty() {
+            return t!("write.unchanged").into_owned();
+        }
+        let names = written
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(&t!("common.list_separator"));
+        if written.iter().any(|(_, backup)| *backup) {
+            t!("write.wrote_backup", files = names).into_owned()
+        } else {
+            t!("write.wrote", files = names).into_owned()
+        }
+    }
+
+    fn announce(&self, notices: &[Notice], cx: &mut Context<Self>) {
+        for notice in notices {
+            cx.emit(notice.clone());
+        }
         cx.notify();
     }
 
-    /// 多选 agent 勾上或取消一家。只改内存，见模块注释。
-    pub fn toggle_provider(&mut self, agent: usize, provider: usize, cx: &mut Context<Self>) {
-        if let Selection::Multi(enabled) = &mut self.agents[agent].selection {
-            match enabled.iter().position(|&p| p == provider) {
-                Some(at) => {
-                    enabled.remove(at);
-                }
-                None => enabled.push(provider),
-            }
-            cx.notify();
+    /// 家目录下的路径写成 `~/…`。
+    pub fn tilde(&self, path: &Path) -> String {
+        match path.strip_prefix(&self.home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
         }
     }
 
@@ -390,6 +606,8 @@ impl Store {
                     let logos = found.map(logo).into_iter().collect();
                     (logos, t!("pill.key_mismatch", name = name).into())
                 }
+                // 配置文件解析不了：不能冒充「默认」，选一家时的报错会说明哪一行坏了。
+                None if agent.selectable() => (vec![agent.logo], t!("pill.unreadable").into()),
                 _ => (vec![agent.logo], t!("common.default").into()),
             },
             Selection::Multi(enabled) if enabled.is_empty() => {
@@ -412,6 +630,15 @@ impl Store {
         (0..self.agents.len())
             .filter(|&a| self.is_enabled(a, provider))
             .collect()
+    }
+}
+
+/// Codex 模型目录没生成出来的原因，按界面语言说（core 的 `Skipped` 只有中文）。
+fn describe_skipped(skipped: Skipped) -> std::borrow::Cow<'static, str> {
+    match skipped {
+        Skipped::NotFound => t!("codex.not_found"),
+        Skipped::Failed => t!("codex.failed"),
+        Skipped::NoTemplate => t!("codex.no_template"),
     }
 }
 

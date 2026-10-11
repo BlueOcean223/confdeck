@@ -48,6 +48,10 @@ pill:
   key_mismatch:
     en: "%{name} · key differs"
     zh-CN: "%{name} · Key 不一致"
+  # 配置文件解析不了，认不出连的是哪家。
+  unreadable:
+    en: Config unreadable
+    zh-CN: 配置读不了
 
 agents:
   show_more:
@@ -343,6 +347,51 @@ toast:
   sync_failed:
     en: "%{agent} was not written: %{error}"
     zh-CN: "%{agent} 没写成：%{error}"
+
+# 选了一家以后的提示（主窗口的提示条、面板的底栏）：前半句说换成了什么，后半句接着说写了哪个文件。
+write:
+  switched:
+    en: "%{agent} now uses %{provider}"
+    zh-CN: "%{agent} 已切到 %{provider}"
+  restored:
+    en: "%{agent} is back to its own login"
+    zh-CN: "%{agent} 已还原成默认"
+  enabled:
+    en: "%{provider} added to %{agent}"
+    zh-CN: "%{agent} 勾上了 %{provider}"
+  disabled:
+    en: "%{provider} removed from %{agent}"
+    zh-CN: "%{agent} 去掉了 %{provider}"
+  wrote:
+    en: " · wrote %{files}"
+    zh-CN: " · 写了 %{files}"
+  wrote_backup:
+    en: " · wrote %{files}, backed up first"
+    zh-CN: " · 写了 %{files}，先备份了"
+  unchanged:
+    en: " · the file already matched, nothing written"
+    zh-CN: " · 文件本来就是这样，没有写"
+  codex_catalog_skipped:
+    en: "Codex model catalog not written (%{reason}): /model still lists GPT models and this provider's models get a 272K window"
+    zh-CN: "Codex 的模型目录没写成（%{reason}）：/model 列的还是 GPT 模型，这家的模型按 272K 窗口算"
+  codex_catalog_refreshed:
+    en: "Codex model catalog rewritten for the installed Codex (%{file})"
+    zh-CN: "按本机的 Codex 重写了模型目录（%{file}）"
+  codex_catalog_refresh_failed:
+    en: "Could not refresh the Codex model catalog: %{reason}. The old one still works"
+    zh-CN: "没能按本机的 Codex 重写模型目录：%{reason}。旧目录照样能用"
+
+# Codex 模型目录没生成出来的三种原因（core 的 `Skipped`），填进上面 write.codex_* 的 %{reason}。
+codex:
+  not_found:
+    en: codex was not found
+    zh-CN: 没找到 codex
+  failed:
+    en: "`codex debug models --bundled` did not run"
+    zh-CN: "codex debug models --bundled 没跑成"
+  no_template:
+    en: none of Codex's built-in models can serve as a template
+    zh-CN: Codex 内置的模型里挑不出能照着写的
 
 # 添加供应商的预设卡片表。
 add:

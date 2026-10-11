@@ -8,7 +8,7 @@ use gpui_kit::component::*;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::Store;
+use crate::data::{Notice, NoticeKind, Store};
 use crate::main_window;
 use crate::picker::{Picker, PickerEvent};
 use crate::theme::Theme;
@@ -124,6 +124,8 @@ pub struct Panel {
     focus_handle: FocusHandle,
     picker: Option<OpenPicker>,
     just_closed: Option<usize>,
+    /// 最近一次写文件的结果，显示在底栏左边，直到下一次写或面板关掉。
+    status: Option<Notice>,
     /// 窗口现在的高度，没变就不去改原生窗口。
     height: f32,
     _subscriptions: Vec<Subscription>,
@@ -157,6 +159,7 @@ impl Panel {
             focus_handle,
             picker: None,
             just_closed: None,
+            status: None,
             height,
             _subscriptions,
         }
@@ -188,9 +191,19 @@ impl Panel {
                 window,
                 move |this, _, event: &PickerEvent, window, cx| {
                     match event {
+                        // 选了就写。写完的那句话放到底栏；主窗口开着的话它自己也会收到。
                         PickerEvent::Picked(option) => {
                             let option = *option;
-                            this.store.update(cx, |s, cx| s.set_provider(agent, option, cx));
+                            let write = this.store.update(cx, |s, cx| s.switch(agent, option, cx));
+                            cx.spawn(async move |this, cx| {
+                                let notices = write.await;
+                                this.update(cx, |panel, cx| {
+                                    panel.status = notices.into_iter().next();
+                                    cx.notify();
+                                })
+                                .ok();
+                            })
+                            .detach();
                         }
                         // 面板里没有多选 agent，不会收到。
                         PickerEvent::Toggled(_) => return,
@@ -298,6 +311,38 @@ impl Panel {
     }
 }
 
+impl Panel {
+    /// 底栏左边：最近一次写文件的结果，一行放不下就截断，悬停看全文。
+    fn status_line(&self, t: &Theme) -> Div {
+        let slot = div().flex_1().min_w_0().h(px(LINKS));
+        let Some(notice) = &self.status else {
+            return slot;
+        };
+        let (icon, color) = match notice.kind {
+            NoticeKind::Success => ("circle-check", t.success),
+            NoticeKind::Error => ("circle-alert", t.danger),
+        };
+        let text_color = match notice.kind {
+            NoticeKind::Success => t.muted,
+            NoticeKind::Error => t.danger,
+        };
+        slot.child(
+            div()
+                .id("status")
+                .h_flex()
+                .items_center()
+                .gap(px(5.))
+                .pl(px(4.))
+                .h_full()
+                .text_size(px(11.5))
+                .text_color(text_color)
+                .child(ui::icon(icon, 12., color))
+                .child(div().flex_1().min_w_0().truncate().child(notice.text.clone()))
+                .tooltip(ui::tooltip(notice.text.clone())),
+        )
+    }
+}
+
 /// 关掉面板。不能在 AppKit 的窗口回调（比如失焦）里同步关窗口，会抛 NSRangeException
 /// 让整个应用崩溃，所以放到下一轮主线程任务里关。
 fn close(window: &mut Window, cx: &mut App) {
@@ -365,9 +410,10 @@ impl Render for Panel {
                     .child(
                         div()
                             .h_flex()
-                            .justify_end()
+                            .items_center()
                             .gap(px(16.))
                             .pr(px(4.))
+                            .child(self.status_line(&t))
                             .child(
                                 ui::text_button("open", &t)
                                     .child(t!("panel.open"))
