@@ -17,6 +17,7 @@ use confdeck_core::engine::{Engine, EngineError, LiveFile, Outcome, Snapshot};
 use confdeck_core::preset;
 use confdeck_core::provider::{self, Protocol, Provider};
 use confdeck_core::store::{self, StoreError};
+use confdeck_core::toggles::ClaudeToggle;
 use gpui_kit::*;
 use rust_i18n::t;
 
@@ -393,6 +394,35 @@ impl Store {
             })
             .ok();
         })
+    }
+
+    /// 设置页 › Claude Code 的一个开关现在是开是关。文件不存在、键不在按默认；文件读不了也先按默认显示，
+    /// 点的时候才报错。
+    pub fn claude_toggle(&self, toggle: ClaudeToggle) -> bool {
+        toggle
+            .read(&self.engine, &self.home)
+            .unwrap_or_else(|_| toggle.default_on())
+    }
+
+    /// 开关写的是哪个文件，`~/…` 的写法（行里的小字）。
+    pub fn claude_toggle_path(&self, toggle: ClaudeToggle) -> String {
+        self.tilde(&toggle.file(&self.home).path)
+    }
+
+    /// 设置页点了一个开关：写那个文件（就改一个键，当场写完），写了说一句「Claude Code 已更新」，没写成报错。
+    pub fn set_claude_toggle(&mut self, toggle: ClaudeToggle, on: bool, cx: &mut Context<Self>) {
+        let agent = AgentKind::ClaudeCode.to_string();
+        let notice = match toggle.set(&self.engine, &self.home, on) {
+            Ok(outcome) if outcome.changed => Some(Notice::ok(t!("write.updated", agent = agent))),
+            Ok(_) => None,
+            Err(err) => Some(Notice::err(t!(
+                "toast.sync_failed",
+                agent = agent,
+                error = err.to_string()
+            ))),
+        };
+        self.reload();
+        self.announce(notice.as_slice(), cx);
     }
 
     /// 胶囊画成虚线边框：文件连的和列表里哪家都对不上（decisions「『自定义』的样子」）。

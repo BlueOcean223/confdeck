@@ -11,6 +11,7 @@
 //! - [`apply`]：把上面串起来，「把这家供应商写进这个 agent」；改了、删了供应商以后更新在用它的 agent。
 //! - [`current`]：认出 agent 现在用的是哪家（单选连的哪家，多选勾了哪几家），只有 Key 不一样的算「Key 不一致」，
 //!   对不上的算「自定义」，可以拼成一家新供应商。
+//! - [`toggles`]：设一次就不动的开关（跳过首次确认、VS Code 插件跟着切换、署名），和供应商无关，按键补丁直接写。
 //! - [`backup`]、[`data`]、[`fsx`]：备份、数据目录、文件操作的基本件。
 //!
 //! 按键补丁、写入引擎和各 agent 的关键字段清单移植自 ccs-lite（BlueOcean223/cc-switch，MIT 许可）
@@ -27,3 +28,4 @@ pub mod patch;
 pub mod preset;
 pub mod provider;
 pub mod store;
+pub mod toggles;

@@ -14,6 +14,7 @@ use crate::config_page::{ConfigEvent, ConfigPage};
 use crate::data::{self, Notice, NoticeKind, Store};
 use crate::editor::{Editor, EditorEvent};
 use crate::picker::{Picker, PickerEvent};
+use crate::settings_page::SettingsPage;
 use crate::theme::Theme;
 use crate::ui;
 
@@ -137,6 +138,8 @@ pub struct MainWindow {
     tab: Tab,
     picker: Option<OpenPicker>,
     config: Option<OpenConfig>,
+    /// 顶栏齿轮打开的设置页，盖在当前标签的页面上；再点齿轮或点标签就关。
+    settings: Option<Entity<SettingsPage>>,
     overlay: Option<Overlay>,
     toasts: Vec<Toast>,
     toast_seq: u64,
@@ -165,6 +168,7 @@ impl MainWindow {
             tab: Tab::Agents,
             picker: None,
             config: None,
+            settings: None,
             overlay: None,
             toasts: Vec::new(),
             toast_seq: 0,
@@ -252,13 +256,30 @@ impl MainWindow {
                             this.tab = *tab;
                             this.picker = None;
                             this.config = None;
+                            this.settings = None;
                             cx.notify();
                         }),
                     )),
             )
             .child(div().flex_1())
             .child(ui::icon_button("refresh", t, "rotate-cw"))
-            .child(ui::icon_button("settings", t, "settings"))
+            .child(
+                ui::icon_button("settings", t, "settings")
+                    .when(self.settings.is_some(), |b| b.bg(t.pill_hover))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_settings(cx))),
+            )
+    }
+
+    /// 齿轮：开着就关，关着就开。
+    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.settings = None;
+        } else {
+            let store = self.store.clone();
+            self.settings = Some(cx.new(|cx| SettingsPage::new(store, cx)));
+            self.picker = None;
+        }
+        cx.notify();
     }
 
     fn agents_page(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -934,10 +955,11 @@ impl MainWindow {
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Theme::window(window.appearance());
-        let page = match (self.tab, &self.config) {
-            (Tab::Agents, Some(config)) => config.page.clone().into_any_element(),
-            (Tab::Agents, None) => self.agents_page(&t, window, cx).into_any_element(),
-            (Tab::Providers, _) => self.providers_page(&t, window, cx).into_any_element(),
+        let page = match (&self.settings, self.tab, &self.config) {
+            (Some(settings), _, _) => settings.clone().into_any_element(),
+            (None, Tab::Agents, Some(config)) => config.page.clone().into_any_element(),
+            (None, Tab::Agents, None) => self.agents_page(&t, window, cx).into_any_element(),
+            (None, Tab::Providers, _) => self.providers_page(&t, window, cx).into_any_element(),
             _ => self.placeholder(&t).into_any_element(),
         };
 

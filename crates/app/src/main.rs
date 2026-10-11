@@ -1,6 +1,7 @@
 mod add_provider;
 mod assets;
 mod config_page;
+mod settings_page;
 mod data;
 #[cfg(debug_assertions)]
 mod drive;

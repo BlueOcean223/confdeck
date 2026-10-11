@@ -539,3 +539,19 @@ pub fn card_title(t: &Theme, title: impl Into<SharedString>) -> Div {
         .text_color(t.fg)
         .child(title.into())
 }
+
+/// 开关（设置页）：轨道 30×18，圆点 14，开了是强调色。
+pub fn toggle(t: &Theme, on: bool) -> Div {
+    let knob = if t.dark { t.fg } else { gpui_kit::white() };
+    div()
+        .flex_none()
+        .w(px(30.))
+        .h(px(18.))
+        .rounded_full()
+        .p(px(2.))
+        .flex()
+        .items_center()
+        .bg(if on { t.accent } else { t.faint })
+        .when(on, |track| track.justify_end())
+        .child(div().size(px(14.)).rounded_full().bg(knob).shadow_sm())
+}

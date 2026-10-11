@@ -516,3 +516,21 @@ config:
   open:
     en: Open
     zh-CN: 打开
+
+# 设置页（顶栏的齿轮）：设一次就不动的开关，按 agent 分组，现在只有 Claude Code 一组（decisions「配置页」）。
+settings:
+  title:
+    en: Settings
+    zh-CN: 设置
+  # ~/.claude.json 的 hasCompletedOnboarding：装好以后第一次打开 Claude Code 的那几步确认。
+  skip_onboarding:
+    en: Skip first-run setup
+    zh-CN: 跳过首次确认
+  # ~/.claude/config.json 的 primaryApiKey = "any"：VS Code 插件也用 settings.json 里的地址和 Key。
+  vscode_follows:
+    en: Switch the VS Code extension too
+    zh-CN: VS Code 插件跟着切换
+  # settings.json 的 includeCoAuthoredBy：提交里的「Co-Authored-By: Claude」。
+  attribution:
+    en: Co-authored-by in commits
+    zh-CN: 提交署名
