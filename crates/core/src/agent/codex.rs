@@ -349,7 +349,7 @@ fn rename_reserved(providers: &mut dyn TableLike) {
     }
 }
 
-/// 写进模型目录的模型：列表（覆盖里选的，或打星的），默认模型不在列表里时排在最前面。
+/// 写进模型目录的模型：列表（覆盖里选的，或整个目录），默认模型不在列表里时排在最前面。
 pub fn catalog_models(provider: &Provider) -> Result<Vec<&Model>, AdaptError> {
     let mut models = list_models(provider, AGENT)?;
     let default = default_model(provider, AGENT)?;
@@ -851,11 +851,12 @@ requires_openai_auth = false
     }
 
     #[test]
-    fn the_catalog_lists_the_default_model_first_when_it_is_not_starred() {
+    fn the_catalog_lists_the_default_model_first_when_it_is_not_in_the_list() {
         let mut provider = relay();
         provider.overrides.insert(
             AGENT,
             AgentOverride {
+                models: Some(vec!["glm-4.5-air".into(), "glm-4.6".into()]),
                 default_model: Some("glm-4.5".into()),
                 ..AgentOverride::default()
             },

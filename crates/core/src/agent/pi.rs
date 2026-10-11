@@ -189,7 +189,8 @@ mod tests {
                             "input": ["text", "image"],
                             "contextWindow": 200000,
                             "maxTokens": 128000
-                        }
+                        },
+                        {"id": "glm-4.5", "reasoning": false}
                     ]
                 }
             }})

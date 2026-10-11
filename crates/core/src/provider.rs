@@ -32,15 +32,6 @@ impl fmt::Display for Protocol {
     }
 }
 
-/// 强弱档，自动填槽位时用。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Tier {
-    Flagship,
-    Balanced,
-    Fast,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Modality {
@@ -54,11 +45,6 @@ pub struct Model {
     /// 显示名；没有时显示 `id`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// 常用模型：列表型 agent 默认只取打星的。
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub star: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<Tier>,
     /// 上下文长度（token）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<u64>,
@@ -103,8 +89,12 @@ pub struct Provider {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub key: String,
     pub endpoints: BTreeMap<Protocol, String>,
+    /// 目录就是要写进 agent 的模型；列表型 agent 默认写整个目录，按 agent 的子集在覆盖里。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<Model>,
+    /// 默认模型（目录里的 id）：没人指定时先用它。没填就是目录第一个，见 [`Provider::default_or_first`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub overrides: BTreeMap<AgentKind, AgentOverride>,
 }
@@ -135,6 +125,8 @@ pub enum ProviderError {
         agent: AgentKind,
         model: String,
     },
+    #[error("供应商 {id} 的默认模型 {model} 不在目录里")]
+    UnknownDefaultModel { id: String, model: String },
 }
 
 impl Provider {
@@ -148,6 +140,14 @@ impl Provider {
 
     pub fn override_for(&self, agent: AgentKind) -> Option<&AgentOverride> {
         self.overrides.get(&agent)
+    }
+
+    /// 默认模型：填了且目录里有的那个，否则目录第一个；目录空着就是 `None`。
+    pub fn default_or_first(&self) -> Option<&Model> {
+        self.default_model
+            .as_deref()
+            .and_then(|id| self.model(id))
+            .or_else(|| self.models.first())
     }
 
     /// Anthropic 官方：连它时 Claude Code 的槽位全不写，Key 走 `ANTHROPIC_API_KEY`。
@@ -200,6 +200,14 @@ impl Provider {
                 });
             }
         }
+        if let Some(model) = &self.default_model
+            && self.model(model).is_none()
+        {
+            return Err(ProviderError::UnknownDefaultModel {
+                id: id(),
+                model: model.clone(),
+            });
+        }
         for (&agent, overrides) in &self.overrides {
             let referenced = overrides
                 .models
@@ -219,10 +227,6 @@ impl Provider {
         }
         Ok(())
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn is_valid_id(id: &str) -> bool {
@@ -266,7 +270,7 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    /// 测试用的第三方供应商：两个协议，三档模型各一个。
+    /// 测试用的第三方供应商：三个协议，三个模型，默认是第二个。
     pub(crate) fn relay() -> Provider {
         Provider {
             id: "relay".into(),
@@ -281,15 +285,11 @@ pub(crate) mod tests {
             models: vec![
                 Model {
                     id: "glm-4.5-air".into(),
-                    tier: Some(Tier::Fast),
-                    star: true,
                     ..Model::default()
                 },
                 Model {
                     id: "glm-4.6".into(),
                     name: Some("GLM 4.6".into()),
-                    tier: Some(Tier::Flagship),
-                    star: true,
                     context: Some(200_000),
                     output: Some(128_000),
                     input: vec![Modality::Text, Modality::Image],
@@ -297,10 +297,10 @@ pub(crate) mod tests {
                 },
                 Model {
                     id: "glm-4.5".into(),
-                    tier: Some(Tier::Balanced),
                     ..Model::default()
                 },
             ],
+            default_model: Some("glm-4.6".into()),
             overrides: BTreeMap::new(),
         }
     }
@@ -329,18 +329,17 @@ pub(crate) mod tests {
                     "openai-responses": "https://relay.example/v1"
                 },
                 "models": [
-                    {"id": "glm-4.5-air", "star": true, "tier": "fast"},
+                    {"id": "glm-4.5-air"},
                     {
                         "id": "glm-4.6",
                         "name": "GLM 4.6",
-                        "star": true,
-                        "tier": "flagship",
                         "context": 200000,
                         "output": 128000,
                         "input": ["text", "image"],
                         "reasoning": ["low", "high"]
                     }
                 ],
+                "default_model": "glm-4.6",
                 "overrides": {"pi": {"protocol": "anthropic"}}
             })
         );

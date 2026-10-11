@@ -468,6 +468,13 @@ base_url = "https://relay.example/v1"
 api_key = "sk-relay"
 api_backend = "responses"
 context_window = 200000
+
+[model."confdeck-glm-4.5"]
+model = "glm-4.5"
+name = "glm-4.5 (Relay)"
+base_url = "https://relay.example/v1"
+api_key = "sk-relay"
+api_backend = "responses"
 "#
         );
     }

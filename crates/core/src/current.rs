@@ -134,6 +134,7 @@ pub fn draft(
             key,
             endpoints: [(setup.protocol, setup.base_url)].into(),
             models: Vec::new(),
+            default_model: None,
             overrides: Default::default(),
         },
     };

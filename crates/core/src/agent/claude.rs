@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::slots::{self, Slot, Strength};
+use super::slots::{self, Slot};
 use super::{
     AdaptError, AgentKind, Connection, Credential, FileSetup, choose_protocol, require_key,
 };
@@ -108,31 +108,16 @@ pub fn is_floor_top(key: &str) -> bool {
 
 /// 六个槽位和它们写进 `env` 的键。
 pub const SLOTS: &[(Slot, &str)] = &[
-    (slot("main", Strength::Strong), "ANTHROPIC_MODEL"),
-    (
-        slot("opus", Strength::Strong),
-        "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    ),
-    (
-        slot("sonnet", Strength::Strong),
-        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    ),
-    (
-        slot("fable", Strength::Strong),
-        "ANTHROPIC_DEFAULT_FABLE_MODEL",
-    ),
-    (
-        slot("haiku", Strength::Fast),
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    ),
-    (
-        slot("subagent", Strength::Fast),
-        "CLAUDE_CODE_SUBAGENT_MODEL",
-    ),
+    (slot("main"), "ANTHROPIC_MODEL"),
+    (slot("opus"), "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+    (slot("sonnet"), "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+    (slot("fable"), "ANTHROPIC_DEFAULT_FABLE_MODEL"),
+    (slot("haiku"), "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+    (slot("subagent"), "CLAUDE_CODE_SUBAGENT_MODEL"),
 ];
 
-const fn slot(key: &'static str, strength: Strength) -> Slot {
-    Slot { key, strength }
+const fn slot(key: &'static str) -> Slot {
+    Slot { key }
 }
 
 /// 切到这家供应商的补丁；`None` 是「默认」：清掉关键字段，还原成 Claude Code 自带的登录。
@@ -400,8 +385,8 @@ mod tests {
                     "ANTHROPIC_MODEL": "glm-4.6",
                     "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.6",
                     "ANTHROPIC_DEFAULT_FABLE_MODEL": "glm-4.6",
-                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5-air",
-                    "CLAUDE_CODE_SUBAGENT_MODEL": "glm-4.5-air"
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.6",
+                    "CLAUDE_CODE_SUBAGENT_MODEL": "glm-4.6"
                 },
                 "permissions": {"allow": ["Bash"]},
                 "statusLine": {"type": "command", "command": "~/bin/status"}
@@ -634,8 +619,15 @@ mod tests {
     #[test]
     fn models_with_a_million_tokens_of_context_get_the_1m_suffix() {
         let mut provider = relay();
-        provider.models[1].context = Some(1_048_576); // glm-4.6，强槽位
-        provider.models[0].context = Some(262_144); // glm-4.5-air，快槽位
+        provider.models[1].context = Some(1_048_576); // glm-4.6，默认模型
+        provider.models[0].context = Some(262_144); // glm-4.5-air，用户填给 Haiku 槽位
+        provider.overrides.insert(
+            AGENT,
+            AgentOverride {
+                slots: [("haiku".into(), "glm-4.5-air".into())].into(),
+                ..AgentOverride::default()
+            },
+        );
         let env = &apply(Some(&provider), "{}")["env"];
         assert_eq!(env["ANTHROPIC_MODEL"], "glm-4.6[1m]");
         assert_eq!(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "glm-4.6[1m]");

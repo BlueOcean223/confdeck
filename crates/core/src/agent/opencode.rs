@@ -275,7 +275,8 @@ mod tests {
                         "attachment": true,
                         "modalities": {"input": ["text", "image"], "output": ["text"]},
                         "limit": {"context": 200000, "output": 128000}
-                    }
+                    },
+                    "glm-4.5": {}
                 }
             })
         );

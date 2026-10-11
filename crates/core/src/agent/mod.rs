@@ -248,21 +248,14 @@ pub fn choose_protocol(
         .ok_or_else(incompatible)
 }
 
-/// 列表型 agent 取哪些模型：用户覆盖的 > 打星的 > 整个目录。
+/// 列表型 agent 取哪些模型：用户覆盖的 > 整个目录。
 pub fn list_models(provider: &Provider, agent: AgentKind) -> Result<Vec<&Model>, AdaptError> {
     let chosen: Vec<&Model> = match override_of(provider, agent).and_then(|o| o.models.as_ref()) {
         Some(ids) => ids
             .iter()
             .map(|id| resolve(provider, id))
             .collect::<Result<_, _>>()?,
-        None => {
-            let starred: Vec<&Model> = provider.models.iter().filter(|m| m.star).collect();
-            if starred.is_empty() {
-                provider.models.iter().collect()
-            } else {
-                starred
-            }
-        }
+        None => provider.models.iter().collect(),
     };
     if chosen.is_empty() {
         return Err(AdaptError::NoModels {
@@ -273,7 +266,7 @@ pub fn list_models(provider: &Provider, agent: AgentKind) -> Result<Vec<&Model>,
     Ok(chosen)
 }
 
-/// 默认模型：用户覆盖的 > 预设推荐的（目录里还有的）> 列表里最强的。
+/// 默认模型：用户覆盖的 > 预设推荐的（目录里还有的）> 这家的默认模型（在这个 agent 的列表里时）> 列表第一个。
 pub fn default_model(provider: &Provider, agent: AgentKind) -> Result<&Model, AdaptError> {
     if let Some(id) = override_of(provider, agent).and_then(|o| o.default_model.as_ref()) {
         return resolve(provider, id);
@@ -285,7 +278,10 @@ pub fn default_model(provider: &Provider, agent: AgentKind) -> Result<&Model, Ad
         return Ok(model);
     }
     let list = list_models(provider, agent)?;
-    Ok(slots::strongest(&list).expect("list_models never returns an empty list"))
+    let preferred = provider
+        .default_or_first()
+        .filter(|model| list.iter().any(|listed| listed.id == model.id));
+    Ok(preferred.unwrap_or(list[0]))
 }
 
 fn resolve<'a>(provider: &'a Provider, id: &str) -> Result<&'a Model, AdaptError> {
@@ -415,17 +411,13 @@ mod tests {
     }
 
     #[test]
-    fn list_takes_the_override_then_starred_then_everything() {
+    fn list_takes_the_override_or_the_whole_catalog() {
         let ids = |models: Vec<&Model>| models.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
 
         assert_eq!(
             ids(list_models(&relay(), AgentKind::Pi).unwrap()),
-            ["glm-4.5-air", "glm-4.6"]
+            ["glm-4.5-air", "glm-4.6", "glm-4.5"]
         );
-
-        let mut unstarred = relay();
-        unstarred.models.iter_mut().for_each(|m| m.star = false);
-        assert_eq!(list_models(&unstarred, AgentKind::Pi).unwrap().len(), 3);
 
         let provider = with_override(
             AgentKind::Pi,
@@ -487,13 +479,13 @@ mod tests {
     }
 
     #[test]
-    fn the_preset_default_model_sits_between_the_override_and_the_strongest() {
+    fn the_preset_default_model_sits_between_the_override_and_the_providers_default() {
         let provider = from_preset("deepseek");
         assert_eq!(
             default_model(&provider, AgentKind::Codex).unwrap().id,
             "deepseek-flash"
         );
-        // 没给 Grok 推荐：取最强的。
+        // 没给 Grok 推荐：这家的默认模型，预设没选就是目录第一个。
         assert_eq!(
             default_model(&provider, AgentKind::GrokBuild).unwrap().id,
             "deepseek-v4-pro"
@@ -521,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn default_model_is_the_override_or_the_strongest_listed() {
+    fn default_model_is_the_override_or_the_providers_default() {
         assert_eq!(
             default_model(&relay(), AgentKind::Codex).unwrap().id,
             "glm-4.6"
@@ -535,6 +527,19 @@ mod tests {
         );
         assert_eq!(
             default_model(&provider, AgentKind::Codex).unwrap().id,
+            "glm-4.5"
+        );
+
+        // 这个 agent 的列表里没有这家的默认模型：列表第一个。
+        let subset = with_override(
+            AgentKind::Codex,
+            AgentOverride {
+                models: Some(vec!["glm-4.5".into(), "glm-4.5-air".into()]),
+                ..AgentOverride::default()
+            },
+        );
+        assert_eq!(
+            default_model(&subset, AgentKind::Codex).unwrap().id,
             "glm-4.5"
         );
     }

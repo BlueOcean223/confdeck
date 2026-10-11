@@ -5,7 +5,7 @@
 //! 排在用户的覆盖和自动之间（decisions「供应商和 agent 的关系」「模型」）：
 //!
 //! - 协议：用户覆盖的 > 推荐的 > agent 偏好顺序里这家提供的第一种；
-//! - 默认模型、槽位：用户填的 > 推荐的 > 按打星和强弱档自动选。
+//! - 默认模型、槽位：用户填的 > 推荐的 > 这家的默认模型（没选就是目录第一个）。
 //!
 //! 用户填的值不对（模型不在目录里、协议没有地址）报错；推荐的值不对就当没有推荐：
 //! 那是用户自己删了这个模型或地址，按自动的来。
@@ -85,6 +85,7 @@ impl Preset {
             key: key.to_string(),
             endpoints: self.endpoints.clone(),
             models: self.models.clone(),
+            default_model: None,
             overrides: BTreeMap::new(),
         };
         provider.normalize();

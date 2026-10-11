@@ -1,54 +1,18 @@
 //! 槽位型 agent（Claude Code 等）怎么从目录里给每个槽位挑模型。
 //!
-//! 用户填的 > 预设推荐的 > 按强弱档自动填：强槽位用最强的，快槽位用快速档；没标档位就全填同一个。
+//! 用户填的 > 预设推荐的 > 全填这家的默认模型（[`Provider::default_or_first`]）。
 //! 推荐的模型不在目录里了就当没推荐。
 
 use std::collections::BTreeMap;
 
-use crate::provider::{Model, Provider, Tier};
+use crate::provider::Provider;
 
 use super::{AdaptError, AgentKind, recommended};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Strength {
-    Strong,
-    Fast,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slot {
     /// 覆盖里 `slots` 用的名字。
     pub key: &'static str,
-    pub strength: Strength,
-}
-
-/// 最强的模型：档位高的在前（没标档位的排最后），同档打星的在前，再按目录顺序。
-pub fn strongest<'a>(models: &[&'a Model]) -> Option<&'a Model> {
-    models
-        .iter()
-        .enumerate()
-        .min_by_key(|(index, model)| (tier_rank(model.tier), !model.star, *index))
-        .map(|(_, model)| *model)
-}
-
-/// 快速档里打星的、再按目录顺序；没有快速档就退回最强的。
-pub fn fastest<'a>(models: &[&'a Model]) -> Option<&'a Model> {
-    models
-        .iter()
-        .enumerate()
-        .filter(|(_, model)| model.tier == Some(Tier::Fast))
-        .min_by_key(|(index, model)| (!model.star, *index))
-        .map(|(_, model)| *model)
-        .or_else(|| strongest(models))
-}
-
-fn tier_rank(tier: Option<Tier>) -> u8 {
-    match tier {
-        Some(Tier::Flagship) => 0,
-        Some(Tier::Balanced) => 1,
-        Some(Tier::Fast) => 2,
-        None => 3,
-    }
 }
 
 /// 给槽位填模型，按 `slots` 的顺序返回（槽位，模型 id）。
@@ -72,8 +36,8 @@ pub fn fill<'a>(
         }
     }
 
-    let catalog: Vec<&Model> = provider.models.iter().collect();
-    if auto && catalog.is_empty() {
+    let default = provider.default_or_first();
+    if auto && default.is_none() {
         return Err(AdaptError::NoModels {
             agent,
             provider: provider.name.clone(),
@@ -90,11 +54,8 @@ pub fn fill<'a>(
             None if auto => suggested
                 .get(slot.key)
                 .and_then(|id| provider.model(id))
-                .or_else(|| match slot.strength {
-                    Strength::Strong => strongest(&catalog),
-                    Strength::Fast => fastest(&catalog),
-                })
-                .expect("catalog is not empty"),
+                .or(default)
+                .expect("checked above: the catalog is not empty"),
             None => continue,
         };
         filled.push((slot, model.id.as_str()));
@@ -110,16 +71,7 @@ mod tests {
     use crate::provider::AgentOverride;
     use crate::provider::tests::relay;
 
-    const SLOTS: &[Slot] = &[
-        Slot {
-            key: "main",
-            strength: Strength::Strong,
-        },
-        Slot {
-            key: "haiku",
-            strength: Strength::Fast,
-        },
-    ];
+    const SLOTS: &[Slot] = &[Slot { key: "main" }, Slot { key: "haiku" }];
 
     fn ids(filled: &[(Slot, &str)]) -> Vec<(&'static str, String)> {
         filled
@@ -129,26 +81,27 @@ mod tests {
     }
 
     #[test]
-    fn tiers_decide_strong_and_fast_slots() {
+    fn every_slot_gets_the_default_model() {
         let provider = relay();
         let filled = fill(&provider, AgentKind::ClaudeCode, SLOTS, true).unwrap();
         assert_eq!(
             ids(&filled),
-            [("main", "glm-4.6".into()), ("haiku", "glm-4.5-air".into())]
-        );
-    }
-
-    #[test]
-    fn without_tiers_every_slot_gets_the_same_model() {
-        let mut provider = relay();
-        provider.models.iter_mut().for_each(|m| m.tier = None);
-        provider.models[0].star = false;
-        let filled = fill(&provider, AgentKind::ClaudeCode, SLOTS, true).unwrap();
-        // 没有档位时打星的在前：目录里第一个打星的是 glm-4.6。
-        assert_eq!(
-            ids(&filled),
             [("main", "glm-4.6".into()), ("haiku", "glm-4.6".into())]
         );
+
+        // 没选默认模型：目录第一个。选的那个不在目录里了也一样。
+        for default in [None, Some("gone".to_string())] {
+            let mut provider = relay();
+            provider.default_model = default;
+            let filled = fill(&provider, AgentKind::ClaudeCode, SLOTS, true).unwrap();
+            assert_eq!(
+                ids(&filled),
+                [
+                    ("main", "glm-4.5-air".into()),
+                    ("haiku", "glm-4.5-air".into())
+                ]
+            );
+        }
     }
 
     #[test]
@@ -188,7 +141,7 @@ mod tests {
         let provider = preset::get("kimi-coding")
             .unwrap()
             .provider("kimi-coding", "sk");
-        // 自动会给快槽位挑 HighSpeed；官方配置所有槽位都用 kimi-for-coding。
+        // 预设推荐 Haiku、子代理用 kimi-for-coding，它也是目录第一个：所有槽位都是它。
         let filled = fill(&provider, AgentKind::ClaudeCode, &slots, true).unwrap();
         assert!(
             ids(&filled).iter().all(|(_, id)| id == "kimi-for-coding"),
@@ -207,12 +160,16 @@ mod tests {
         assert!(filled.contains(&("haiku", "kimi-for-coding-highspeed".into())));
         assert!(filled.contains(&("subagent", "kimi-for-coding".into())));
 
-        // 推荐的模型被删了：按档位自动填。
+        // 推荐的模型被删了：全填默认模型，也就是剩下的第一个。
         let mut removed = provider.clone();
         removed.models.retain(|model| model.id != "kimi-for-coding");
         let filled = ids(&fill(&removed, AgentKind::ClaudeCode, &slots, true).unwrap());
-        assert!(filled.contains(&("main", "k3".into())));
-        assert!(filled.contains(&("haiku", "kimi-for-coding-highspeed".into())));
+        assert!(
+            filled
+                .iter()
+                .all(|(_, id)| id == "kimi-for-coding-highspeed"),
+            "{filled:?}"
+        );
 
         // 不自动填的时候，推荐的也不用。
         assert!(

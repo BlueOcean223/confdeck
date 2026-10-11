@@ -437,7 +437,7 @@ mod tests {
     use crate::data::DataDir;
     use crate::engine::FileStatus;
     use crate::provider::tests::relay;
-    use crate::provider::{AgentOverride, Protocol};
+    use crate::provider::{AgentOverride, Model, Protocol};
 
     struct Home {
         dir: tempfile::TempDir,
@@ -638,14 +638,17 @@ mod tests {
                 .map(|entry| entry["slug"].as_str().unwrap().to_string())
                 .collect()
         };
-        assert_eq!(slugs(&home), ["glm-4.5-air", "glm-4.6"]);
+        assert_eq!(slugs(&home), ["glm-4.5-air", "glm-4.6", "glm-4.5"]);
 
         // 改了模型目录：目录文件跟着重写。
         let providers = vec![relay()];
         let mut edited = relay();
-        edited.models[2].star = true;
+        edited.models.push(Model {
+            id: "glm-5".into(),
+            ..Model::default()
+        });
         save_provider(&home.engine, home.path(), &providers, &edited).unwrap();
-        assert_eq!(slugs(&home), ["glm-4.5-air", "glm-4.6", "glm-4.5"]);
+        assert_eq!(slugs(&home), ["glm-4.5-air", "glm-4.6", "glm-4.5", "glm-5"]);
 
         // 改不了 config.toml 时目录文件也不动。
         let before = home.read(".codex/confdeck-models.json");
@@ -861,7 +864,7 @@ mod tests {
         assert!(codex.contains("model_reasoning_effort = \"high\""));
         assert!(codex.contains("model = \"glm-4.5\""));
         let grok = home.read(".grok/config.toml");
-        assert_eq!(grok.matches("api_key = \"sk-new\"").count(), 2, "{grok}");
+        assert_eq!(grok.matches("api_key = \"sk-new\"").count(), 3, "{grok}");
         assert!(grok.contains("default = \"confdeck-glm-4.5-air\""));
         let pi = home.json(".pi/agent/models.json");
         assert_eq!(pi["providers"]["confdeck-relay"]["apiKey"], "sk-new");
