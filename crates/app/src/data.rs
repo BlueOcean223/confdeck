@@ -5,6 +5,7 @@
 //! 选了一家就写文件（`switch` / `toggle`）：写在后台线程，写完按文件重读一遍，内存里先改的胶囊会被
 //! 文件里的实际状态盖掉；写了什么、有没有备份、失败的原因做成 [`Notice`] 事件发出去，主窗口做成提示条，面板写在底栏。
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use confdeck_core::apply::{self, ApplyError, Switched, Synced, UsedBy};
 use confdeck_core::backup::{self, Backup, Reason};
 use confdeck_core::current::{self, Current};
 use confdeck_core::data::DataDir;
-use confdeck_core::engine::{Engine, EngineError, LiveFile, Outcome, Snapshot};
+use confdeck_core::engine::{Engine, EngineError, LiveFile, Outcome, Place, Snapshot};
 use confdeck_core::preset;
 use confdeck_core::provider::{self, Protocol, Provider};
 use confdeck_core::store::{self, StoreError};
@@ -48,8 +49,7 @@ pub enum Selection {
 }
 
 pub struct Agent {
-    /// core 里的适配器；`None` 是还没接上的 agent，只列出来，选不了。
-    pub kind: Option<AgentKind>,
+    pub kind: AgentKind,
     pub name: &'static str,
     pub logo: Logo,
     /// 配置文件，相对家目录。
@@ -64,15 +64,16 @@ pub struct Agent {
     pub selection: Selection,
     /// 单选 agent 从文件里认出来的原样结果，「自定义 · 主机名」「Key 不一致」要用。
     pub current: Option<Current>,
-    /// 在 confdeck 里给它选过供应商（`state.json` 的 `selections`）。
-    /// 菜单栏面板只列这样的单选 agent（decisions「没有『接管』」）。
-    pub chosen: bool,
+    /// 设置页「显示哪些 agent」里关掉了：Agent 页不列它。
+    pub hidden_on_page: bool,
+    /// 设置页「显示哪些 agent」里关掉了：菜单栏面板不列它。
+    pub hidden_in_panel: bool,
 }
 
 impl Agent {
-    /// 能在界面上选供应商：有适配器、配置文件也在。
+    /// 能在界面上选供应商：配置文件在。
     pub fn selectable(&self) -> bool {
-        self.kind.is_some() && self.installed
+        self.installed
     }
 
     /// 显示用的配置文件路径。
@@ -82,7 +83,7 @@ impl Agent {
 }
 
 struct AgentDef {
-    kind: Option<AgentKind>,
+    kind: AgentKind,
     name: &'static str,
     logo: Logo,
     config: &'static str,
@@ -91,10 +92,10 @@ struct AgentDef {
     requires_key: bool,
 }
 
-/// 界面上列的 agent，按这个顺序。前五个是 core 里有适配器的；后三个是阶段 7 的，协议照 fork，到时再核对。
+/// 界面上列的 agent，按这个顺序：只有 core 里有适配器的（decisions「Agent 页」：还没接上的不列）。
 const AGENTS: &[AgentDef] = &[
     AgentDef {
-        kind: Some(AgentKind::ClaudeCode),
+        kind: AgentKind::ClaudeCode,
         name: "Claude Code",
         logo: Logo::Color("icons/brand/claudecode-color.svg"),
         config: ".claude/settings.json",
@@ -103,7 +104,7 @@ const AGENTS: &[AgentDef] = &[
         requires_key: true,
     },
     AgentDef {
-        kind: Some(AgentKind::Codex),
+        kind: AgentKind::Codex,
         name: "Codex",
         logo: Logo::Color("icons/brand/codex-color.svg"),
         config: ".codex/config.toml",
@@ -112,16 +113,7 @@ const AGENTS: &[AgentDef] = &[
         requires_key: true,
     },
     AgentDef {
-        kind: None,
-        name: "Gemini CLI",
-        logo: Logo::Color("icons/brand/geminicli-color.svg"),
-        config: ".gemini/.env",
-        mode: Mode::Switch,
-        protocols: &[Protocol::Gemini],
-        requires_key: true,
-    },
-    AgentDef {
-        kind: Some(AgentKind::Opencode),
+        kind: AgentKind::Opencode,
         name: "OpenCode",
         logo: Logo::Mono("icons/brand/opencode.svg"),
         config: ".config/opencode/opencode.json",
@@ -135,7 +127,7 @@ const AGENTS: &[AgentDef] = &[
         requires_key: false,
     },
     AgentDef {
-        kind: Some(AgentKind::Pi),
+        kind: AgentKind::Pi,
         name: "Pi",
         logo: Logo::Mono("icons/brand/pi.svg"),
         config: ".pi/agent/models.json",
@@ -149,7 +141,7 @@ const AGENTS: &[AgentDef] = &[
         requires_key: false,
     },
     AgentDef {
-        kind: Some(AgentKind::GrokBuild),
+        kind: AgentKind::GrokBuild,
         name: "Grok Build",
         logo: Logo::Mono("icons/brand/grok.svg"),
         config: ".grok/config.toml",
@@ -160,24 +152,6 @@ const AGENTS: &[AgentDef] = &[
             Protocol::Anthropic,
         ],
         requires_key: true,
-    },
-    AgentDef {
-        kind: None,
-        name: "OpenClaw",
-        logo: Logo::Color("icons/brand/openclaw-color.svg"),
-        config: ".openclaw/openclaw.json",
-        mode: Mode::Coexist,
-        protocols: &[Protocol::OpenaiChat, Protocol::Anthropic],
-        requires_key: false,
-    },
-    AgentDef {
-        kind: None,
-        name: "Hermes",
-        logo: Logo::Color("icons/brand/hermes.png"),
-        config: ".hermes/config.yaml",
-        mode: Mode::Coexist,
-        protocols: &[Protocol::OpenaiChat],
-        requires_key: false,
     },
 ];
 
@@ -284,17 +258,20 @@ impl Store {
                 self.load_error = Some(err.to_string());
             }
         }
-        self.agents = AGENTS.iter().map(|def| self.agent(def)).collect();
+        let hidden = (
+            self.engine.hidden(Place::Page),
+            self.engine.hidden(Place::Panel),
+        );
+        self.agents = AGENTS.iter().map(|def| self.agent(def, &hidden)).collect();
     }
 
-    fn agent(&self, def: &AgentDef) -> Agent {
+    fn agent(&self, def: &AgentDef, hidden: &(BTreeSet<String>, BTreeSet<String>)) -> Agent {
+        let kind = def.kind;
         let installed = self.home.join(def.config).exists();
         let index_of = |id: &str| self.providers.iter().position(|p| p.id == id);
         let mut current = None;
-        let mut chosen = false;
-        let selection = match (def.kind, def.mode) {
-            (Some(kind), Mode::Switch) if installed => {
-                chosen = self.engine.selection(kind.id()).is_some();
+        let selection = match def.mode {
+            Mode::Switch if installed => {
                 let found = current::current(&self.engine, &self.home, kind, &self.providers).ok();
                 let picked = match &found {
                     Some(Current::Provider(id)) => index_of(id),
@@ -303,18 +280,18 @@ impl Store {
                 current = found;
                 Selection::Single(picked)
             }
-            (Some(kind), Mode::Coexist) if installed => Selection::Multi(
+            Mode::Coexist if installed => Selection::Multi(
                 current::enabled(&self.engine, &self.home, kind)
                     .unwrap_or_default()
                     .iter()
                     .filter_map(|id| index_of(id))
                     .collect(),
             ),
-            (_, Mode::Switch) => Selection::Single(None),
-            (_, Mode::Coexist) => Selection::Multi(Vec::new()),
+            Mode::Switch => Selection::Single(None),
+            Mode::Coexist => Selection::Multi(Vec::new()),
         };
         Agent {
-            kind: def.kind,
+            kind,
             name: def.name,
             logo: def.logo,
             config: def.config,
@@ -324,20 +301,45 @@ impl Store {
             requires_key: def.requires_key,
             selection,
             current,
-            chosen,
+            hidden_on_page: hidden.0.contains(kind.id()),
+            hidden_in_panel: hidden.1.contains(kind.id()),
         }
+    }
+
+    /// 设置页「显示哪些 agent」：在 Agent 页或菜单栏面板里显示 / 藏起一个 agent。记在 `state.json`，当场写完。
+    pub fn set_agent_hidden(
+        &mut self,
+        agent: usize,
+        place: Place,
+        hidden: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let kind = self.agents[agent].kind;
+        let notice = self
+            .engine
+            .set_hidden(place, kind.id(), hidden)
+            .err()
+            .map(|err| {
+                Notice::err(t!(
+                    "toast.sync_failed",
+                    agent = kind.to_string(),
+                    error = err.to_string()
+                ))
+            });
+        self.reload();
+        self.announce(notice.as_slice(), cx);
     }
 
     /// 单选 agent 的配置文件现在连到哪：地址和凭据的原样，选择器「现在」那组要用。读不了就是 `None`。
     pub fn connection(&self, agent: usize) -> Option<Connection> {
-        let kind = self.agents[agent].kind?;
+        let kind = self.agents[agent].kind;
         current::connection(&self.engine, &self.home, kind).ok()
     }
 
     /// 「把当前配置存成供应商」：按这个 agent 的配置文件拼好的一家新供应商（core 的 `draft`），
     /// 交给新建表单预先填好。文件连的不是一个地址（Bedrock 这类）时是 `None`。
     pub fn draft(&self, agent: usize) -> Option<Provider> {
-        let kind = self.agents[agent].kind?;
+        let kind = self.agents[agent].kind;
         current::draft(&self.engine, &self.home, kind, &self.providers)
             .ok()
             .flatten()
@@ -346,7 +348,7 @@ impl Store {
     /// 单选 agent 的配置文件里现在写的模型（「配置 ›」页的下拉框显示文件里的值）。
     /// 读不了、连的不是一个地址、多选 agent 都是 `None`。
     pub fn setup(&self, agent: usize) -> Option<FileSetup> {
-        let kind = self.agents[agent].kind?;
+        let kind = self.agents[agent].kind;
         // 刚选了别家、文件还没写完时，文件里还是上一家的模型，不拿来显示。
         let on_disk = current::current(&self.engine, &self.home, kind, &self.providers).ok()?;
         if Some(&on_disk) != self.agents[agent].current.as_ref() {
@@ -359,7 +361,7 @@ impl Store {
 
     /// 这个 agent 的配置文件（Codex 有两个，「原始文件」只编辑 config.toml）。
     pub fn live_file(&self, agent: usize) -> Option<LiveFile> {
-        let kind = self.agents[agent].kind?;
+        let kind = self.agents[agent].kind;
         apply::live_files(&self.home, kind).into_iter().next()
     }
 
@@ -394,9 +396,7 @@ impl Store {
         provider: Provider,
         cx: &mut Context<Self>,
     ) -> Task<()> {
-        let Some(kind) = self.agents[agent].kind else {
-            return Task::ready(());
-        };
+        let kind = self.agents[agent].kind;
         // `save_provider` 要拿改之前的列表认出在用这家的 agent。
         let before = self.providers.clone();
         if let Some(slot) = self.providers.iter_mut().find(|p| p.id == provider.id) {
@@ -452,12 +452,10 @@ impl Store {
         let mut owners: Vec<BackupOwner> = self
             .agents
             .iter()
-            .filter_map(|agent| {
-                Some(BackupOwner {
-                    id: agent.kind?.id(),
-                    name: agent.name,
-                    logo: agent.logo,
-                })
+            .map(|agent| BackupOwner {
+                id: agent.kind.id(),
+                name: agent.name,
+                logo: agent.logo,
             })
             .collect();
         owners.push(BackupOwner {
@@ -474,8 +472,7 @@ impl Store {
         let mut files: Vec<LiveFile> = self
             .agents
             .iter()
-            .filter_map(|agent| agent.kind)
-            .flat_map(|kind| apply::live_files(&self.home, kind))
+            .flat_map(|agent| apply::live_files(&self.home, agent.kind))
             .collect();
         files.extend(toggles::extra_files(&self.home));
         files.push(store::live_file(self.engine.data()));
@@ -549,9 +546,7 @@ impl Store {
     }
 
     pub fn agent_index(&self, kind: AgentKind) -> Option<usize> {
-        self.agents
-            .iter()
-            .position(|agent| agent.kind == Some(kind))
+        self.agents.iter().position(|agent| agent.kind == kind)
     }
 
     /// 保存一家（新建或替换同 ID 的），写进在用它的 agent，然后重新读一遍。
@@ -600,9 +595,7 @@ impl Store {
         provider: Option<usize>,
         cx: &mut Context<Self>,
     ) -> Task<Vec<Notice>> {
-        let Some(kind) = self.agents[agent].kind else {
-            return Task::ready(Vec::new());
-        };
+        let kind = self.agents[agent].kind;
         // 选的就是现在这家、文件是 confdeck 写的样子、state.json 也记着它：没什么可写，也不提示「已切到」。
         // 文件认出来是这家但 state 里没记（比如刚把文件里的连接存成供应商）还是要走一遍，把选择记下来。
         let picked_id = provider.map(|p| self.providers[p].id.as_str());
@@ -629,7 +622,6 @@ impl Store {
             Some(p) => Current::Provider(p.id.clone()),
             None => Current::Default,
         });
-        row.chosen = true;
         cx.notify();
 
         let engine = self.engine.clone();
@@ -656,9 +648,7 @@ impl Store {
         provider: usize,
         cx: &mut Context<Self>,
     ) -> Task<Vec<Notice>> {
-        let Some(kind) = self.agents[agent].kind else {
-            return Task::ready(Vec::new());
-        };
+        let kind = self.agents[agent].kind;
         let Selection::Multi(enabled) = &mut self.agents[agent].selection else {
             return Task::ready(Vec::new());
         };
@@ -703,16 +693,13 @@ impl Store {
         key: String,
         cx: &mut Context<Self>,
     ) -> Task<Vec<Notice>> {
-        let Some(kind) = self.agents[agent].kind else {
-            return Task::ready(Vec::new());
-        };
+        let kind = self.agents[agent].kind;
         let mut picked = self.providers[provider].clone();
         picked.key = key;
         let name = picked.name.clone();
         let row = &mut self.agents[agent];
         row.selection = Selection::Single(Some(provider));
         row.current = Some(Current::Provider(picked.id.clone()));
-        row.chosen = true;
         cx.notify();
 
         let engine = self.engine.clone();
@@ -963,11 +950,9 @@ impl Store {
     /// 这个 agent 用这家时的模型（在用的芯片上显示）。
     pub fn model_for(&self, agent: usize, provider: usize) -> Option<String> {
         let provider = &self.providers[provider];
-        let model = match self.agents[agent].kind {
-            Some(kind) => agent::default_model(provider, kind).ok(),
-            None => provider.default_or_first(),
-        };
-        model.map(|model| model.id.clone())
+        agent::default_model(provider, self.agents[agent].kind)
+            .ok()
+            .map(|model| model.id.clone())
     }
 
     /// 胶囊里画什么：要叠的图标（单选是一个）和文字。
@@ -1113,7 +1098,7 @@ mod tests {
     fn config_paths_match_core_live_files() {
         let home = Path::new("/home/x");
         for def in AGENTS {
-            let Some(kind) = def.kind else { continue };
+            let kind = def.kind;
             let live = apply::live_files(home, kind)
                 .into_iter()
                 .next()

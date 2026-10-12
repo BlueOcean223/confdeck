@@ -148,7 +148,6 @@ pub struct MainWindow {
     /// 上一个标签和这次切换的编号，给分段标签的滑块放动画。
     tab_anim: Option<(usize, u64)>,
     clicks: u64,
-    show_more: bool,
     should_move: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -179,7 +178,6 @@ impl MainWindow {
             just_closed: None,
             tab_anim: None,
             clicks: 0,
-            show_more: false,
             should_move: false,
             _subscriptions,
         }
@@ -286,60 +284,22 @@ impl MainWindow {
         cx.notify();
     }
 
+    /// 设置页「显示哪些 agent」里没关掉的都列出来；配置文件不在的一样列，只是没有胶囊。
     fn agents_page(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
-        let (installed, others): (Vec<usize>, Vec<usize>) =
-            (0..store.agents.len()).partition(|&i| store.agents[i].selectable());
-        let hidden = others.len();
+        let shown: Vec<usize> = (0..store.agents.len())
+            .filter(|&i| !store.agents[i].hidden_on_page)
+            .collect();
 
         let mut list = ui::list(t, false);
-        for (n, &i) in installed.iter().enumerate() {
+        for (n, &i) in shown.iter().enumerate() {
             list = list.child(self.agent_row(i, n == 0, store, t, window, cx));
         }
-        if hidden > 0 {
-            let hover_bg = t.card_2;
-            let hover_fg = t.fg;
-            list = list.child(
-                div()
-                    .id("more")
-                    .h_flex()
-                    .justify_center()
-                    .gap(px(5.))
-                    .py(px(9.))
-                    .border_t_1()
-                    .border_color(t.line_2)
-                    .when(!self.show_more, |row| row.rounded_b(px(11.)))
-                    .text_size(px(12.))
-                    .text_color(t.muted)
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_more = !this.show_more;
-                        cx.notify();
-                    }))
-                    .child(if self.show_more {
-                        t!("agents.show_less")
-                    } else {
-                        t!("agents.show_more", count = hidden)
-                    })
-                    .child(ui::icon(
-                        if self.show_more {
-                            "chevron-up"
-                        } else {
-                            "chevron-down"
-                        },
-                        12.,
-                        t.muted,
-                    )),
-            );
-            if self.show_more {
-                for &i in &others {
-                    list = list.child(self.agent_row(i, false, store, t, window, cx));
-                }
-            }
-        }
-
-        div().v_flex().gap(px(10.)).child(list)
+        // 全关掉了就什么都不画（空卡片只剩一圈边）。
+        div()
+            .v_flex()
+            .gap(px(10.))
+            .when(!shown.is_empty(), |page| page.child(list))
     }
 
     fn open_picker(&mut self, agent: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -401,9 +361,7 @@ impl MainWindow {
         let open = self.picker.as_ref().filter(|p| p.agent == i);
         let (logos, label) = store.pill(i);
         // 状态行只写文件在哪。连到哪、是不是 confdeck 写的，都在胶囊里（decisions「没有『接管』」）。
-        let status: SharedString = if agent.kind.is_none() {
-            t!("agents.not_supported").into()
-        } else if agent.installed {
+        let status: SharedString = if agent.installed {
             agent.config_path().into()
         } else {
             t!("agents.no_config").into()

@@ -168,7 +168,7 @@ impl ConfigPage {
         self.setup = self.store.read(cx).setup(self.agent);
     }
 
-    fn kind(&self, store: &Store) -> Option<AgentKind> {
+    fn kind(&self, store: &Store) -> AgentKind {
         store.agents[self.agent].kind
     }
 
@@ -210,9 +210,10 @@ impl ConfigPage {
     /// 给一个槽位选模型；`None` 是「留空」，覆盖里存空串，这个环境变量就不写（core 的 `agent::slots`）。
     fn set_slot(&mut self, key: &'static str, model: Option<String>, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
-        let (Some(kind), Some(p)) = (self.kind(store), self.single(store)) else {
+        let Some(p) = self.single(store) else {
             return;
         };
+        let kind = self.kind(store);
         let mut provider = store.providers[p].clone();
         if let Some(model) = &model {
             ensure_model(&mut provider, model);
@@ -231,9 +232,10 @@ impl ConfigPage {
     /// 「恢复默认」：清掉这个 agent 对这家的槽位，回到目录的默认模型。
     fn reset_slots(&mut self, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
-        let (Some(kind), Some(p)) = (self.kind(store), self.single(store)) else {
+        let Some(p) = self.single(store) else {
             return;
         };
+        let kind = self.kind(store);
         let mut provider = store.providers[p].clone();
         if let Some(o) = provider.overrides.get_mut(&kind) {
             o.slots.clear();
@@ -247,9 +249,7 @@ impl ConfigPage {
     /// 列表型、多选 agent：勾上或取消一个模型。最后一个不能取消。
     fn toggle_model(&mut self, p: usize, id: &str, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
-        let Some(kind) = self.kind(store) else {
-            return;
-        };
+        let kind = self.kind(store);
         let mut provider = store.providers[p].clone();
         let mut listed = listed(&provider, kind);
         if listed.iter().any(|m| m == id) {
@@ -273,9 +273,7 @@ impl ConfigPage {
     /// 列表型 agent 的默认模型。不在列表里的先勾上。
     fn set_default(&mut self, p: usize, id: &str, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
-        let Some(kind) = self.kind(store) else {
-            return;
-        };
+        let kind = self.kind(store);
         let mut provider = store.providers[p].clone();
         let mut listed = listed(&provider, kind);
         if !listed.iter().any(|m| m == id) {
@@ -290,9 +288,7 @@ impl ConfigPage {
     /// 多选 agent：这家走哪种接口。
     fn set_protocol(&mut self, p: usize, protocol: Protocol, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
-        let Some(kind) = self.kind(store) else {
-            return;
-        };
+        let kind = self.kind(store);
         let mut provider = store.providers[p].clone();
         provider.overrides.entry(kind).or_default().protocol = Some(protocol);
         self.save(provider, cx);
@@ -319,9 +315,10 @@ impl ConfigPage {
             return;
         }
         let store = self.store.read(cx);
-        let (Some(kind), Some(p)) = (self.kind(store), self.target(store)) else {
+        let Some(p) = self.target(store) else {
             return;
         };
+        let kind = self.kind(store);
         let mut provider = store.providers[p].clone();
         ensure_model(&mut provider, &value);
         let mut listed = listed(&provider, kind);
@@ -614,7 +611,7 @@ impl ConfigPage {
     /// 「模型」卡。选「默认」（官方登录）、自定义、Key 不一致，或多选 agent 一家都没勾时不显示。
     fn models_card(&self, t: &Theme, window: &mut Window, cx: &Context<Self>) -> Option<Div> {
         let store = self.store.read(cx);
-        let kind = self.kind(store)?;
+        let kind = self.kind(store);
         match &store.agents[self.agent].selection {
             Selection::Single(Some(p)) => Some(match kind {
                 AgentKind::ClaudeCode => self.slots_card(*p, kind, store, t, cx),

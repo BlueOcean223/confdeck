@@ -58,22 +58,12 @@ pill:
     zh-CN: 配置读不了
 
 agents:
-  show_more:
-    en: Show %{count} more
-    zh-CN: 显示其余 %{count} 个
-  show_less:
-    en: Show less
-    zh-CN: 收起
   no_config:
     en: No config file found
     zh-CN: 未检测到配置文件
   configure:
     en: Configure
     zh-CN: 配置
-  # 还没有适配器的 agent（阶段 7）。
-  not_supported:
-    en: Not supported yet
-    zh-CN: 还没接上
 
 providers:
   count_one:
@@ -540,6 +530,16 @@ settings:
   title:
     en: Settings
     zh-CN: 设置
+  # 设置 › 显示哪些 agent：每个 agent 两个开关，Agent 页和菜单栏面板各一个（用户 10-12）。
+  agents:
+    en: Which agents to show
+    zh-CN: 显示哪些 agent
+  on_page:
+    en: Agents page
+    zh-CN: Agent 页
+  in_panel:
+    en: Menu bar
+    zh-CN: 菜单栏
   # ~/.claude.json 的 hasCompletedOnboarding：装好以后第一次打开 Claude Code 的那几步确认。
   skip_onboarding:
     en: Skip first-run setup

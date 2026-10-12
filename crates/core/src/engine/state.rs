@@ -6,11 +6,13 @@
 //!   认当前是哪家时，同一个地址和 Key 对得上好几家，就以它为准（见 [`crate::current`]）。
 //! - `owned`：原始片段写进 agent 配置里和用户共用的位置的键和值（现在只有 Claude Code 的 `env` 和顶层）。
 //!   下次切换时，值还是这个的才删；用户改过的留着。记在这里而不是现查上一家供应商：那家可能已经改了或删了。
+//! - `hidden_on_page`、`hidden_in_panel`：用户在设置页「显示哪些 agent」里关掉的 agent（id），
+//!   分别对应主窗口的 Agent 页和菜单栏面板。没写就是都显示，新接上的 agent 自然也显示。
 //!
 //! 这份记录只是提示，丢了或读不出来就当作空的：后果只是多备份一次、认不出同地址的几家里是哪一家，
 //! 所以不像用户的文件那样「读不出就报错」。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 
@@ -35,6 +37,19 @@ pub struct State {
     /// 键是 agent 的 id。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     owned: BTreeMap<String, Vec<Owned>>,
+    /// Agent 页上藏起来的 agent（id）。
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    hidden_on_page: BTreeSet<String>,
+    /// 菜单栏面板里藏起来的 agent（id）。
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    hidden_in_panel: BTreeSet<String>,
+}
+
+/// 「显示哪些 agent」分两处：主窗口的 Agent 页、菜单栏面板。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    Page,
+    Panel,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,6 +101,26 @@ impl State {
     pub fn select(&mut self, agent: &str, provider_id: Option<&str>) {
         self.selections
             .insert(agent.to_string(), provider_id.map(str::to_string));
+    }
+
+    /// 这一处藏起来的 agent。
+    pub fn hidden(&self, place: Place) -> &BTreeSet<String> {
+        match place {
+            Place::Page => &self.hidden_on_page,
+            Place::Panel => &self.hidden_in_panel,
+        }
+    }
+
+    pub fn set_hidden(&mut self, place: Place, agent: &str, hidden: bool) {
+        let set = match place {
+            Place::Page => &mut self.hidden_on_page,
+            Place::Panel => &mut self.hidden_in_panel,
+        };
+        if hidden {
+            set.insert(agent.to_string());
+        } else {
+            set.remove(agent);
+        }
     }
 
     pub fn owned(&self, agent: &str) -> &[Owned] {
@@ -156,6 +191,24 @@ mod tests {
         state.own("claude-code", vec![owned.clone()]);
         state.save(&path).unwrap();
         assert_eq!(State::load(&path).owned("claude-code"), [owned]);
+
+        let mut state = State::load(&path);
+        assert!(state.hidden(Place::Panel).is_empty());
+        state.set_hidden(Place::Panel, "codex", true);
+        state.set_hidden(Place::Page, "grok-build", true);
+        state.set_hidden(Place::Page, "grok-build", false);
+        state.save(&path).unwrap();
+        let state = State::load(&path);
+        assert_eq!(
+            state.hidden(Place::Panel).iter().collect::<Vec<_>>(),
+            ["codex"]
+        );
+        assert!(state.hidden(Place::Page).is_empty());
+        assert_eq!(
+            state.selection("claude-code"),
+            Some(Some("relay")),
+            "other records are kept"
+        );
         let mut state = State::load(&path);
         state.own("claude-code", Vec::new());
         state.save(&path).unwrap();

@@ -3,7 +3,6 @@
 
 use std::time::{Duration, Instant};
 
-use confdeck_core::agent::Mode;
 use gpui_kit::component::*;
 use gpui_kit::*;
 use rust_i18n::t;
@@ -94,13 +93,12 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     }
 }
 
-/// 面板只列「有 confdeck 选的供应商」的单选 agent（decisions「没有『接管』」）；
-/// 多选 agent 没有「现在用的那一家」可换，去主窗口管。
+/// 面板列配置文件在、设置页「显示哪些 agent」里没在菜单栏关掉的 agent。
 fn shown_agents(store: &Store) -> Vec<usize> {
     (0..store.agents.len())
         .filter(|&i| {
             let agent = &store.agents[i];
-            agent.selectable() && agent.mode == Mode::Switch && agent.chosen
+            agent.selectable() && !agent.hidden_in_panel
         })
         .collect()
 }
@@ -221,8 +219,14 @@ impl Panel {
                             main_window::show_draft(this.store.clone(), agent, draft, cx);
                             return;
                         }
-                        // 面板里没有多选 agent，不会收到。
-                        PickerEvent::Toggled(_) => return,
+                        // 多选 agent 勾一下写一次，浮层不关（和主窗口一样）。
+                        PickerEvent::Toggled(provider) => {
+                            let provider = *provider;
+                            let write =
+                                this.store.update(cx, |s, cx| s.toggle(agent, provider, cx));
+                            this.show_result(write, cx);
+                            return;
+                        }
                         PickerEvent::Dismissed => {}
                     }
                     this.close_picker(window, cx);
@@ -413,6 +417,7 @@ impl Render for Panel {
         for (n, &i) in shown.iter().enumerate() {
             list = list.child(self.agent_row(i, n, store, &t, window, cx));
         }
+        let list = (!shown.is_empty()).then_some(list);
         let open_store = self.store.clone();
 
         // 选择器盖在列表上，从打开它的那一行下面展开，宽度和面板一样（左右各留 8）。
@@ -453,7 +458,7 @@ impl Render for Panel {
                     .gap(px(GAP))
                     .p(px(PADDING))
                     .child(self.header(&t, cx))
-                    .child(list)
+                    .children(list)
                     .child(
                         div()
                             .h_flex()

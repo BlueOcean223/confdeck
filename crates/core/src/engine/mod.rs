@@ -20,6 +20,7 @@
 
 mod state;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,7 @@ use crate::backup::{self, Backup, Reason, Shelf};
 use crate::data::DataDir;
 use crate::fsx::{self, Digest, Mode};
 use crate::patch::{self, Format, KeyPath, LivePatch, PatchError};
+pub use state::Place;
 use state::{Owned, State};
 
 /// 第 6 步发现被外部改了以后最多重来几次。
@@ -196,6 +198,20 @@ impl Engine {
         let path = self.data.state();
         let mut state = State::load(&path);
         state.select(agent, provider_id);
+        state.save(&path).map_err(io_error(&path))
+    }
+
+    /// 设置页「显示哪些 agent」里在这一处关掉的 agent（id）。
+    pub fn hidden(&self, place: Place) -> BTreeSet<String> {
+        State::load(&self.data.state()).hidden(place).clone()
+    }
+
+    /// 在 Agent 页或面板里显示 / 藏起一个 agent。只存在本机。
+    pub fn set_hidden(&self, place: Place, agent: &str, hidden: bool) -> Result<(), EngineError> {
+        let _lock = self.lock()?;
+        let path = self.data.state();
+        let mut state = State::load(&path);
+        state.set_hidden(place, agent, hidden);
         state.save(&path).map_err(io_error(&path))
     }
 

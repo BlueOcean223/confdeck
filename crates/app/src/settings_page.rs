@@ -1,5 +1,7 @@
 //! 设置页（顶栏的齿轮）：设一次就不动的东西，一块一张卡。
 //!
+//! - 显示哪些 agent：每个 agent 两个开关，Agent 页一个、菜单栏面板一个（`Store::set_agent_hidden`，记在 `state.json`）。
+//!   默认都开；关掉只是不列，配置文件和选择都不动。
 //! - Claude Code：跳过首次确认、VS Code 插件跟着切换、隐藏 AI 署名（decisions「配置页」：一次性的设置放设置页，
 //!   署名先做成全局开关）。点一下写一次（`Store::set_claude_toggle`），不攒着等保存。行里的小字是文件和键名，查问题时用。
 //! - 备份（decisions「备份」）：右上角的下拉框选文件归谁（默认 Claude Code），只列这一家有备份的文件，
@@ -11,6 +13,7 @@ use chrono::NaiveDateTime;
 use confdeck_core::agent::AgentKind;
 use confdeck_core::backup::{Backup, Reason};
 use confdeck_core::diff::{self, Row};
+use confdeck_core::engine::Place;
 use confdeck_core::toggles::{CLAUDE_TOGGLES, ClaudeToggle};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -48,6 +51,9 @@ pub struct SettingsPage {
 
 /// 差异里变了的地方前后各留几行。
 const CONTEXT: usize = 3;
+
+/// 「显示哪些 agent」卡里一列开关的宽度（列名也按这个宽度居中）。
+const COL: f32 = 72.;
 
 impl SettingsPage {
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
@@ -193,6 +199,74 @@ impl SettingsPage {
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.fg)
             .child(t!("settings.title"))
+    }
+
+    fn agents_card(&self, t: &Theme, window: &Window, cx: &Context<Self>) -> Div {
+        let store = self.store.read(cx);
+        let column = |text: SharedString| {
+            div()
+                .flex_none()
+                .w(px(COL))
+                .text_center()
+                .text_size(px(11.))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(t.muted)
+                .child(text)
+        };
+        let mut card = ui::list(t, false).child(
+            div()
+                .h_flex()
+                .items_center()
+                .h(px(42.))
+                .pl(px(14.))
+                .pr(px(12.))
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(div().flex_1().child(t!("settings.agents")))
+                .child(column(t!("settings.on_page").into()))
+                .child(column(t!("settings.in_panel").into())),
+        );
+        for (i, agent) in store.agents.iter().enumerate() {
+            let switch = |place: Place, on: bool, name: &'static str| {
+                div()
+                    .id(ElementId::named_usize(name, i))
+                    .flex_none()
+                    .w(px(COL))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .update(cx, |store, cx| store.set_agent_hidden(i, place, on, cx))
+                    }))
+                    .child(ui::toggle(t, on))
+            };
+            card = card.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .h(px(44.))
+                    .pl(px(14.))
+                    .pr(px(12.))
+                    .border_t_1()
+                    .border_color(t.line_2)
+                    .child(ui::logo(agent.logo, 16., t, window, cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.5))
+                            .truncate()
+                            .child(agent.name),
+                    )
+                    .child(switch(Place::Page, !agent.hidden_on_page, "page"))
+                    .child(switch(Place::Panel, !agent.hidden_in_panel, "panel")),
+            );
+        }
+        card
     }
 
     fn claude_card(&self, t: &Theme, window: &Window, cx: &Context<Self>) -> Div {
@@ -598,6 +672,7 @@ impl Render for SettingsPage {
                 cx.listener(|this, _, _, _| this.just_closed = false),
             )
             .child(self.title(&t))
+            .child(self.agents_card(&t, window, cx))
             .child(self.claude_card(&t, window, cx))
             .child(self.backups_card(&t, window, cx))
     }
