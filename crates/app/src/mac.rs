@@ -52,10 +52,31 @@ pub fn hide(window: &Window, cx: &App) {
     let Some(ns_window) = ns_window(window) else {
         return;
     };
-    ns_window.makeFirstResponder(None);
     ns_window.setAlphaValue(0.);
+    order_out(window, cx);
+}
+
+/// 收起窗口、不销毁：交出第一响应者，下一轮主线程任务再 `orderOut`。主窗口点关闭按钮时用它，
+/// 理由和 `hide` 一样（notes/panel-focus-crash.md「第四次」）。之后 `activate_window` 就能再显示出来。
+pub fn order_out(window: &Window, cx: &App) {
+    let Some(ns_window) = ns_window(window) else {
+        return;
+    };
+    ns_window.makeFirstResponder(None);
     cx.foreground_executor()
         .spawn(async move { ns_window.orderOut(None) })
+        .detach();
+}
+
+/// 和点窗口左上角的关闭按钮一样（`performClose:`，会问 GPUI 的 `on_window_should_close`），给 drive 脚本用。
+/// 放到下一轮主线程任务：调用时 `App` 正被借着，GPUI 的回调拿不到它，会当作「可以关」直接关掉。
+#[cfg(debug_assertions)]
+pub fn perform_close(window: &Window, cx: &App) {
+    let Some(ns_window) = ns_window(window) else {
+        return;
+    };
+    cx.foreground_executor()
+        .spawn(async move { ns_window.performClose(None) })
         .detach();
 }
 

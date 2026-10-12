@@ -75,6 +75,13 @@ pub fn show(store: Entity<Store>, cx: &mut App) {
     }
 
     let (handle, view) = gpui_kit::open_window(MainWindow::options(cx), cx, |window, cx| {
+        // 点关闭按钮只收起窗口、不销毁，下次 `show` 原样拿出来：销毁时 GPUI 释放窗口的 content view，
+        // AppKit 的 TouchBar 观察者还挂在上面，下一次刷新就崩（notes/panel-focus-crash.md「第四次」）。
+        #[cfg(target_os = "macos")]
+        window.on_window_should_close(cx, |window, cx| {
+            crate::mac::order_out(window, cx);
+            false
+        });
         cx.new(|cx| MainWindow::new(store, window, cx))
     })
     .expect("failed to open main window");

@@ -185,6 +185,9 @@ fn run(cmd: &str, arg: &str, target: Target, shots: &Path, cx: &mut App) -> anyh
                 }
             }
             "shot" => shot(window, cx, &shots.join(format!("{arg}.png")))?,
+            // 点窗口左上角的关闭按钮。
+            #[cfg(target_os = "macos")]
+            "close" => crate::mac::perform_close(window, cx),
             _ => bail!("unknown command"),
         }
         // 屏幕锁着、窗口被挡住时 macOS 停掉了 display link，GPUI 不再画新帧，命中区域就停在旧的一帧上。
