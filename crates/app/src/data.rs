@@ -190,11 +190,18 @@ pub enum Unusable {
     NoKey,
 }
 
+/// 设置 › 备份的下拉框里的一项：文件归谁。接上的 agent 各一项，再加 confdeck 自己（`providers.json`）。
+#[derive(Clone, Copy)]
+pub struct BackupOwner {
+    /// `LiveFile::owner`，也是备份目录的第一层。
+    pub id: &'static str,
+    pub name: &'static str,
+    pub logo: Logo,
+}
+
 /// 设置 › 备份里的一行：一个有备份的文件和它的备份（最新的在前）。
 pub struct FileBackups {
     pub file: LiveFile,
-    /// 文件归谁：agent 的图标，confdeck 自己的文件是卡带。
-    pub logo: Logo,
     pub backups: Vec<Backup>,
 }
 
@@ -413,12 +420,10 @@ impl Store {
         })
     }
 
-    /// 设置页 › Claude Code 的一个开关现在是开是关。文件不存在、键不在按默认；文件读不了也先按默认显示，
+    /// 设置页 › Claude Code 的一个开关现在是开是关。文件不存在、键不在算关；文件读不了也先显示成关，
     /// 点的时候才报错。
     pub fn claude_toggle(&self, toggle: ClaudeToggle) -> bool {
-        toggle
-            .read(&self.engine, &self.home)
-            .unwrap_or_else(|_| toggle.default_on())
+        toggle.read(&self.engine, &self.home).unwrap_or(false)
     }
 
     /// 开关写的是哪个文件，`~/…` 的写法（行里的小字）。
@@ -442,38 +447,43 @@ impl Store {
         self.announce(notice.as_slice(), cx);
     }
 
-    /// 设置 › 备份：confdeck 会写的每个文件（各 agent 的、开关的两个、`providers.json`）里有备份的那些。
-    pub fn backups(&self) -> Vec<FileBackups> {
-        let mut files: Vec<(LiveFile, Logo)> = Vec::new();
-        for agent in &self.agents {
-            let Some(kind) = agent.kind else {
-                continue;
-            };
-            for file in apply::live_files(&self.home, kind) {
-                files.push((file, agent.logo));
-            }
-        }
-        let claude = self
+    /// 设置 › 备份的下拉框：接上的 agent（按标签的顺序）和 confdeck 自己。
+    pub fn backup_owners(&self) -> Vec<BackupOwner> {
+        let mut owners: Vec<BackupOwner> = self
             .agents
             .iter()
-            .find(|agent| agent.kind == Some(AgentKind::ClaudeCode))
-            .map_or(Logo::Letter('C'), |agent| agent.logo);
-        for file in toggles::extra_files(&self.home) {
-            files.push((file, claude));
-        }
-        files.push((
-            store::live_file(self.engine.data()),
-            Logo::Mono("icons/confdeck.svg"),
-        ));
+            .filter_map(|agent| {
+                Some(BackupOwner {
+                    id: agent.kind?.id(),
+                    name: agent.name,
+                    logo: agent.logo,
+                })
+            })
+            .collect();
+        owners.push(BackupOwner {
+            id: store::live_file(self.engine.data()).owner,
+            name: "confdeck",
+            logo: Logo::Mono("icons/confdeck.svg"),
+        });
+        owners
+    }
+
+    /// 设置 › 备份：confdeck 会写的每个文件（各 agent 的、开关的两个、`providers.json`）里有备份的那些。
+    /// 文件归谁看 `file.owner`，和 [`Self::backup_owners`] 对。
+    pub fn backups(&self) -> Vec<FileBackups> {
+        let mut files: Vec<LiveFile> = self
+            .agents
+            .iter()
+            .filter_map(|agent| agent.kind)
+            .flat_map(|kind| apply::live_files(&self.home, kind))
+            .collect();
+        files.extend(toggles::extra_files(&self.home));
+        files.push(store::live_file(self.engine.data()));
         files
             .into_iter()
-            .filter_map(|(file, logo)| {
+            .filter_map(|file| {
                 let backups = backup::list(self.engine.data(), &file.shelf()).ok()?;
-                (!backups.is_empty()).then_some(FileBackups {
-                    file,
-                    logo,
-                    backups,
-                })
+                (!backups.is_empty()).then_some(FileBackups { file, backups })
             })
             .collect()
     }

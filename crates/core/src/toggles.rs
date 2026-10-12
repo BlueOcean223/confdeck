@@ -5,9 +5,9 @@
 //! | --- | --- | --- |
 //! | 跳过首次确认 | `~/.claude.json` | `hasCompletedOnboarding: true` |
 //! | VS Code 插件跟着切换 | `~/.claude/config.json` | `primaryApiKey: "any"`，插件看到它就用 settings.json 里的地址和 Key |
-//! | 提交署名 | `~/.claude/settings.json` | 关是 `includeCoAuthoredBy: false`；开是没有这个键（Claude Code 默认署名） |
+//! | 隐藏 AI 署名 | `~/.claude/settings.json` | `includeCoAuthoredBy: false`；关是没有这个键（Claude Code 默认署名） |
 //!
-//! 读的时候文件不存在、键不存在都按默认（前两个关，署名开）。关的时候只删 confdeck 会写的那个值：
+//! 三个开关都是「改掉默认行为」：文件不存在、键不存在都算关。关的时候只删 confdeck 会写的那个值：
 //! `primaryApiKey` 里是真 Key（老版本 Claude Code 存在这里）就不动。
 
 use std::path::Path;
@@ -26,15 +26,15 @@ pub enum ClaudeToggle {
     SkipOnboarding,
     /// VS Code 插件跟着切换：`~/.claude/config.json` 的 `primaryApiKey`。
     VscodeFollows,
-    /// 提交里的 `Co-Authored-By: Claude`：`~/.claude/settings.json` 的 `includeCoAuthoredBy`。
-    Attribution,
+    /// 提交里不带 `Co-Authored-By: Claude`：`~/.claude/settings.json` 的 `includeCoAuthoredBy: false`。
+    HideAttribution,
 }
 
 /// 设置页里的顺序。
 pub const CLAUDE_TOGGLES: &[ClaudeToggle] = &[
     ClaudeToggle::SkipOnboarding,
     ClaudeToggle::VscodeFollows,
-    ClaudeToggle::Attribution,
+    ClaudeToggle::HideAttribution,
 ];
 
 /// 开关会写的、不在 [`crate::apply::live_files`] 里的文件（备份页要列它们）。
@@ -51,13 +51,8 @@ impl ClaudeToggle {
         match self {
             Self::SkipOnboarding => "hasCompletedOnboarding",
             Self::VscodeFollows => "primaryApiKey",
-            Self::Attribution => "includeCoAuthoredBy",
+            Self::HideAttribution => "includeCoAuthoredBy",
         }
-    }
-
-    /// 文件里没有这个键时是开还是关。
-    pub fn default_on(self) -> bool {
-        matches!(self, Self::Attribution)
     }
 
     /// 要写的文件。`settings.json` 和适配器写的是同一个（里面有 Key，0600）；另外两个文件
@@ -76,7 +71,7 @@ impl ClaudeToggle {
                 mode: Mode::Keep,
                 format: Format::Json,
             },
-            Self::Attribution => claude::live_file(home),
+            Self::HideAttribution => claude::live_file(home),
         }
     }
 
@@ -85,11 +80,11 @@ impl ClaudeToggle {
         match self {
             Self::SkipOnboarding => (Value::Bool(true), true),
             Self::VscodeFollows => (Value::from("any"), true),
-            Self::Attribution => (Value::Bool(false), false),
+            Self::HideAttribution => (Value::Bool(false), true),
         }
     }
 
-    /// 现在是开是关。文件不存在、键不存在按默认；文件解析不了报错。
+    /// 现在是开是关。文件不存在、键不存在算关；文件解析不了报错。
     pub fn read(self, engine: &Engine, home: &Path) -> Result<bool, EngineError> {
         let file = self.file(home);
         let snapshot = engine.read(&file)?;
@@ -170,7 +165,7 @@ mod tests {
         let home = Home::new();
         assert!(!home.read(ClaudeToggle::SkipOnboarding));
         assert!(!home.read(ClaudeToggle::VscodeFollows));
-        assert!(home.read(ClaudeToggle::Attribution));
+        assert!(!home.read(ClaudeToggle::HideAttribution));
     }
 
     #[test]
@@ -224,38 +219,38 @@ mod tests {
     }
 
     #[test]
-    fn attribution_off_is_a_false_in_settings() {
+    fn hiding_attribution_is_a_false_in_settings() {
         let home = Home::new();
         home.write(
             ".claude/settings.json",
             json!({ "theme": "dark", "env": { "ANTHROPIC_MODEL": "x" } }),
         );
 
-        assert!(home.set(ClaudeToggle::Attribution, false));
+        assert!(home.set(ClaudeToggle::HideAttribution, true));
         assert_eq!(
             home.doc(".claude/settings.json"),
             json!({ "theme": "dark", "env": { "ANTHROPIC_MODEL": "x" }, "includeCoAuthoredBy": false })
         );
-        assert!(!home.read(ClaudeToggle::Attribution));
+        assert!(home.read(ClaudeToggle::HideAttribution));
 
-        assert!(home.set(ClaudeToggle::Attribution, true));
+        assert!(home.set(ClaudeToggle::HideAttribution, false));
         assert_eq!(
             home.doc(".claude/settings.json"),
             json!({ "theme": "dark", "env": { "ANTHROPIC_MODEL": "x" } })
         );
-        assert!(home.read(ClaudeToggle::Attribution));
+        assert!(!home.read(ClaudeToggle::HideAttribution));
     }
 
     #[test]
-    fn explicit_true_counts_as_on() {
+    fn explicit_true_counts_as_shown() {
         let home = Home::new();
         home.write(
             ".claude/settings.json",
             json!({ "includeCoAuthoredBy": true }),
         );
-        assert!(home.read(ClaudeToggle::Attribution));
+        assert!(!home.read(ClaudeToggle::HideAttribution));
         // 用户自己写的 true 留着。
-        assert!(!home.set(ClaudeToggle::Attribution, true));
+        assert!(!home.set(ClaudeToggle::HideAttribution, false));
         assert_eq!(
             home.doc(".claude/settings.json"),
             json!({ "includeCoAuthoredBy": true })
@@ -266,7 +261,7 @@ mod tests {
     fn switching_provider_keeps_the_attribution_key() {
         let home = Home::new();
         home.write(".claude/settings.json", json!({}));
-        home.set(ClaudeToggle::Attribution, false);
+        home.set(ClaudeToggle::HideAttribution, true);
 
         let relay = relay();
         apply::switch(
@@ -276,9 +271,9 @@ mod tests {
             Some(&relay),
         )
         .unwrap();
-        assert!(!home.read(ClaudeToggle::Attribution));
+        assert!(home.read(ClaudeToggle::HideAttribution));
         apply::switch(&home.engine, home.path(), AgentKind::ClaudeCode, None).unwrap();
-        assert!(!home.read(ClaudeToggle::Attribution));
+        assert!(home.read(ClaudeToggle::HideAttribution));
     }
 
     #[test]

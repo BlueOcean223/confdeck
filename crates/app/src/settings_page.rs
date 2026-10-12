@@ -1,13 +1,14 @@
 //! 设置页（顶栏的齿轮）：设一次就不动的东西，一块一张卡。
 //!
-//! - Claude Code：跳过首次确认、VS Code 插件跟着切换、提交带 Claude 署名（decisions「配置页」：一次性的设置放设置页，
+//! - Claude Code：跳过首次确认、VS Code 插件跟着切换、隐藏 AI 署名（decisions「配置页」：一次性的设置放设置页，
 //!   署名先做成全局开关）。点一下写一次（`Store::set_claude_toggle`），不攒着等保存。行里的小字是文件和键名，查问题时用。
-//! - 备份（decisions「备份」）：每个有备份的文件一行（几份、多大、最近一次），点开列每一份的时间和原因，
-//!   可以看和现在的差异、恢复、「清理」（删原件以外的）。
+//! - 备份（decisions「备份」）：右上角的下拉框选文件归谁（默认 Claude Code），只列这一家有备份的文件，
+//!   一个文件一行（几份、多大、最近一次），点开列每一份的时间和原因，可以看和现在的差异、恢复、「清理」（删原件以外的）。
 
 use std::path::PathBuf;
 
 use chrono::NaiveDateTime;
+use confdeck_core::agent::AgentKind;
 use confdeck_core::backup::{Backup, Reason};
 use confdeck_core::diff::{self, Row};
 use confdeck_core::toggles::{CLAUDE_TOGGLES, ClaudeToggle};
@@ -16,7 +17,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::{FileBackups, Logo, Store};
+use crate::data::{BackupOwner, FileBackups, Logo, Store};
 use crate::theme::Theme;
 use crate::ui;
 
@@ -30,7 +31,15 @@ struct DiffView {
 
 pub struct SettingsPage {
     store: Entity<Store>,
+    /// 有备份的文件，各家的都在；画的时候只取 `owner` 那家的。
     files: Vec<FileBackups>,
+    owners: Vec<BackupOwner>,
+    /// 备份卡现在看的是谁的文件（`BackupOwner::id`）。
+    owner: &'static str,
+    /// 选文件归谁的下拉框开着。
+    menu: bool,
+    /// 下拉框刚被「点外面」关掉。点的正好是它的按钮时，不要立刻再打开。
+    just_closed: bool,
     /// 展开的文件（`files` 的下标）。
     expanded: Option<usize>,
     diff: Option<DiffView>,
@@ -47,9 +56,20 @@ impl SettingsPage {
             cx.notify();
         });
         let files = store.read(cx).backups();
+        let owners = store.read(cx).backup_owners();
+        // 默认看 Claude Code 的（用户 10-12）。
+        let owner = owners
+            .iter()
+            .find(|owner| owner.id == AgentKind::ClaudeCode.id())
+            .or(owners.first())
+            .map_or("", |owner| owner.id);
         Self {
             store,
             files,
+            owners,
+            owner,
+            menu: false,
+            just_closed: false,
             expanded: None,
             diff: None,
             _subscription,
@@ -82,6 +102,24 @@ impl SettingsPage {
         let on = self.store.read(cx).claude_toggle(toggle);
         self.store
             .update(cx, |store, cx| store.set_claude_toggle(toggle, !on, cx));
+    }
+
+    fn toggle_menu(&mut self, cx: &mut Context<Self>) {
+        if self.just_closed {
+            return;
+        }
+        self.menu = !self.menu;
+        cx.notify();
+    }
+
+    fn pick_owner(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        if self.owner != id {
+            self.owner = id;
+            self.expanded = None;
+            self.diff = None;
+        }
+        self.menu = false;
+        cx.notify();
     }
 
     fn toggle_file(&mut self, n: usize, cx: &mut Context<Self>) {
@@ -223,18 +261,54 @@ impl SettingsPage {
 
     fn backups_card(&self, t: &Theme, window: &Window, cx: &Context<Self>) -> Div {
         let store = self.store.read(cx);
+        let owner = self
+            .owners
+            .iter()
+            .find(|owner| owner.id == self.owner)
+            .copied();
         let mut card = ui::list(t, false).child(
-            ui::card_title(t, t!("settings.backups")).child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .font_weight(FontWeight::NORMAL)
-                    .text_size(px(11.5))
-                    .text_color(t.muted)
-                    .child(store.tilde(&store.backups_dir())),
-            ),
+            ui::card_title(t, t!("settings.backups"))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::NORMAL)
+                        .text_size(px(11.5))
+                        .text_color(t.muted)
+                        .child(store.tilde(&store.backups_dir())),
+                )
+                .child(div().flex_1())
+                .when_some(owner, |row, owner| {
+                    row.child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .w(px(150.))
+                            .font_weight(FontWeight::NORMAL)
+                            .child(
+                                ui::select_pill(
+                                    "backup-owner",
+                                    t,
+                                    false,
+                                    &[owner.logo],
+                                    owner.name,
+                                    self.menu,
+                                    false,
+                                    window,
+                                    cx,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(cx))),
+                            )
+                            .when(self.menu, |d| {
+                                d.child(ui::dropdown(self.owner_menu(t, window, cx)))
+                            }),
+                    )
+                }),
         );
-        if self.files.is_empty() {
+        let shown: Vec<usize> = (0..self.files.len())
+            .filter(|&n| self.files[n].file.owner == self.owner)
+            .collect();
+        if shown.is_empty() {
             return card.child(
                 div()
                     .h_flex()
@@ -248,7 +322,8 @@ impl SettingsPage {
                     .child(t!("settings.no_backups")),
             );
         }
-        for (n, entry) in self.files.iter().enumerate() {
+        for n in shown {
+            let entry = &self.files[n];
             let open = self.expanded == Some(n);
             let hover = t.card_2;
             let total: u64 = entry.backups.iter().map(|backup| backup.size).sum();
@@ -271,7 +346,6 @@ impl SettingsPage {
                     .cursor_pointer()
                     .hover(move |row| row.bg(hover))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_file(n, cx)))
-                    .child(ui::logo(entry.logo, 18., t, window, cx))
                     .child(
                         div()
                             .v_flex()
@@ -322,7 +396,7 @@ impl SettingsPage {
                         .items_center()
                         .justify_end()
                         .h(px(40.))
-                        .pl(px(44.))
+                        .pl(px(28.))
                         .pr(px(12.))
                         .border_t_1()
                         .border_color(t.line_2)
@@ -335,6 +409,50 @@ impl SettingsPage {
             }
         }
         card
+    }
+
+    /// 文件归谁的下拉框：接上的 agent 和 confdeck 自己，现在看的那家打勾。
+    fn owner_menu(&self, t: &Theme, window: &Window, cx: &Context<Self>) -> impl IntoElement {
+        let hover = t.sel;
+        let mut list = div().v_flex().p(px(5.));
+        for (n, owner) in self.owners.iter().enumerate() {
+            let id = owner.id;
+            list = list.child(
+                div()
+                    .id(ElementId::named_usize("owner-option", n))
+                    .h_flex()
+                    .items_center()
+                    .gap(px(9.))
+                    .h(px(32.))
+                    .px(px(8.))
+                    .rounded(px(7.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.pick_owner(id, cx)))
+                    .child(ui::logo(owner.logo, 14., t, window, cx))
+                    .child(div().flex_1().text_size(px(12.)).child(owner.name))
+                    .when(id == self.owner, |row| {
+                        row.child(ui::icon("check", 13., t.accent))
+                    }),
+            );
+        }
+        div()
+            .v_flex()
+            .w(px(200.))
+            .bg(Hsla { a: 1., ..t.pop_bg })
+            .rounded(px(11.))
+            .border_1()
+            .border_color(t.line)
+            .shadow(t.pop_shadow())
+            .overflow_hidden()
+            .occlude()
+            .text_color(t.fg)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.menu = false;
+                this.just_closed = true;
+                cx.notify();
+            }))
+            .child(list)
     }
 
     /// 一份备份：时间、原因、大小，右边「差异」「恢复」。
@@ -353,7 +471,7 @@ impl SettingsPage {
             .items_center()
             .gap(px(12.))
             .h(px(36.))
-            .pl(px(44.))
+            .pl(px(28.))
             .pr(px(12.))
             .border_t_1()
             .border_color(t.line_2)
@@ -475,6 +593,10 @@ impl Render for SettingsPage {
         div()
             .v_flex()
             .gap(px(10.))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.just_closed = false),
+            )
             .child(self.title(&t))
             .child(self.claude_card(&t, window, cx))
             .child(self.backups_card(&t, window, cx))
@@ -485,7 +607,7 @@ fn label(toggle: ClaudeToggle) -> SharedString {
     match toggle {
         ClaudeToggle::SkipOnboarding => t!("settings.skip_onboarding").into(),
         ClaudeToggle::VscodeFollows => t!("settings.vscode_follows").into(),
-        ClaudeToggle::Attribution => t!("settings.attribution").into(),
+        ClaudeToggle::HideAttribution => t!("settings.hide_attribution").into(),
     }
 }
 

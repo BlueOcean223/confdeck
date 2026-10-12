@@ -548,10 +548,11 @@ settings:
   vscode_follows:
     en: Switch the VS Code extension too
     zh-CN: VS Code 插件跟着切换
-  # settings.json 的 includeCoAuthoredBy：开着提交里带「Co-Authored-By: Claude」（用户 10-12：要说清是保留还是去掉）。
-  attribution:
-    en: Credit Claude in commits
-    zh-CN: 提交带 Claude 署名
+  # settings.json 的 includeCoAuthoredBy = false：提交里不带「Co-Authored-By: Claude」。
+  # 开关说「隐藏」（用户 10-12：Claude Code 默认带着，开关是改默认，和另外两个一样）。
+  hide_attribution:
+    en: Hide the AI byline in commits
+    zh-CN: 隐藏 AI 署名
   # 设置 › 备份（decisions「备份」）。
   backups:
     en: Backups
