@@ -115,11 +115,16 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> EngineError + '_ {
 /// 由写前内容（和它的 hash）算出写后内容。
 type Compute<'a> = dyn FnMut(Option<&[u8]>, Option<&Digest>) -> Result<Vec<u8>, EngineError> + 'a;
 
+/// 换登录文件时由写前内容算出写后内容（[`Engine::write_login`]）。
+pub type LoginCompute<'a> = dyn FnMut(Option<&[u8]>) -> Result<Vec<u8>, EngineError> + 'a;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Patch,
     Edit,
     Restore,
+    /// 换官方账号：换下来的登录已经存进账号里了，不备份（备份里也不该留令牌）。
+    Login,
 }
 
 pub struct Engine {
@@ -285,6 +290,16 @@ impl Engine {
         })
     }
 
+    /// 换 agent 的登录文件（[`crate::account`]）。`compute` 在锁里拿到文件现在的内容，先把它存好，再给出要写的内容；
+    /// 文件在这期间被 agent 改了（比如刚换了新令牌）就拿新内容再来一次。不备份。
+    pub fn write_login(
+        &self,
+        file: &LiveFile,
+        compute: &mut LoginCompute<'_>,
+    ) -> Result<Outcome, EngineError> {
+        self.commit(file, Kind::Login, &mut |pre, _| compute(pre))
+    }
+
     /// 用一份备份替换当前文件。当前内容先备份，恢复错了还能再退回来。
     pub fn restore(&self, file: &LiveFile, backup: &Backup) -> Result<Outcome, EngineError> {
         let bytes = fs::read(&backup.path).map_err(io_error(&backup.path))?;
@@ -318,6 +333,7 @@ impl Engine {
                 Kind::Patch => Some(Reason::External),
                 Kind::Edit => Some(Reason::BeforeEdit),
                 Kind::Restore => Some(Reason::BeforeRestore),
+                Kind::Login => None,
             };
             let backup = match (&pre.bytes, reason) {
                 (Some(bytes), Some(reason)) => {

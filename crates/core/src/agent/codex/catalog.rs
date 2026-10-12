@@ -225,44 +225,7 @@ fn locate(home: &Path) -> Option<PathBuf> {
         tests::FAKE_CODEX.with(|fake| fake.borrow().clone())
     }
     #[cfg(not(test))]
-    search(
-        home,
-        env::var_os("PATH").as_deref(),
-        &["/opt/homebrew/bin", "/usr/local/bin"],
-    )
-}
-
-/// 先找 `PATH`，再找常见的安装位置：从 Finder 启动的应用拿到的 `PATH` 只有系统目录。
-/// mise、asdf 的 shim 按当前目录选 Node 版本，在这里用的是全局的那个。
-fn search(home: &Path, path: Option<&std::ffi::OsStr>, system: &[&str]) -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = path.map(env::split_paths).into_iter().flatten().collect();
-    dirs.extend(
-        [
-            ".local/bin",
-            ".npm-global/bin",
-            ".bun/bin",
-            ".volta/bin",
-            "Library/pnpm",
-            ".local/share/mise/shims",
-            ".asdf/shims",
-            ".cargo/bin",
-        ]
-        .iter()
-        .map(|dir| home.join(dir)),
-    );
-    dirs.extend(system.iter().map(PathBuf::from));
-    // nvm 装的 Node 各版本，新的在前。
-    if let Ok(versions) = fs::read_dir(home.join(".nvm/versions/node")) {
-        let mut versions: Vec<PathBuf> = versions
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join("bin"))
-            .collect();
-        versions.sort();
-        dirs.extend(versions.into_iter().rev());
-    }
-    dirs.into_iter()
-        .map(|dir| dir.join("codex"))
-        .find(|candidate| candidate.is_file())
+    crate::program::find(home, "codex")
 }
 
 /// 跑 `codex debug models --bundled`。`CODEX_HOME` 指到一个临时目录：这条命令不读配置，
@@ -480,30 +443,5 @@ pub(crate) mod tests {
         use_codex(dir.path(), &sample());
         let out = generate(dir.path(), &[&model("m")]).unwrap();
         assert_eq!(entries(&out)[0]["slug"], "m");
-    }
-
-    #[test]
-    fn search_looks_in_path_then_the_usual_places() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let on_path = dir.path().join("bin");
-        assert_eq!(search(&home, None, &[]), None);
-
-        let nvm = home.join(".nvm/versions/node/v22.1.0/bin");
-        fs::create_dir_all(&nvm).unwrap();
-        fs::write(nvm.join("codex"), "").unwrap();
-        assert_eq!(search(&home, None, &[]), Some(nvm.join("codex")));
-
-        fs::create_dir_all(home.join(".local/bin")).unwrap();
-        fs::write(home.join(".local/bin/codex"), "").unwrap();
-        assert_eq!(
-            search(&home, None, &[]),
-            Some(home.join(".local/bin/codex"))
-        );
-
-        fs::create_dir_all(&on_path).unwrap();
-        fs::write(on_path.join("codex"), "").unwrap();
-        let path = env::join_paths([&on_path]).unwrap();
-        assert_eq!(search(&home, Some(&path), &[]), Some(on_path.join("codex")));
     }
 }

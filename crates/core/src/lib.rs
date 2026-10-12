@@ -17,11 +17,14 @@
 //!   [`remote`]：对一家供应商测各个接口地址、拉模型列表；[`models_dev`]：按 models.dev 补模型的上下文、价格等。
 //! - [`usage`]：扫各 agent 的会话记录算用量，认是哪家供应商、按价格算花费；[`balance`]：查供应商账户里还有多少钱；
 //!   [`quota`]：官方订阅和套餐的限额窗口用了多少；[`session`]：各 agent 的会话列表、对话内容、恢复命令。
+//! - [`account`]：官方账号多账号（Codex、Grok Build）：存下每个账号的登录，切换时写回 agent 的登录文件；
+//!   [`program`]：找 agent 的命令行程序。
 //! - [`backup`]、[`data`]、[`fsx`]：备份、数据目录、文件操作的基本件；[`diff`]：备份和现在的文件按行比。
 //!
 //! 按键补丁、写入引擎和各 agent 的关键字段清单移植自 ccs-lite（BlueOcean223/cc-switch，MIT 许可）
 //! 的 `live/` 模块。
 
+pub mod account;
 pub mod agent;
 pub mod apply;
 pub mod backup;
@@ -35,10 +38,11 @@ pub mod models_dev;
 pub mod net;
 pub mod patch;
 pub mod preset;
+pub mod program;
 pub mod provider;
 pub mod quota;
-pub mod session;
 pub mod remote;
+pub mod session;
 pub mod store;
 pub mod toggles;
 pub mod transfer;

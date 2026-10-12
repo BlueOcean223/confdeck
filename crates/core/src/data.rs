@@ -4,6 +4,7 @@
 //! - `state.json`：每个 agent 配置文件上次由 confdeck 写入后的 hash，只属于这台设备，不同步。
 //! - `backups/`：备份（[`crate::backup`]），有 Key，不同步。
 //! - `history.jsonl`：单选 agent 连到哪家的记录（[`crate::usage::history`]），用量页认供应商用，重算不出来。
+//! - `accounts.json`、`accounts/`：存下的官方账号和它们的登录（[`crate::account`]），有令牌，不同步、不导出。
 //! - `cache/`：丢了能重算的东西，比如用量的数据库 `cache/usage.db`（[`crate::usage::Db`]）。
 //! - `.lock`：写入时的跨进程锁。
 
@@ -42,6 +43,15 @@ impl DataDir {
 
     pub fn history(&self) -> PathBuf {
         self.root.join("history.jsonl")
+    }
+
+    pub fn accounts(&self) -> PathBuf {
+        self.root.join("accounts.json")
+    }
+
+    /// 存账号登录的目录，一个 agent 一个子目录。
+    pub fn account_logins(&self) -> PathBuf {
+        self.root.join("accounts")
     }
 
     pub fn usage_db(&self) -> PathBuf {
