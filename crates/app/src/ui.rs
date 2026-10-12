@@ -211,6 +211,15 @@ pub fn ease_out_quart(t: f32) -> f32 {
 
 /// 把浮层挂在父元素正下方、右边对齐，画在其他内容之上。父元素要是 `relative()`。
 pub fn dropdown(content: impl IntoElement) -> Div {
+    dropdown_layer(content, 1)
+}
+
+/// 弹层（编辑供应商等，`deferred` 优先级 2）里的下拉框：要画在弹层上面，优先级得更高。
+pub fn overlay_dropdown(content: impl IntoElement) -> Div {
+    dropdown_layer(content, 4)
+}
+
+fn dropdown_layer(content: impl IntoElement, priority: usize) -> Div {
     div().absolute().top_full().right_0().child(
         deferred(
             anchored()
@@ -218,7 +227,7 @@ pub fn dropdown(content: impl IntoElement) -> Div {
                 .snap_to_window_with_margin(px(8.))
                 .child(div().pt(px(4.)).child(content)),
         )
-        .with_priority(1),
+        .with_priority(priority),
     )
 }
 

@@ -285,9 +285,9 @@ editor:
   reasoning:
     en: Reasoning
     zh-CN: 推理档位
-  reasoning_placeholder:
-    en: "low, high (empty = none)"
-    zh-CN: "low, high（空着 = 不支持）"
+  reasoning_none:
+    en: "None"
+    zh-CN: 不支持
   reasoning_line:
     en: "reasoning %{levels}"
     zh-CN: "推理 %{levels}"

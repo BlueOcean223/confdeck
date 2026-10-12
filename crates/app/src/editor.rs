@@ -11,6 +11,7 @@
 //! - 删除先列出在用的 agent（`apply::used_by`）确认。有没保存的改动时关掉先问。
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use confdeck_core::agent::Mode;
 use confdeck_core::apply::{Synced, UsedBy};
@@ -55,6 +56,8 @@ pub const WIDTH: f32 = 560.;
 const PAIR_LABEL: f32 = 64.;
 /// 拉取列表一行的高度。
 const PICK_ROW: f32 = 34.;
+/// 推理档位下拉框里列的档位，按从低到高。文件里有别的写法也留着，排在后面。
+const LEVELS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// 模型目录里的一行：收起时是简表，展开是表单。
 struct ModelRow {
@@ -63,7 +66,8 @@ struct ModelRow {
     context: Entity<InputState>,
     output: Entity<InputState>,
     image: bool,
-    reasoning: Entity<InputState>,
+    /// 勾了的推理档位，按 `LEVELS` 的顺序；空表示不支持推理。
+    reasoning: Vec<String>,
     /// 原来的输入模态，保存时只增减「图像」。
     input: Vec<Modality>,
     /// 价格（美元 / 百万 token）：输入、输出、缓存读、缓存写。前两个都填了才算有价格。
@@ -131,6 +135,10 @@ pub struct Editor {
     fetching: bool,
     filling: bool,
     picker: Option<ModelPicker>,
+    /// 开着推理档位下拉框的那一行。
+    levels_open: Option<usize>,
+    /// 这次按下鼠标刚在框外点掉了下拉框：松开时别让下拉框的按钮又把它打开。
+    menu_just_closed: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -306,6 +314,8 @@ impl Editor {
             fetching: false,
             filling: false,
             picker: None,
+            levels_open: None,
+            menu_just_closed: false,
             _subscriptions: subscriptions,
         }
     }
@@ -326,11 +336,7 @@ impl Editor {
             context: input("128000".into(), &number(model.context), cx),
             output: input("32000".into(), &number(model.output), cx),
             image: model.input.contains(&Modality::Image),
-            reasoning: input(
-                t!("editor.reasoning_placeholder").into(),
-                &model.reasoning.join(", "),
-                cx,
-            ),
+            reasoning: sort_levels(model.reasoning.clone()),
             input: model.input.clone(),
             price: {
                 let cost = model.cost;
@@ -371,12 +377,7 @@ impl Editor {
                     context: parse_tokens(&value(&row.context)),
                     output: parse_tokens(&value(&row.output)),
                     input,
-                    reasoning: value(&row.reasoning)
-                        .split([',', ' ', '、', '/'])
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect(),
+                    reasoning: row.reasoning.clone(),
                     cost: {
                         let [input, output, read, write] =
                             row.price.each_ref().map(|state| parse_price(&value(state)));
@@ -683,7 +684,9 @@ impl Editor {
             set(&row.name, model.name.clone().unwrap_or_default(), cx);
             set(&row.context, number(model.context), cx);
             set(&row.output, number(model.output), cx);
-            set(&row.reasoning, model.reasoning.join(", "), cx);
+            if row.reasoning.is_empty() && !model.reasoning.is_empty() {
+                row.reasoning = sort_levels(model.reasoning.clone());
+            }
             if let Some(cost) = model.cost {
                 set(&row.price[0], price_text(cost.input), cx);
                 set(&row.price[1], price_text(cost.output), cx);
@@ -903,6 +906,137 @@ impl Editor {
         )
     }
 
+    fn toggle_levels(&mut self, n: usize, cx: &mut Context<Self>) {
+        if self.menu_just_closed {
+            return;
+        }
+        self.levels_open = (self.levels_open != Some(n)).then_some(n);
+        cx.notify();
+    }
+
+    fn toggle_level(&mut self, n: usize, level: &str, cx: &mut Context<Self>) {
+        let Some(row) = self.models.get_mut(n) else {
+            return;
+        };
+        if let Some(at) = row.reasoning.iter().position(|l| l == level) {
+            row.reasoning.remove(at);
+        } else {
+            row.reasoning.push(level.to_string());
+            row.reasoning = sort_levels(std::mem::take(&mut row.reasoning));
+        }
+        self.error = None;
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// 推理档位：样子和输入框一样，点开是可多选的档位列表。
+    fn levels_field(&self, n: usize, row: &ModelRow, t: &Theme, cx: &Context<Self>) -> Div {
+        let open = self.levels_open == Some(n);
+        let empty = row.reasoning.is_empty();
+        let label: SharedString = if empty {
+            t!("editor.reasoning_none").into()
+        } else {
+            row.reasoning.join(", ").into()
+        };
+        div()
+            .relative()
+            .w(px(220.))
+            .child(
+                div()
+                    .id(ElementId::named_usize("levels", n))
+                    .h_flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .h(px(30.))
+                    .px(px(9.))
+                    .rounded(px(7.))
+                    .bg(t.field)
+                    .border_1()
+                    .border_color(if open { t.accent } else { t.line })
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .when(!empty, |d| d.font_family("Menlo"))
+                            .text_color(if empty { t.faint } else { t.fg })
+                            .child(label),
+                    )
+                    .child(ui::icon(
+                        "chevron-down",
+                        10.,
+                        if open { t.muted } else { t.faint },
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_levels(n, cx))),
+            )
+            .when(open, |d| {
+                d.child(ui::overlay_dropdown(self.levels_menu(n, row, t, cx)))
+            })
+    }
+
+    fn levels_menu(
+        &self,
+        n: usize,
+        row: &ModelRow,
+        t: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let hover = t.sel;
+        let extra = row
+            .reasoning
+            .iter()
+            .filter(|level| !LEVELS.contains(&level.as_str()))
+            .cloned();
+        let levels: Vec<String> = LEVELS.iter().map(|l| l.to_string()).chain(extra).collect();
+        let mut list = div().v_flex().p(px(5.));
+        for (i, level) in levels.into_iter().enumerate() {
+            let on = row.reasoning.contains(&level);
+            list = list.child(
+                div()
+                    .id(ElementId::named_usize("level", i))
+                    .h_flex()
+                    .items_center()
+                    .gap(px(9.))
+                    .h(px(30.))
+                    .px(px(8.))
+                    .rounded(px(7.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .child(ui::checkbox(t, on))
+                    .child(
+                        div()
+                            .font_family("Menlo")
+                            .text_size(px(12.))
+                            .child(level.clone()),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_level(n, &level, cx))),
+            );
+        }
+        div()
+            .w(px(220.))
+            .bg(Hsla { a: 1., ..t.pop_bg })
+            .rounded(px(11.))
+            .border_1()
+            .border_color(t.line)
+            .shadow(t.pop_shadow())
+            .overflow_hidden()
+            .occlude()
+            .text_color(t.fg)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.levels_open = None;
+                this.menu_just_closed = true;
+                cx.notify();
+            }))
+            .child(list)
+            .with_animation(
+                "levels-in",
+                Animation::new(Duration::from_millis(320)).with_easing(ui::ease_out_quart),
+                |el, d| el.opacity((d * 2.2).min(1.)).mt(px(-6. * (1. - d))),
+            )
+    }
+
     fn model_line(&self, row: &ModelRow, cx: &App) -> SharedString {
         let value = |state: &Entity<InputState>| state.read(cx).value().trim().to_string();
         let mut parts: Vec<String> = Vec::new();
@@ -915,14 +1049,8 @@ impl Editor {
         if row.image {
             parts.push(t!("editor.image").into());
         }
-        let reasoning = value(&row.reasoning);
-        if !reasoning.is_empty() {
-            let levels = reasoning
-                .split([',', ' ', '、', '/'])
-                .filter(|s| !s.trim().is_empty())
-                .map(str::trim)
-                .collect::<Vec<_>>()
-                .join(" / ");
+        if !row.reasoning.is_empty() {
+            let levels = row.reasoning.join(" / ");
             parts.push(t!("editor.reasoning_line", levels = levels).into());
         }
         if parts.is_empty() {
@@ -1126,7 +1254,7 @@ impl Editor {
                     )
                     .child(div().flex_1())
                     .child(ui::hint(t, t!("editor.reasoning")).flex_none())
-                    .child(div().w(px(220.)).child(field(&row.reasoning, true))),
+                    .child(self.levels_field(n, row, t, cx)),
             )
             .child(pair(
                 (t!("editor.price_input").into(), price(&row.price[0])),
@@ -1733,6 +1861,10 @@ impl Render for Editor {
             .v_flex()
             .w(px(WIDTH))
             .max_h(px(max_h))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.menu_just_closed = false),
+            )
             .bg(t.card)
             .rounded(px(14.))
             .border_1()
@@ -1770,6 +1902,25 @@ fn slug(name: &str) -> String {
     } else {
         out
     }
+}
+
+/// 推理档位按 `LEVELS` 的顺序排，认不出的排在后面、保持原来的先后，重复的去掉。
+fn sort_levels(levels: Vec<String>) -> Vec<String> {
+    let rank = |level: &str| {
+        LEVELS
+            .iter()
+            .position(|l| *l == level)
+            .unwrap_or(LEVELS.len())
+    };
+    let mut out: Vec<String> = Vec::new();
+    for level in levels {
+        let level = level.trim().to_string();
+        if !level.is_empty() && !out.contains(&level) {
+            out.push(level);
+        }
+    }
+    out.sort_by_key(|level| rank(level));
+    out
 }
 
 /// 解析 token 数：`128000`、`128,000`、`128k`、`1m`。
