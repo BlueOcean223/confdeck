@@ -215,6 +215,63 @@ pub fn sync_component_theme(t: &Theme, cx: &mut App) {
     theme.muted_foreground = t.faint;
     theme.caret = t.fg;
     theme.selection = t.sel;
+    theme.highlight_theme = highlight_theme(t);
+}
+
+/// 「原始文件」的语法着色。gpui-component 自带的那套把键名画成和正文一样的颜色，JSON 只有字符串是彩色的；
+/// 这里照 VS Code 的 Light+ / Dark+ 换掉几种：键名、TOML 的表名、字符串、数字、布尔和 null、注释。
+/// 编辑器底色也换成输入框的底色：自带的深色是 `#0a0a0a`，行号栏会比正文那块黑一截。
+fn highlight_theme(t: &Theme) -> std::sync::Arc<gpui_kit::component::highlighter::HighlightTheme> {
+    use gpui_kit::component::highlighter::{HighlightTheme, SyntaxColors};
+    use std::sync::{Arc, OnceLock};
+
+    static LIGHT: OnceLock<Arc<HighlightTheme>> = OnceLock::new();
+    static DARK: OnceLock<Arc<HighlightTheme>> = OnceLock::new();
+    let (cell, base, colors) = if t.dark {
+        (
+            &DARK,
+            HighlightTheme::default_dark(),
+            [
+                ("property", "#9cdcfe"),
+                ("type", "#4ec9b0"),
+                ("string", "#ce9178"),
+                ("string.special", "#b5cea8"),
+                ("number", "#b5cea8"),
+                ("boolean", "#569cd6"),
+                ("constant", "#569cd6"),
+                ("comment", "#6a9955"),
+            ],
+        )
+    } else {
+        (
+            &LIGHT,
+            HighlightTheme::default_light(),
+            [
+                ("property", "#0451a5"),
+                ("type", "#267f99"),
+                ("string", "#a31515"),
+                ("string.special", "#098658"),
+                ("number", "#098658"),
+                ("boolean", "#0000ff"),
+                ("constant", "#0000ff"),
+                ("comment", "#008000"),
+            ],
+        )
+    };
+    cell.get_or_init(|| {
+        let mut syntax = serde_json::to_value(&base.style.syntax).unwrap_or_default();
+        for (name, color) in colors {
+            syntax[name] = serde_json::json!({ "color": color });
+        }
+        let mut theme = (*base).clone();
+        if let Ok(syntax) = serde_json::from_value::<SyntaxColors>(syntax) {
+            theme.style.syntax = syntax;
+        }
+        theme.style.editor_background = Some(t.field);
+        theme.style.editor_active_line = Some(t.fg.opacity(0.04));
+        Arc::new(theme)
+    })
+    .clone()
 }
 
 fn shadow(color: Hsla, x: f32, y: f32, blur: f32, spread: f32, inset: bool) -> BoxShadow {

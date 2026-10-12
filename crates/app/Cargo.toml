@@ -12,7 +12,9 @@ shots = ["gpui-kit/test-support"]
 
 [dependencies]
 confdeck-core.workspace = true
-gpui-kit.workspace = true
+# tree-sitter：配置页「原始文件」的 JSON 语法高亮；TOML 的要另开 gpui-component 的 tree-sitter-toml（同一个版本，特性合并）。
+gpui-kit = { workspace = true, features = ["tree-sitter"] }
+gpui-component = { version = "0.7.1", default-features = false, features = ["tree-sitter-toml"] }
 tray-icon.workspace = true
 async-channel.workspace = true
 anyhow.workspace = true
@@ -22,6 +24,7 @@ sys-locale.workspace = true
 resvg.workspace = true
 image.workspace = true
 chrono.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

@@ -25,9 +25,11 @@ const HEADER: f32 = 30.;
 const ROW: f32 = 40.;
 const LINKS: f32 = 20.;
 
+/// 面板窗口第一次打开时建好，之后关掉只是藏起来（`mac::hide`），下次打开再显示，不销毁。
 #[derive(Default)]
 struct PanelState {
     handle: Option<WindowHandle<Panel>>,
+    shown: bool,
     closed_at: Option<Instant>,
 }
 
@@ -41,6 +43,7 @@ pub fn init(cx: &mut App) {
 #[cfg(debug_assertions)]
 pub fn handle(cx: &App) -> Option<AnyWindowHandle> {
     cx.try_global::<PanelState>()
+        .filter(|state| state.shown)
         .and_then(|state| state.handle)
         .map(Into::into)
 }
@@ -48,17 +51,16 @@ pub fn handle(cx: &App) -> Option<AnyWindowHandle> {
 /// 面板开着就关掉，关着就在 `icon`（托盘图标在屏幕上的位置）下方打开。
 pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     let state = cx.default_global::<PanelState>();
-    let open = state.handle.take();
+    let (handle, shown) = (state.handle, state.shown);
     // 面板开着时点托盘图标，面板会先因失焦关掉，紧接着才收到这次点击；这次就不再打开。
     let just_closed = state
         .closed_at
         .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
 
-    if let Some(handle) = open
-        && handle
-            .update(cx, |_, window, _| window.remove_window())
-            .is_ok()
-    {
+    if shown {
+        if let Some(handle) = handle {
+            handle.update(cx, |_, window, cx| close(window, cx)).ok();
+        }
         return;
     }
     if just_closed {
@@ -67,6 +69,18 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
 
     let height = base_height(store.read(cx));
     let origin = point(icon.center().x - px(WIDTH / 2.), icon.bottom() + px(OFFSET));
+    // 和 Wails 一样先激活应用再显示面板。不激活的话，应用在后台、主窗口又开着时，
+    // gpui 为绕开 Cocoa 的一个问题会立刻收走面板刚拿到的焦点，接着 AppKit 抛异常崩溃。
+    cx.activate(true);
+    if let Some(handle) = handle
+        && handle
+            .update(cx, |panel, window, cx| panel.reopen(origin, window, cx))
+            .is_ok()
+    {
+        cx.global_mut::<PanelState>().shown = true;
+        return;
+    }
+
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
             origin,
@@ -82,13 +96,14 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
         window_background: WindowBackgroundAppearance::Blurred,
         ..Default::default()
     };
-    // 和 Wails 一样先激活应用再显示面板。不激活的话，应用在后台、主窗口又开着时，
-    // gpui 为绕开 Cocoa 的一个问题会立刻收走面板刚拿到的焦点，接着 AppKit 抛异常崩溃。
-    cx.activate(true);
     match cx.open_window(options, |window, cx| {
         cx.new(|cx| Panel::new(store, window, cx))
     }) {
-        Ok(handle) => cx.global_mut::<PanelState>().handle = Some(handle),
+        Ok(handle) => {
+            let state = cx.global_mut::<PanelState>();
+            state.handle = Some(handle);
+            state.shown = true;
+        }
         Err(err) => eprintln!("failed to open panel: {err:#}"),
     }
 }
@@ -118,6 +133,9 @@ struct OpenPicker {
     agent: usize,
     row: usize,
     picker: Entity<Picker>,
+    /// 窗口长到装得下选择器以后才画它。窗口高度要下一轮主线程任务才改得动（notes/panel-resize.md），
+    /// 先画的话第一帧窗口还是矮的，选择器会被挤到上面盖住列表，下一帧才落回原位，看着就是闪一下。
+    drawn: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -165,6 +183,26 @@ impl Panel {
             height,
             _subscriptions,
         }
+    }
+
+    /// 藏起来的面板重新显示：回到刚打开时的样子，挪到托盘图标下面。
+    fn reopen(&mut self, origin: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.just_closed = None;
+        self.status = None;
+        self.height = base_height(self.store.read(cx));
+        self.focus_handle.focus(window, cx);
+        #[cfg(target_os = "macos")]
+        {
+            crate::mac::show_at(window, origin, self.height as f64, cx);
+            // 排在 `show_at` 的任务后面：窗口显示出来以后，等画完下一帧再变回不透明。
+            cx.spawn_in(window, async move |_, cx| {
+                cx.update(|window, _| window.on_next_frame(|window, _| crate::mac::reveal(window)))
+                    .ok();
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     /// 窗口高度跟着内容走：平时刚好装下列表；开着选择器时往下长，刚好装下选择器。
@@ -241,6 +279,7 @@ impl Panel {
             agent,
             row,
             picker,
+            drawn: false,
             _subscriptions,
         });
         self.fit_height(window, cx);
@@ -385,26 +424,18 @@ impl Panel {
     }
 }
 
-/// 关掉面板。不能在 AppKit 的窗口回调（比如失焦）里同步关窗口，会抛 NSRangeException
-/// 让整个应用崩溃，所以先交出第一响应者，等一帧再关（notes/panel-focus-crash.md）。
+/// 关掉面板：只藏起来，不销毁窗口（`mac::hide` 说了为什么）。失焦回调里也会调到，
+/// 所以真正 `orderOut` 放在下一轮主线程任务（notes/panel-focus-crash.md）。
 fn close(window: &mut Window, cx: &mut App) {
     let state = cx.default_global::<PanelState>();
-    state.handle = None;
+    if !state.shown {
+        return;
+    }
+    state.shown = false;
     state.closed_at = Some(Instant::now());
     window.blur(cx);
     #[cfg(target_os = "macos")]
-    crate::mac::resign_first_responder(window);
-    let handle = window.window_handle();
-    let timer = cx.background_executor().timer(Duration::from_millis(32));
-    cx.spawn(async move |cx| {
-        timer.await;
-        cx.update(|cx| {
-            handle
-                .update(cx, |_, window, _| window.remove_window())
-                .ok()
-        });
-    })
-    .detach();
+    crate::mac::hide(window, cx);
 }
 
 impl Render for Panel {
@@ -421,19 +452,23 @@ impl Render for Panel {
         let open_store = self.store.clone();
 
         // 选择器盖在列表上，从打开它的那一行下面展开，宽度和面板一样（左右各留 8）。
-        let picker = self.picker.as_ref().map(|open| {
+        // 不用 `anchored`：窗口比选择器矮时它会把选择器往上挪；这里固定位置，矮了就先截掉下面一截。
+        let tall_enough = window.viewport_size().height >= px(self.height - 0.5);
+        if let Some(open) = self.picker.as_mut() {
+            open.drawn |= tall_enough;
+        }
+        let picker = self.picker.as_ref().filter(|open| open.drawn).map(|open| {
             deferred(
-                anchored()
-                    .position(point(px(8.), px(row_bottom(open.row) + 4.)))
-                    .child(
-                        div()
-                            .w(px(WIDTH - 16.))
-                            .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
-                                this.just_closed = this.picker.as_ref().map(|p| p.agent);
-                                this.close_picker(window, cx);
-                            }))
-                            .child(open.picker.clone()),
-                    ),
+                div()
+                    .absolute()
+                    .top(px(row_bottom(open.row) + 4.))
+                    .left(px(8.))
+                    .w(px(WIDTH - 16.))
+                    .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
+                        this.just_closed = this.picker.as_ref().map(|p| p.agent);
+                        this.close_picker(window, cx);
+                    }))
+                    .child(open.picker.clone()),
             )
             .with_priority(1)
         });
