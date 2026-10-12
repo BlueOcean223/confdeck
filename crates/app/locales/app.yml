@@ -237,12 +237,23 @@ editor:
   key_hint_in_use:
     en: "Changes sync to %{agents}"
     zh-CN: "改了会同步到 %{agents}"
+  # 接口：一个公共地址，各协议的地址默认按它填，收在「协议」一行里（用户 10-12）。
   endpoints:
     en: Endpoints
-    zh-CN: 接口地址
-  endpoints_hint:
-    en: Leave empty if the protocol isn't supported
-    zh-CN: 留空则表示不支持该协议
+    zh-CN: 接口
+  base_url:
+    en: Base URL
+    zh-CN: 地址
+  protocols:
+    en: Protocols
+    zh-CN: 协议
+  # 展开后各协议地址框右边的按钮。
+  endpoint_remove:
+    en: Not offered
+    zh-CN: 不提供
+  endpoint_add:
+    en: Fill from base URL
+    zh-CN: 按地址填上
   not_offered:
     en: Not offered
     zh-CN: 不提供

@@ -2,9 +2,10 @@
 //! 覆盖不在这里，在 agent 的「配置 ›」页。
 //!
 //! - 在用的 agent 一排芯片（名字 + 它用的模型）；名字；ID（新建时从名字生成、可改，建好后只读）；
-//!   Key（遮罩 + 显示）；四种接口地址各一行，空着就是不提供；模型目录简表，点一行展开改全部字段，
+//!   Key（遮罩 + 显示）；接口：一个公共的「地址」，四种协议的地址默认按它填（`EndpointRow`），收在「协议」一行里，
+//!   展开能改、去掉、加回来（用户 10-12：协议地址大多是固定的）；模型目录简表，点一行展开改全部字段，
 //!   「添加模型」是同一个表单；每行最前面是默认模型的标记。
-//! - 「接口地址」右边「测速」：按表单里现在的地址测（还没存也行），结果写在每个地址框的右边。
+//! - 「接口」右边「测速」：按表单里现在的地址测（还没存也行），结果写在「协议」那行每个协议后面，展开时在每个地址框的右边。
 //! - 「模型目录」右边「拉取」：从这家的接口拉模型列表，弹一层勾要加的（目录里已有的勾着、灰着），补好参数加进目录；
 //!   「补全」：按预设和 models.dev 补目录里空着的上下文、输出上限、图像、推理档位、价格（只补空的）。
 //! - 保存走 `Store::save_provider`（core 的 `apply::save_provider`），结果交给主窗口提示。
@@ -58,6 +59,14 @@ const PAIR_LABEL: f32 = 64.;
 const PICK_ROW: f32 = 34.;
 /// 推理档位下拉框里列的档位，按从低到高。文件里有别的写法也留着，排在后面。
 const LEVELS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// 一种协议的地址。
+struct EndpointRow {
+    protocol: Protocol,
+    input: Entity<InputState>,
+    /// 跟着公共地址走时接在它后面的那段（`default_suffix`）；`None` 是自己填的，或者不提供（空着）。
+    suffix: Option<String>,
+}
 
 /// 模型目录里的一行：收起时是简表，展开是表单。
 struct ModelRow {
@@ -122,7 +131,11 @@ pub struct Editor {
     id_edited: bool,
     key: Entity<InputState>,
     key_visible: bool,
-    endpoints: Vec<(Protocol, Entity<InputState>)>,
+    /// 公共的接口地址。不存进供应商，打开时从各协议的地址推出来（`infer_base`）。
+    base: Entity<InputState>,
+    endpoints: Vec<EndpointRow>,
+    /// 各协议的地址展开着。推不出公共地址（各协议不在一个地方）时一打开就展开。
+    endpoints_open: bool,
     models: Vec<ModelRow>,
     /// 默认模型是第几行；`None` 是没指定（目录第一个）。
     default_row: Option<usize>,
@@ -230,13 +243,32 @@ impl Editor {
         let name = input(t!("editor.name").into(), &provider.name, cx);
         let id = input("id".into(), &provider.id, cx);
         let key = input(t!("editor.key_placeholder").into(), &provider.key, cx);
-        let endpoints = PROTOCOLS
+        // 一个地址都没有（新建自定义的）：Anthropic、OpenAI 两种默认跟着公共地址走，Gemini 默认不提供。
+        let blank = provider.endpoints.is_empty();
+        let base_url = infer_base(
+            &PROTOCOLS
+                .iter()
+                .filter_map(|&protocol| Some((protocol, provider.endpoint(protocol)?)))
+                .collect::<Vec<_>>(),
+        );
+        let base = input("https://…".into(), &base_url, cx);
+        let endpoints: Vec<EndpointRow> = PROTOCOLS
             .iter()
             .map(|&protocol| {
                 let url = provider.endpoint(protocol).unwrap_or_default();
-                (protocol, input(t!("editor.not_offered").into(), url, cx))
+                let suffix = if blank {
+                    (protocol != Protocol::Gemini).then(|| default_suffix(protocol).to_string())
+                } else {
+                    follows(&base_url, url)
+                };
+                EndpointRow {
+                    protocol,
+                    input: input(t!("editor.not_offered").into(), url, cx),
+                    suffix,
+                }
             })
             .collect();
+        let endpoints_open = base_url.is_empty() && !blank;
         let models = provider
             .models
             .iter()
@@ -247,6 +279,24 @@ impl Editor {
             .as_deref()
             .and_then(|id| provider.models.iter().position(|m| m.id == id));
 
+        subscriptions.push(cx.subscribe_in(
+            &base,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::Change = event {
+                    this.base_changed(window, cx);
+                }
+            },
+        ));
+        for (n, row) in endpoints.iter().enumerate() {
+            subscriptions.push(
+                cx.subscribe(&row.input, move |this, _, event: &InputEvent, cx| {
+                    if let InputEvent::Change = event {
+                        this.endpoint_changed(n, cx);
+                    }
+                }),
+            );
+        }
         // 新建时 ID 跟着名字走，直到用户自己动了 ID。
         subscriptions.push(cx.subscribe_in(
             &name,
@@ -304,7 +354,9 @@ impl Editor {
             id_edited: false,
             key,
             key_visible: false,
+            base,
             endpoints,
+            endpoints_open,
             models,
             default_row,
             expanded: None,
@@ -407,9 +459,9 @@ impl Editor {
             endpoints: self
                 .endpoints
                 .iter()
-                .filter_map(|(protocol, state)| {
-                    let url = value(state);
-                    (!url.is_empty()).then_some((*protocol, url))
+                .filter_map(|row| {
+                    let url = value(&row.input);
+                    (!url.is_empty()).then_some((row.protocol, url))
                 })
                 .collect(),
             models,
@@ -531,6 +583,50 @@ impl Editor {
     }
 
     /// 「测速」：按表单里现在的地址测。
+    /// 改了公共地址：跟着它走的协议换成新地址后面接原来那段；它清空了，这几种也清空。
+    fn base_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let base = self.base.read(cx).value().trim().to_string();
+        for row in &self.endpoints {
+            if let Some(suffix) = &row.suffix {
+                let url = join(&base, suffix);
+                row.input
+                    .update(cx, |input, cx| input.set_value(url, window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 手改了一种协议的地址：还在公共地址底下就接着跟它走（记下后面那段），不在了就是自己填的。
+    fn endpoint_changed(&mut self, n: usize, cx: &mut Context<Self>) {
+        let base = self.base.read(cx).value().trim().to_string();
+        let row = &mut self.endpoints[n];
+        let url = row.input.read(cx).value().trim().to_string();
+        row.suffix = follows(&base, &url);
+    }
+
+    /// 展开后某种协议右边的「×」：不提供。
+    fn remove_endpoint(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let row = &mut self.endpoints[n];
+        row.suffix = None;
+        row.input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.error = None;
+        cx.notify();
+    }
+
+    /// 空着的协议右边的「＋」：按公共地址填上。
+    fn add_endpoint(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let base = self.base.read(cx).value().trim().to_string();
+        let row = &mut self.endpoints[n];
+        let suffix = default_suffix(row.protocol).to_string();
+        let url = join(&base, &suffix);
+        row.suffix = Some(suffix);
+        row.input
+            .update(cx, |input, cx| input.set_value(url, window, cx));
+        self.error = None;
+        cx.notify();
+    }
+
     fn ping(&mut self, cx: &mut Context<Self>) {
         let mut draft = self.draft(cx);
         draft.normalize();
@@ -1359,8 +1455,8 @@ impl Editor {
                 }),
         );
 
-        let pinging = self.endpoints.iter().any(|(protocol, state)| {
-            let url = normalize_url(*protocol, &state.read(cx).value());
+        let pinging = self.endpoints.iter().any(|row| {
+            let url = normalize_url(row.protocol, &row.input.read(cx).value());
             matches!(store.reach(&url), Some(Reach::Checking))
         });
         let mut body = div()
@@ -1380,7 +1476,7 @@ impl Editor {
             .child(self.section(
                 t,
                 t!("editor.endpoints").into(),
-                Some(t!("editor.endpoints_hint").into()),
+                None,
                 vec![self.section_button(
                     "ping",
                     t,
@@ -1389,20 +1485,25 @@ impl Editor {
                     |this, _, cx| this.ping(cx),
                     cx,
                 )],
-            ));
-        for (n, (protocol, state)) in self.endpoints.iter().enumerate() {
-            let url = normalize_url(*protocol, &state.read(cx).value());
-            let reach = (!url.is_empty())
-                .then(|| store.reach(&url))
-                .flatten()
-                .map(|reach| {
-                    net::reach_text(t, ElementId::named_usize("reach", n), reach).into_any_element()
-                });
-            body = body.child(self.form_row(
+            ))
+            .child(self.form_row(
                 t,
-                protocol.to_string().into(),
-                ui::field(t, state, true, reach, window, cx),
+                t!("editor.base_url").into(),
+                ui::field(t, &self.base, true, None, window, cx),
+            ))
+            .child(self.form_row(
+                t,
+                t!("editor.protocols").into(),
+                self.protocols_line(t, store, cx),
             ));
+        if self.endpoints_open {
+            for (n, row) in self.endpoints.iter().enumerate() {
+                body = body.child(self.form_row(
+                    t,
+                    row.protocol.to_string().into(),
+                    self.endpoint_field(n, row, t, store, window, cx),
+                ));
+            }
         }
         let busy = |on: bool, text: SharedString| on.then_some(text);
         body = body
@@ -1437,6 +1538,114 @@ impl Editor {
                     .on_click(cx.listener(|this, _, window, cx| this.add_model(window, cx))),
             );
         body
+    }
+
+    /// 「协议」一行：提供哪几种（测过速的后面跟着结果），点一下展开、收起各协议的地址。
+    fn protocols_line(&self, t: &Theme, store: &Store, cx: &Context<Self>) -> Stateful<Div> {
+        let hover = t.fg;
+        let mut line = div()
+            .id("protocols")
+            .h_flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(30.))
+            .cursor_pointer()
+            .text_size(px(12.5))
+            .text_color(t.fg_2)
+            .hover(move |s| s.text_color(hover))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.endpoints_open = !this.endpoints_open;
+                cx.notify();
+            }));
+        let mut any = false;
+        for (n, row) in self.endpoints.iter().enumerate() {
+            let url = row.input.read(cx).value().trim().to_string();
+            if url.is_empty() && row.suffix.is_none() {
+                continue;
+            }
+            let reach = (!url.is_empty())
+                .then(|| store.reach(&normalize_url(row.protocol, &url)))
+                .flatten();
+            line = line.child(
+                div()
+                    .h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(5.))
+                    .when(any, |d| {
+                        d.child(div().text_color(t.faint).mr(px(5.)).child("·"))
+                    })
+                    .child(row.protocol.to_string())
+                    .children(reach.map(|reach| {
+                        net::reach_text(t, ElementId::named_usize("line-reach", n), reach)
+                    })),
+            );
+            any = true;
+        }
+        if !any {
+            line = line.child(div().text_color(t.muted).child(t!("editor.not_offered")));
+        }
+        line.child(div().flex_1()).child(ui::icon(
+            if self.endpoints_open {
+                "chevron-up"
+            } else {
+                "chevron-down"
+            },
+            12.,
+            t.faint,
+        ))
+    }
+
+    /// 展开后一种协议的地址框：右边是测速结果和「×」（去掉）或「＋」（按公共地址填上）。
+    fn endpoint_field(
+        &self,
+        n: usize,
+        row: &EndpointRow,
+        t: &Theme,
+        store: &Store,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        let url = row.input.read(cx).value().trim().to_string();
+        let reach = (!url.is_empty())
+            .then(|| store.reach(&normalize_url(row.protocol, &url)))
+            .flatten();
+        let hover = t.pill_hover;
+        let (icon, tip): (&str, SharedString) = if url.is_empty() {
+            ("plus", t!("editor.endpoint_add").into())
+        } else {
+            ("x", t!("editor.endpoint_remove").into())
+        };
+        let empty = url.is_empty();
+        let button = div()
+            .id(ElementId::named_usize("endpoint-toggle", n))
+            .flex_none()
+            .size(px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.))
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .tooltip(ui::tooltip(tip))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if empty {
+                    this.add_endpoint(n, window, cx);
+                } else {
+                    this.remove_endpoint(n, window, cx);
+                }
+            }))
+            .child(ui::icon(icon, 12., t.muted));
+        let suffix = div()
+            .h_flex()
+            .items_center()
+            .gap(px(6.))
+            .children(
+                reach.map(|reach| net::reach_text(t, ElementId::named_usize("reach", n), reach)),
+            )
+            .child(button)
+            .into_any_element();
+        ui::field(t, &row.input, true, Some(suffix), window, cx)
     }
 
     fn footer(&self, t: &Theme, cx: &Context<Self>) -> Div {
@@ -1998,10 +2207,129 @@ fn describe(err: &ProviderError) -> SharedString {
     .into()
 }
 
+/// 跟着公共地址走时，各协议接在它后面的那段：Anthropic、Gemini 的地址存的是不带版本的（`normalize_url` 会去掉
+/// `/v1`、`/v1beta`），OpenAI 两种带 `/v1`。
+fn default_suffix(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::OpenaiChat | Protocol::OpenaiResponses => "/v1",
+        Protocol::Anthropic | Protocol::Gemini => "",
+    }
+}
+
+fn join(base: &str, suffix: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return String::new();
+    }
+    format!("{base}{suffix}")
+}
+
+/// `url` 在 `base` 底下（就是它，或者在它的某个子路径）时，返回后面那段。
+fn follows(base: &str, url: &str) -> Option<String> {
+    let base = base.trim().trim_end_matches('/');
+    let url = url.trim().trim_end_matches('/');
+    if base.is_empty() || url.is_empty() {
+        return None;
+    }
+    let rest = url.strip_prefix(base)?;
+    (rest.is_empty() || rest.starts_with('/')).then(|| rest.to_string())
+}
+
+/// 从各协议的地址推公共地址：按路径段取共同的开头（至少到主机名）；只有 OpenAI 的地址时去掉末尾的 `/v1`。
+/// 只有一种时去掉这种协议默认接的那段。推不出来（不在一个主机上）是空的。
+fn infer_base(endpoints: &[(Protocol, &str)]) -> String {
+    let urls: Vec<(Protocol, &str)> = endpoints
+        .iter()
+        .map(|(protocol, url)| (*protocol, url.trim().trim_end_matches('/')))
+        .filter(|(_, url)| !url.is_empty())
+        .collect();
+    let Some((first, rest)) = urls.split_first() else {
+        return String::new();
+    };
+    let mut common: Vec<&str> = first.1.split('/').collect();
+    for (_, url) in rest {
+        let segments: Vec<&str> = url.split('/').collect();
+        let same = common
+            .iter()
+            .zip(&segments)
+            .take_while(|(a, b)| a == b)
+            .count();
+        common.truncate(same);
+    }
+    // `https:`、空段、主机名：少于三段就是主机都不一样。
+    if common.len() < 3 || common[2].is_empty() {
+        return String::new();
+    }
+    let base = common.join("/");
+    let openai_only = urls
+        .iter()
+        .all(|(protocol, _)| default_suffix(*protocol) == "/v1");
+    if openai_only && common.len() > 3 {
+        return base.strip_suffix("/v1").unwrap_or(&base).to_string();
+    }
+    base
+}
+
 #[cfg(test)]
 mod tests {
     // 不能 `use super::*`：gpui 也导出一个 `test` 属性宏，会把 `#[test]` 抢走。
-    use super::{parse_price, parse_tokens, price_text, slug, tokens};
+    use confdeck_core::provider::Protocol;
+
+    use super::{follows, infer_base, join, parse_price, parse_tokens, price_text, slug, tokens};
+
+    #[test]
+    fn the_shared_address_comes_from_the_protocol_addresses() {
+        use Protocol::*;
+        let deepseek = [
+            (Anthropic, "https://api.deepseek.com/anthropic"),
+            (OpenaiChat, "https://api.deepseek.com/v1"),
+            (OpenaiResponses, "https://api.deepseek.com"),
+        ];
+        assert_eq!(infer_base(&deepseek), "https://api.deepseek.com");
+        let relay = [
+            (Anthropic, "https://relay.example.com/"),
+            (OpenaiChat, "https://relay.example.com/v1"),
+        ];
+        assert_eq!(infer_base(&relay), "https://relay.example.com");
+        // 只有 OpenAI 的：去掉末尾的 /v1。
+        assert_eq!(
+            infer_base(&[
+                (OpenaiChat, "https://openrouter.ai/api/v1"),
+                (OpenaiResponses, "https://openrouter.ai/api/v1")
+            ]),
+            "https://openrouter.ai/api"
+        );
+        assert_eq!(
+            infer_base(&[(Anthropic, "https://api.kimi.com/coding")]),
+            "https://api.kimi.com/coding"
+        );
+        // 不在一个主机上：推不出来。
+        assert_eq!(
+            infer_base(&[
+                (Anthropic, "https://a.example.com"),
+                (OpenaiChat, "https://b.example.com/v1")
+            ]),
+            ""
+        );
+        assert_eq!(infer_base(&[]), "");
+    }
+
+    #[test]
+    fn protocol_addresses_follow_the_shared_one() {
+        assert_eq!(
+            follows("https://x.com", "https://x.com/v1").as_deref(),
+            Some("/v1")
+        );
+        assert_eq!(
+            follows("https://x.com/", "https://x.com").as_deref(),
+            Some("")
+        );
+        // 只是开头的字一样，不是它底下的路径。
+        assert_eq!(follows("https://x.com", "https://x.company/v1"), None);
+        assert_eq!(follows("", "https://x.com"), None);
+        assert_eq!(join("https://y.com/", "/v1"), "https://y.com/v1");
+        assert_eq!(join("  ", "/v1"), "");
+    }
 
     #[test]
     fn slugs_come_from_the_name() {
