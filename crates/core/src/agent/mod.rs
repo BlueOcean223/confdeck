@@ -122,7 +122,7 @@ impl Credential {
 }
 
 /// 从配置文件里读出的一套设置，用来「把当前配置存成供应商」。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileSetup {
     pub protocol: Protocol,
     pub base_url: String,

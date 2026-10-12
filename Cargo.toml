@@ -40,3 +40,10 @@ sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tempfile = "3"
 toml_edit = "0.22"
+# confdeck 自己发出去的请求（拉模型列表、测连通、下 models.dev），在后台线程上用阻塞的客户端。
+# 不用默认的 rustls（aws-lc-rs 要编一大截 C）：native-tls 在 macOS 上是系统的 Security.framework，信任钥匙串里装的证书。
+# system-proxy：没设代理时跟着环境变量和系统的代理设置走。
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls", "http2", "system-proxy", "socks", "gzip"] }
+# 设置页显示「跟随系统」现在走的是哪个代理：和 reqwest 用的是同一个函数。
+hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"] }
+http = "1"

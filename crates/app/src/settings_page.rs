@@ -1,20 +1,28 @@
-//! 设置页（顶栏的齿轮）：设一次就不动的东西，一块一张卡。
+//! 设置页（顶栏的齿轮）：设一次就不动的东西，一块一张卡，按提案 12 分成三段：通用、Claude Code、数据。
 //!
-//! - 显示哪些 agent：每个 agent 两个开关，Agent 页一个、菜单栏面板一个（`Store::set_agent_hidden`，记在 `state.json`）。
+//! - 通用 › 显示哪些 agent：每个 agent 两个开关，Agent 页一个、菜单栏面板一个（`Store::set_agent_hidden`，记在 `state.json`）。
 //!   默认都开；关掉只是不列，配置文件和选择都不动。
+//! - 通用 › 出站代理（decisions「功能范围」：默认跟随系统，可以单独设置）：跟随系统 / 不用代理 / 自定义，
+//!   记在 `state.json`；「测试」连一次 models.dev。confdeck 自己联网（测连通、拉模型列表、models.dev）都走它。
 //! - Claude Code：跳过首次确认、VS Code 插件跟着切换、隐藏 AI 署名（decisions「配置页」：一次性的设置放设置页，
 //!   署名先做成全局开关）。点一下写一次（`Store::set_claude_toggle`），不攒着等保存。行里的小字是文件和键名，查问题时用。
-//! - 备份（decisions「备份」）：右上角的下拉框选文件归谁（默认 Claude Code），只列这一家有备份的文件，
+//! - 数据 › 导入导出：供应商导出成 `providers.json` 格式的文件（可以不带 Key），从这样的文件导入（先列出新增、覆盖哪几家再确认）。
+//! - 数据 › 备份（decisions「备份」）：右上角的下拉框选文件归谁（默认 Claude Code），只列这一家有备份的文件，
 //!   一个文件一行（几份、多大、最近一次），点开列每一份的时间和原因，可以看和现在的差异、恢复、「清理」（删原件以外的）。
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use chrono::NaiveDateTime;
+use chrono::{Local, NaiveDateTime};
 use confdeck_core::agent::AgentKind;
 use confdeck_core::backup::{Backup, Reason};
 use confdeck_core::diff::{self, Row};
 use confdeck_core::engine::Place;
+use confdeck_core::net::{self as core_net, NetError, Proxy, ProxyMode};
+use confdeck_core::provider::Provider;
 use confdeck_core::toggles::{CLAUDE_TOGGLES, ClaudeToggle};
+use confdeck_core::transfer::Plan;
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -22,7 +30,8 @@ use rust_i18n::t;
 
 use crate::data::{BackupOwner, FileBackups, Logo, Store};
 use crate::theme::Theme;
-use crate::ui;
+use crate::ui::{self, Button};
+use crate::{files, net};
 
 /// 点开的「差异」：第几个文件的第几份，和算好的行。备份列表变了（恢复以后多一份）按路径找回来。
 struct DiffView {
@@ -32,8 +41,43 @@ struct DiffView {
     rows: Vec<Row>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    General,
+    Claude,
+    Data,
+}
+
+enum ProxyTest {
+    Testing,
+    Done(Result<Duration, NetError>),
+}
+
+/// 选好了要导入的文件，等确认。
+struct PendingImport {
+    incoming: Vec<Provider>,
+    plan: Plan,
+}
+
 pub struct SettingsPage {
     store: Entity<Store>,
+    section: Section,
+    /// 分段标签的滑块从哪一段滑过来、第几次切换（同顶栏）。
+    section_from: Option<(usize, u64)>,
+    switches: u64,
+    /// 存着的出站代理；自定义的地址在输入框里改，写对了就存。
+    proxy: Proxy,
+    proxy_url: Entity<InputState>,
+    /// 「跟随系统」现在走的代理，打开设置页时读一次。
+    system_proxy: Option<String>,
+    proxy_test: Option<ProxyTest>,
+    /// 自定义的地址写得不对。
+    proxy_error: Option<SharedString>,
+    /// 输入框里上一次的内容：回车时输入框会再发一次「改了」，内容没变，不能把刚报的错清掉。
+    proxy_seen: String,
+    /// 导出带不带 Key。
+    export_keys: bool,
+    import: Option<PendingImport>,
     /// 有备份的文件，各家的都在；画的时候只取 `owner` 那家的。
     files: Vec<FileBackups>,
     owners: Vec<BackupOwner>,
@@ -46,7 +90,7 @@ pub struct SettingsPage {
     /// 展开的文件（`files` 的下标）。
     expanded: Option<usize>,
     diff: Option<DiffView>,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 /// 差异里变了的地方前后各留几行。
@@ -55,12 +99,30 @@ const CONTEXT: usize = 3;
 /// 「显示哪些 agent」卡里一列开关的宽度（列名也按这个宽度居中）。
 const COL: f32 = 72.;
 
+const SECTIONS: [Section; 3] = [Section::General, Section::Claude, Section::Data];
+
 impl SettingsPage {
-    pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let _subscription = cx.observe(&store, |this, _, cx| {
             this.refresh(cx);
             cx.notify();
         });
+        let proxy = store.read(cx).proxy();
+        let proxy_url = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("http://127.0.0.1:7890")
+                .default_value(proxy.url.clone())
+        });
+        let proxy_seen = proxy.url.clone();
+        let proxy_subscription = cx.subscribe_in(
+            &proxy_url,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_url(window, cx),
+                InputEvent::Change => this.url_changed(cx),
+                _ => {}
+            },
+        );
         let files = store.read(cx).backups();
         let owners = store.read(cx).backup_owners();
         // 默认看 Claude Code 的（用户 10-12）。
@@ -71,6 +133,17 @@ impl SettingsPage {
             .map_or("", |owner| owner.id);
         Self {
             store,
+            section: Section::General,
+            section_from: None,
+            switches: 0,
+            proxy,
+            proxy_url,
+            system_proxy: core_net::system_proxy(),
+            proxy_test: None,
+            proxy_error: None,
+            proxy_seen,
+            export_keys: true,
+            import: None,
             files,
             owners,
             owner,
@@ -78,8 +151,172 @@ impl SettingsPage {
             just_closed: false,
             expanded: None,
             diff: None,
-            _subscription,
+            _subscriptions: vec![_subscription, proxy_subscription],
         }
+    }
+
+    fn show(&mut self, section: Section, cx: &mut Context<Self>) {
+        if self.section == section {
+            return;
+        }
+        let from = SECTIONS
+            .iter()
+            .position(|s| *s == self.section)
+            .unwrap_or(0);
+        self.switches += 1;
+        self.section_from = Some((from, self.switches));
+        self.section = section;
+        self.menu = false;
+        cx.notify();
+    }
+
+    fn save_proxy(&mut self, cx: &mut Context<Self>) {
+        let proxy = self.proxy.clone();
+        self.store
+            .update(cx, |store, cx| store.set_proxy(proxy, cx));
+        self.proxy_test = None;
+        cx.notify();
+    }
+
+    fn set_proxy_mode(&mut self, mode: ProxyMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.proxy.mode == mode {
+            return;
+        }
+        self.proxy.mode = mode;
+        self.proxy_error = None;
+        self.save_proxy(cx);
+        if mode == ProxyMode::Custom && self.proxy.url.is_empty() {
+            self.proxy_url
+                .update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
+    /// 边打边存：写对了就存（不改输入框里的写法），没写完、写错了先不管，回车或测试时再报。
+    /// 点空白处输入框不会失焦，只靠回车存的话，打完直接关掉设置页就丢了。
+    fn url_changed(&mut self, cx: &mut Context<Self>) {
+        let typed = self.proxy_url.read(cx).value().to_string();
+        if typed == self.proxy_seen {
+            return;
+        }
+        self.proxy_seen = typed.clone();
+        self.proxy_error = None;
+        self.proxy_test = None;
+        let url = Proxy::normalized_url(&typed);
+        if url != self.proxy.url && (url.is_empty() || Proxy::check_url(&url).is_ok()) {
+            self.proxy.url = url;
+            self.save_proxy(cx);
+        }
+        cx.notify();
+    }
+
+    /// 回车、离开输入框、点测试：整理写法、校验、存。写得不对就不存，提示在测试那一格。
+    fn commit_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.proxy_url.read(cx).value().to_string();
+        let url = Proxy::normalized_url(&typed);
+        if !url.is_empty() && Proxy::check_url(&url).is_err() {
+            self.proxy_error = Some(t!("net.bad_proxy").into());
+            cx.notify();
+            return;
+        }
+        if url != typed {
+            self.proxy_seen = url.clone();
+            self.proxy_url
+                .update(cx, |input, cx| input.set_value(url.clone(), window, cx));
+        }
+        if url != self.proxy.url {
+            self.proxy.url = url;
+            self.save_proxy(cx);
+        }
+    }
+
+    fn test_proxy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.proxy.mode == ProxyMode::Custom {
+            self.commit_url(window, cx);
+            if self.proxy_error.is_some() {
+                return;
+            }
+        }
+        self.proxy_test = Some(ProxyTest::Testing);
+        let proxy = self.proxy.clone();
+        let task = self
+            .store
+            .update(cx, |store, cx| store.test_proxy(proxy, cx));
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.proxy_test = Some(ProxyTest::Done(result));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn export(&mut self, cx: &mut Context<Self>) {
+        let keys = self.export_keys;
+        let home = self.store.read(cx).home.clone();
+        let downloads = home.join("Downloads");
+        let dir = if downloads.is_dir() { downloads } else { home };
+        let name = format!(
+            "confdeck-providers-{}.json",
+            Local::now().format("%Y-%m-%d")
+        );
+        let pick = files::pick_save(&dir, &name, cx);
+        let store = self.store.clone();
+        cx.spawn(async move |_, cx| {
+            if let Some(path) = pick.await {
+                store.update(cx, |store, cx| store.export(&path, keys, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn choose_import(&mut self, cx: &mut Context<Self>) {
+        let pick = files::pick_open(cx);
+        cx.spawn(async move |this, cx| {
+            let Some(path) = pick.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                let read = this.store.read(cx).read_import(&path);
+                match read {
+                    Ok((_, plan)) if plan.changes() == 0 => {
+                        this.import = None;
+                        this.store.update(cx, |store, cx| {
+                            store.announce(
+                                &[crate::data::Notice::ok(t!("transfer.nothing_new"))],
+                                cx,
+                            )
+                        });
+                    }
+                    Ok((incoming, plan)) => this.import = Some(PendingImport { incoming, plan }),
+                    Err(error) => {
+                        this.import = None;
+                        this.store.update(cx, |store, cx| {
+                            store.announce(
+                                &[crate::data::Notice::err(t!(
+                                    "transfer.import_failed",
+                                    error = error
+                                ))],
+                                cx,
+                            )
+                        });
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn confirm_import(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.import.take() {
+            self.store
+                .update(cx, |store, cx| store.import(pending.incoming, cx));
+        }
+        cx.notify();
     }
 
     /// 文件写了（开关、恢复、清理）以后重列备份；点开的差异按新内容重算。
@@ -188,17 +425,250 @@ impl SettingsPage {
         cx.notify();
     }
 
-    fn title(&self, t: &Theme) -> Div {
+    fn title(&self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let sections: Vec<(Section, SharedString)> = vec![
+            (Section::General, t!("settings.general").into()),
+            (Section::Claude, "Claude Code".into()),
+            (Section::Data, t!("settings.data").into()),
+        ];
         div()
             .h_flex()
             .flex_none()
             .items_center()
             .h(px(28.))
             .px(px(4.))
-            .text_size(px(15.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(t.fg)
-            .child(t!("settings.title"))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(t.fg)
+                    .child(t!("settings.title")),
+            )
+            .child(
+                div()
+                    .id("sections")
+                    .bg(t.pill)
+                    .rounded(px(8.))
+                    .child(ui::seg(
+                        t,
+                        &sections,
+                        self.section,
+                        self.section_from,
+                        window,
+                        cx.listener(|this, section: &Section, _, cx| this.show(*section, cx)),
+                    )),
+            )
+    }
+
+    fn proxy_card(&self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let modes: Vec<(ProxyMode, SharedString)> = vec![
+            (ProxyMode::System, t!("proxy.system").into()),
+            (ProxyMode::Direct, t!("proxy.direct").into()),
+            (ProxyMode::Custom, t!("proxy.custom").into()),
+        ];
+        let header = ui::card_title(t, t!("proxy.title"))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("proxy-mode")
+                    .font_weight(FontWeight::NORMAL)
+                    .bg(t.pill)
+                    .rounded(px(8.))
+                    .child(ui::seg(
+                        t,
+                        &modes,
+                        self.proxy.mode,
+                        None,
+                        window,
+                        cx.listener(|this, mode: &ProxyMode, window, cx| {
+                            this.set_proxy_mode(*mode, window, cx)
+                        }),
+                    )),
+            );
+        let small = |text: SharedString, color: Hsla| {
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(12.))
+                .text_color(color)
+                .child(text)
+        };
+        let left = match self.proxy.mode {
+            ProxyMode::System => match &self.system_proxy {
+                Some(url) => div()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .min_w_0()
+                    .child(small(t!("proxy.system_is").into(), t.muted).flex_none())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_family("Menlo")
+                            .text_size(px(12.))
+                            .child(url.clone()),
+                    ),
+                None => small(t!("proxy.no_system").into(), t.muted),
+            },
+            ProxyMode::Direct => small(t!("proxy.direct_note").into(), t.muted),
+            ProxyMode::Custom => {
+                div()
+                    .w(px(320.))
+                    .child(ui::field(t, &self.proxy_url, true, None, window, cx))
+            }
+        };
+        let result = match (&self.proxy_error, &self.proxy_test) {
+            (Some(error), _) => Some(small(error.clone(), t.danger)),
+            (None, Some(ProxyTest::Testing)) => Some(small(t!("proxy.testing").into(), t.muted)),
+            (None, Some(ProxyTest::Done(Ok(duration)))) => Some(small(
+                t!("proxy.ok", latency = net::latency(*duration)).into(),
+                t.success,
+            )),
+            (None, Some(ProxyTest::Done(Err(error)))) => {
+                Some(small(net::describe(error), t.danger))
+            }
+            (None, None) => None,
+        };
+        ui::list(t, false).child(header).child(
+            div()
+                .h_flex()
+                .items_center()
+                .gap(px(12.))
+                .h(px(48.))
+                .pl(px(14.))
+                .pr(px(12.))
+                .border_t_1()
+                .border_color(t.line_2)
+                .child(div().flex_1().min_w_0().child(left))
+                .children(result)
+                .child(
+                    ui::text_button("proxy-test", t)
+                        .flex_none()
+                        .child(t!("proxy.test"))
+                        .on_click(cx.listener(|this, _, window, cx| this.test_proxy(window, cx))),
+                ),
+        )
+    }
+
+    /// 导入导出：两行，导出（带不带 Key）、导入（选了文件先列出会改什么，确认了才导）。
+    fn transfer_card(&self, t: &Theme, cx: &Context<Self>) -> Div {
+        let store = self.store.read(cx);
+        let count = store.providers.len();
+        let row = || {
+            div()
+                .h_flex()
+                .items_center()
+                .gap(px(12.))
+                .min_h(px(52.))
+                .py(px(8.))
+                .pl(px(14.))
+                .pr(px(12.))
+                .border_t_1()
+                .border_color(t.line_2)
+        };
+        let title = |text: SharedString, sub: Option<SharedString>| {
+            div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(div().text_size(px(12.5)).child(text))
+                .children(sub.map(|sub| {
+                    div()
+                        .mt(px(2.))
+                        .text_size(px(11.))
+                        .text_color(t.muted)
+                        .child(sub)
+                }))
+        };
+        let keys = self.export_keys;
+        let export = row()
+            .child(title(
+                t!("transfer.export").into(),
+                Some(if count == 1 {
+                    t!("providers.count_one").into()
+                } else {
+                    t!("providers.count_other", count = count).into()
+                }),
+            ))
+            .child(
+                div()
+                    .id("export-keys")
+                    .h_flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .child(ui::checkbox(t, keys))
+                    .child(div().text_size(px(12.)).child(t!("transfer.with_keys")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.export_keys = !keys;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                ui::button("export", t, Button::Secondary)
+                    .child(t!("transfer.export_button"))
+                    .when(count > 0 && store.load_error.is_none(), |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| this.export(cx)))
+                    })
+                    .when(count == 0 || store.load_error.is_some(), |b| {
+                        b.opacity(0.5).cursor_default()
+                    }),
+            );
+        let import = match &self.import {
+            None => row()
+                .child(title(t!("transfer.import").into(), None))
+                .child(
+                    ui::button("import", t, Button::Secondary)
+                        .child(t!("transfer.import_button"))
+                        .when(store.load_error.is_none(), |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| this.choose_import(cx)))
+                        })
+                        .when(store.load_error.is_some(), |b| {
+                            b.opacity(0.5).cursor_default()
+                        }),
+                ),
+            Some(pending) => {
+                let names = |list: &[String]| list.join(&t!("common.list_separator"));
+                let mut parts: Vec<String> = Vec::new();
+                if !pending.plan.added.is_empty() {
+                    parts.push(t!("transfer.adds", names = names(&pending.plan.added)).into());
+                }
+                if !pending.plan.replaced.is_empty() {
+                    parts.push(
+                        t!("transfer.replaces", names = names(&pending.plan.replaced)).into(),
+                    );
+                }
+                let changes = pending.plan.changes();
+                row()
+                    .child(title(
+                        t!("transfer.import").into(),
+                        Some(parts.join(" · ").into()),
+                    ))
+                    .child(
+                        ui::button("import-cancel", t, Button::Secondary)
+                            .child(t!("common.cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.import = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        ui::button("import-confirm", t, Button::Primary)
+                            .child(if changes == 1 {
+                                t!("transfer.import_one")
+                            } else {
+                                t!("transfer.import_other", count = changes)
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_import(cx))),
+                    )
+            }
+        };
+        ui::list(t, false)
+            .child(ui::card_title(t, t!("transfer.title")))
+            .child(export)
+            .child(import)
     }
 
     fn agents_card(&self, t: &Theme, window: &Window, cx: &Context<Self>) -> Div {
@@ -671,10 +1141,16 @@ impl Render for SettingsPage {
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.just_closed = false),
             )
-            .child(self.title(&t))
-            .child(self.agents_card(&t, window, cx))
-            .child(self.claude_card(&t, window, cx))
-            .child(self.backups_card(&t, window, cx))
+            .child(self.title(&t, window, cx))
+            .map(|page| match self.section {
+                Section::General => page
+                    .child(self.agents_card(&t, window, cx))
+                    .child(self.proxy_card(&t, window, cx)),
+                Section::Claude => page.child(self.claude_card(&t, window, cx)),
+                Section::Data => page
+                    .child(self.transfer_card(&t, cx))
+                    .child(self.backups_card(&t, window, cx)),
+            })
     }
 }
 

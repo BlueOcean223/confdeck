@@ -1,18 +1,20 @@
 mod add_provider;
 mod assets;
 mod config_page;
-mod settings_page;
 mod data;
 #[cfg(debug_assertions)]
 mod drive;
 mod editor;
+mod files;
 mod i18n;
 mod icons;
 #[cfg(target_os = "macos")]
 mod mac;
 mod main_window;
+mod net;
 mod panel;
 mod picker;
+mod settings_page;
 mod theme;
 mod tray;
 mod ui;

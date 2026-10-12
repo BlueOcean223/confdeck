@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -66,30 +66,47 @@ pub fn live_file(data: &DataDir) -> LiveFile {
 /// 读供应商列表。文件不存在时是空列表。
 pub fn load(data: &DataDir) -> Result<Vec<Provider>, StoreError> {
     let path = data.providers();
-    let io_error = |source| StoreError::Io {
+    let Some(bytes) = fsx::read_optional(&path).map_err(|source| StoreError::Io {
         path: path.clone(),
         source,
-    };
-    let Some(bytes) = fsx::read_optional(&path).map_err(io_error)? else {
+    })?
+    else {
         return Ok(Vec::new());
     };
-    let file: ProvidersFile = serde_json::from_slice(&bytes).map_err(|err| StoreError::Parse {
-        path: path.clone(),
+    parse(&bytes, &path)
+}
+
+/// 按 `providers.json` 的格式解析（导入的文件也是这个格式）：版本比程序新、ID 重复、校验不过都报错。
+/// `path` 只用在错误信息里。
+pub fn parse(bytes: &[u8], path: &Path) -> Result<Vec<Provider>, StoreError> {
+    let file: ProvidersFile = serde_json::from_slice(bytes).map_err(|err| StoreError::Parse {
+        path: path.to_path_buf(),
         line: err.line(),
         column: err.column(),
         message: err.to_string(),
     })?;
     if file.version > VERSION {
         return Err(StoreError::Version {
-            path,
+            path: path.to_path_buf(),
             found: file.version,
         });
     }
     validate(&file.providers).map_err(|source| StoreError::Invalid {
-        path: path.clone(),
+        path: path.to_path_buf(),
         source,
     })?;
     Ok(file.providers)
+}
+
+/// `providers.json` 的内容：两格缩进，末尾换行。导出的文件也是它。
+pub fn to_bytes(providers: &[Provider]) -> Vec<u8> {
+    let file = ProvidersFile {
+        version: VERSION,
+        providers: providers.to_vec(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&file).expect("providers always serialize");
+    bytes.push(b'\n');
+    bytes
 }
 
 /// 写供应商列表。先校验，校验不过不写；内容有变化时先备份旧内容。
@@ -100,12 +117,7 @@ pub fn save(engine: &Engine, providers: &[Provider]) -> Result<(), StoreError> {
         path: path.clone(),
         source,
     })?;
-    let file = ProvidersFile {
-        version: VERSION,
-        providers: providers.to_vec(),
-    };
-    let mut bytes = serde_json::to_vec_pretty(&file).expect("providers always serialize");
-    bytes.push(b'\n');
+    let bytes = to_bytes(providers);
 
     let _lock = engine.lock().map_err(StoreError::Lock)?;
     let io_error = |path: PathBuf| move |source| StoreError::Io { path, source };

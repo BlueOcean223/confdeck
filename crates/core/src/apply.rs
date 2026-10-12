@@ -2,7 +2,7 @@
 //!
 //! 单选 agent 用 [`switch`]（`None` 是「默认」）；多选 agent 用 [`enable`] / [`disable`]，
 //! 勾一下写一次。改了供应商用 [`save_provider`]：存好以后把改动写进所有在用它的 agent；
-//! 删掉用 [`delete_provider`]，之前用 [`used_by`] 列出在用的 agent 请用户确认。
+//! 删掉用 [`delete_provider`]，之前用 [`used_by`] 列出在用的 agent 请用户确认。导入一批用 [`import`]。
 //! 启动时调 [`refresh_codex_catalog`]：Codex 升级以后，模型目录里的提示词要跟着换。
 
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use crate::fsx;
 use crate::patch::{self, LivePatch, PatchError};
 use crate::provider::Provider;
 use crate::store::{self, StoreError};
+use crate::transfer;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -281,11 +282,22 @@ pub fn save_provider(
     let Some(before) = before.filter(|before| *before != provider) else {
         return Ok(Vec::new());
     };
+    Ok(sync(engine, home, providers, before, provider))
+}
+
+/// 一家供应商从 `before` 改成了 `after`（已经存好）：写进在用它的 agent。`providers` 是改之前的列表。
+fn sync(
+    engine: &Engine,
+    home: &Path,
+    providers: &[Provider],
+    before: &Provider,
+    after: &Provider,
+) -> Vec<Synced> {
     let mut synced = Vec::new();
     for (agent, file, in_use) in scan(engine, home, providers, &before.id, AgentKind::ALL) {
         let result = match in_use {
             Ok(false) => continue,
-            Ok(true) => write_changes(engine, home, agent, before, provider),
+            Ok(true) => write_changes(engine, home, agent, before, after),
             Err(err) => Err(err),
         };
         synced.push(Synced {
@@ -293,6 +305,27 @@ pub fn save_provider(
             path: file.path,
             result,
         });
+    }
+    synced
+}
+
+/// 导入（[`transfer::merge`]）：存一次列表，再把换掉的那几家写进在用它们的 agent，和 [`save_provider`] 一样只写变了的键。
+/// 新加的不写任何 agent。
+pub fn import(
+    engine: &Engine,
+    home: &Path,
+    providers: &[Provider],
+    incoming: &[Provider],
+) -> Result<Vec<Synced>, StoreError> {
+    let after = transfer::merge(providers, incoming);
+    store::save(engine, &after)?;
+    let mut synced = Vec::new();
+    for before in providers {
+        if let Some(new) = after.iter().find(|p| p.id == before.id)
+            && new != before
+        {
+            synced.extend(sync(engine, home, providers, before, new));
+        }
     }
     Ok(synced)
 }
@@ -1022,6 +1055,34 @@ mod tests {
             [changed],
             "the provider is saved even when an agent fails"
         );
+    }
+
+    #[test]
+    fn import_rewrites_agents_using_a_replaced_provider_and_keeps_missing_keys() {
+        let home = Home::new();
+        let providers = [relay(), other()];
+        home.use_everywhere(&providers);
+
+        // 导出时没带 Key、地址换了一个；另带一家新的。
+        let mut moved = relay();
+        moved.key.clear();
+        moved
+            .endpoints
+            .insert(Protocol::Anthropic, "https://moved.example".into());
+        let mut new = relay();
+        new.id = "new".into();
+        new.name = "New".into();
+        let synced = import(&home.engine, home.path(), &providers, &[moved, new]).unwrap();
+        assert!(agents(&synced).contains(&AgentKind::ClaudeCode));
+        assert!(outcome(&synced, AgentKind::ClaudeCode).changed);
+
+        let claude = home.json(".claude/settings.json");
+        assert_eq!(claude["env"]["ANTHROPIC_BASE_URL"], "https://moved.example");
+        assert_eq!(claude["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-relay");
+        let saved = store::load(home.engine.data()).unwrap();
+        let ids: Vec<&str> = saved.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["relay", "other", "new"]);
+        assert_eq!(saved[0].key, "sk-relay");
     }
 
     #[test]

@@ -85,6 +85,13 @@ providers:
   add:
     en: Add provider
     zh-CN: 添加供应商
+  # 测每家每个接口地址的往返时间。
+  ping:
+    en: Ping
+    zh-CN: 测速
+  pinging:
+    en: Pinging…
+    zh-CN: 测速中…
   empty:
     en: No providers yet. Add one to get started.
     zh-CN: 还没有供应商，先添加一家
@@ -287,6 +294,75 @@ editor:
   remove_model:
     en: Remove model
     zh-CN: 删掉这个模型
+  ping:
+    en: Ping
+    zh-CN: 测速
+  pinging:
+    en: Pinging…
+    zh-CN: 测速中…
+  # 从这家的接口拉模型列表，勾要加进目录的。
+  fetch:
+    en: Fetch
+    zh-CN: 拉取
+  fetching:
+    en: Fetching…
+    zh-CN: 拉取中…
+  # 按预设和 models.dev 补目录里空着的参数。
+  fill:
+    en: Fill in
+    zh-CN: 补全
+  filling:
+    en: Filling in…
+    zh-CN: 补全中…
+  filled_none:
+    en: Nothing to fill in
+    zh-CN: 没有可补的
+  filled_one:
+    en: Filled in 1 model
+    zh-CN: 补全了 1 个模型
+  filled_other:
+    en: "Filled in %{count} models"
+    zh-CN: "补全了 %{count} 个模型"
+  added_one:
+    en: Added 1 model
+    zh-CN: 加了 1 个模型
+  added_other:
+    en: "Added %{count} models"
+    zh-CN: "加了 %{count} 个模型"
+  pick_filter:
+    en: Search
+    zh-CN: 搜索
+  pick_none:
+    en: No matches
+    zh-CN: 没有匹配的
+  pick_all:
+    en: Select all
+    zh-CN: 全选
+  pick_clear:
+    en: Select none
+    zh-CN: 全不选
+  pick_add:
+    en: Add
+    zh-CN: 加入
+  pick_add_one:
+    en: Add 1 model
+    zh-CN: 加入 1 个
+  pick_add_other:
+    en: "Add %{count} models"
+    zh-CN: "加入 %{count} 个"
+  # 价格：美元 / 百万 token，框右边写着 $/M。
+  price_input:
+    en: Input
+    zh-CN: 输入价格
+  price_output:
+    en: Output
+    zh-CN: 输出价格
+  price_cache_read:
+    en: Cache read
+    zh-CN: 缓存读取
+  price_cache_write:
+    en: Cache write
+    zh-CN: 缓存写入
   footer_hint:
     en: Changes sync to the agents using this provider
     zh-CN: 保存后同步到在用的 agent
@@ -530,6 +606,13 @@ settings:
   title:
     en: Settings
     zh-CN: 设置
+  # 设置页的三段（提案 12 画的分段，10-12 阶段 3 加了代理、导入导出以后才分）。
+  general:
+    en: General
+    zh-CN: 通用
+  data:
+    en: Data
+    zh-CN: 数据
   # 设置 › 显示哪些 agent：每个 agent 两个开关，Agent 页和菜单栏面板各一个（用户 10-12）。
   agents:
     en: Which agents to show
@@ -603,3 +686,138 @@ backup:
   before_save:
     en: Before saving
     zh-CN: 保存前
+
+# 设置 › 通用 › 出站代理：confdeck 自己联网（测连通、拉模型列表、models.dev）走哪个代理。agent 自己的请求不归它管。
+proxy:
+  title:
+    en: Outbound proxy
+    zh-CN: 出站代理
+  system:
+    en: System
+    zh-CN: 跟随系统
+  direct:
+    en: "Off"
+    zh-CN: 不用代理
+  custom:
+    en: Custom
+    zh-CN: 自定义
+  system_is:
+    en: System proxy
+    zh-CN: 系统代理
+  no_system:
+    en: No system proxy
+    zh-CN: 系统没有设代理
+  direct_note:
+    en: Direct connection
+    zh-CN: 直连
+  test:
+    en: Test
+    zh-CN: 测试
+  testing:
+    en: Testing…
+    zh-CN: 测试中…
+  ok:
+    en: "Works · %{latency}"
+    zh-CN: "可用 · %{latency}"
+
+# 联网出错（core 的 net::NetError），测连通、测代理、拉模型列表共用。
+net:
+  bad_proxy:
+    en: Invalid proxy address
+    zh-CN: 代理地址不对
+  bad_url:
+    en: Invalid address
+    zh-CN: 地址不对
+  timeout:
+    en: Timed out
+    zh-CN: 超时
+  dns:
+    en: Host not found
+    zh-CN: 找不到主机
+  refused:
+    en: Connection refused
+    zh-CN: 拒绝连接
+  tls:
+    en: TLS handshake failed
+    zh-CN: TLS 握手失败
+  proxy:
+    en: Proxy unreachable
+    zh-CN: 连不上代理
+  closed:
+    en: Connection dropped
+    zh-CN: 连接被断开
+  unreachable:
+    en: "Unreachable: %{detail}"
+    zh-CN: "连不上：%{detail}"
+  key_rejected:
+    en: "Key rejected (%{status})"
+    zh-CN: "Key 不对（%{status}）"
+  status:
+    en: "HTTP %{status}"
+    zh-CN: "HTTP %{status}"
+  parse:
+    en: Unexpected response
+    zh-CN: 返回的内容看不懂
+  no_model_list:
+    en: No model list here
+    zh-CN: 这家没有模型列表接口
+  proxy_not_saved:
+    en: "Proxy setting not saved: %{error}"
+    zh-CN: "代理设置没存上：%{error}"
+
+# 设置 › 数据 › 导入导出（providers.json 的格式）。
+transfer:
+  title:
+    en: Import & export
+    zh-CN: 导入导出
+  export:
+    en: Export providers
+    zh-CN: 导出供应商
+  export_button:
+    en: Export…
+    zh-CN: 导出…
+  with_keys:
+    en: Include keys
+    zh-CN: 带上 Key
+  import:
+    en: Import providers
+    zh-CN: 导入供应商
+  import_button:
+    en: Import…
+    zh-CN: 导入…
+  adds:
+    en: "Adds %{names}"
+    zh-CN: "新增 %{names}"
+  replaces:
+    en: "Replaces %{names}"
+    zh-CN: "覆盖 %{names}"
+  import_one:
+    en: Import 1
+    zh-CN: 导入 1 家
+  import_other:
+    en: "Import %{count}"
+    zh-CN: "导入 %{count} 家"
+  imported_one:
+    en: Imported 1 provider
+    zh-CN: 导入了 1 家供应商
+  imported_other:
+    en: "Imported %{count} providers"
+    zh-CN: "导入了 %{count} 家供应商"
+  nothing_new:
+    en: Nothing new to import
+    zh-CN: 没有要导入的
+  exported:
+    en: "Exported to %{file}"
+    zh-CN: "已导出到 %{file}"
+  export_failed:
+    en: "Export failed: %{error}"
+    zh-CN: "导出失败：%{error}"
+  import_failed:
+    en: "Import failed: %{error}"
+    zh-CN: "导入失败：%{error}"
+  bad_file:
+    en: "The file format is wrong (line %{line})"
+    zh-CN: "文件格式不对（第 %{line} 行）"
+  too_new:
+    en: Exported by a newer confdeck
+    zh-CN: 这个文件是更新版本的 confdeck 导出的

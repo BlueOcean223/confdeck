@@ -205,14 +205,14 @@ pub enum NoticeKind {
 }
 
 impl Notice {
-    fn ok(text: impl Into<SharedString>) -> Self {
+    pub(crate) fn ok(text: impl Into<SharedString>) -> Self {
         Self {
             kind: NoticeKind::Success,
             text: text.into(),
         }
     }
 
-    fn err(text: impl Into<SharedString>) -> Self {
+    pub(crate) fn err(text: impl Into<SharedString>) -> Self {
         Self {
             kind: NoticeKind::Error,
             text: text.into(),
@@ -222,12 +222,14 @@ impl Notice {
 
 pub struct Store {
     /// 写文件在后台线程，和界面线程共用一个引擎（进程内的锁才管用）。
-    engine: Arc<Engine>,
-    home: PathBuf,
+    pub(crate) engine: Arc<Engine>,
+    pub(crate) home: PathBuf,
     pub providers: Vec<Provider>,
     pub agents: Vec<Agent>,
     /// `providers.json` 读不了的原因。读不了时列表是空的，不许保存，不然会把文件盖掉。
     pub load_error: Option<String>,
+    /// 联网的那几样（测连通、models.dev）的状态，见 `net.rs`。
+    pub(crate) net: crate::net::NetState,
 }
 
 impl EventEmitter<Notice> for Store {}
@@ -241,6 +243,7 @@ impl Store {
             providers: Vec::new(),
             agents: Vec::new(),
             load_error: None,
+            net: Default::default(),
         };
         store.reload();
         store
@@ -904,7 +907,7 @@ impl Store {
         notices
     }
 
-    fn announce(&self, notices: &[Notice], cx: &mut Context<Self>) {
+    pub(crate) fn announce(&self, notices: &[Notice], cx: &mut Context<Self>) {
         for notice in notices {
             cx.emit(notice.clone());
         }

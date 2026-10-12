@@ -13,6 +13,7 @@ use crate::add_provider::{AddEvent, AddProvider};
 use crate::config_page::{ConfigEvent, ConfigPage};
 use crate::data::{self, Notice, NoticeKind, Store};
 use crate::editor::{Editor, EditorEvent};
+use crate::net;
 use crate::picker::{Picker, PickerEvent};
 use crate::settings_page::SettingsPage;
 use crate::theme::Theme;
@@ -268,17 +269,17 @@ impl MainWindow {
             .child(
                 ui::icon_button("settings", t, "settings")
                     .when(self.settings.is_some(), |b| b.bg(t.pill_hover))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_settings(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
             )
     }
 
     /// 齿轮：开着就关，关着就开。
-    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+    fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.is_some() {
             self.settings = None;
         } else {
             let store = self.store.clone();
-            self.settings = Some(cx.new(|cx| SettingsPage::new(store, cx)));
+            self.settings = Some(cx.new(|cx| SettingsPage::new(store, window, cx)));
             self.picker = None;
         }
         cx.notify();
@@ -512,6 +513,27 @@ impl MainWindow {
                         }),
                 )
                 .child(div().flex_1())
+                .when(store.load_error.is_none() && count > 0, |row| {
+                    row.child(if store.checking() {
+                        div()
+                            .mr(px(16.))
+                            .text_size(px(12.5))
+                            .text_color(t.muted)
+                            .child(t!("providers.pinging"))
+                            .into_any_element()
+                    } else {
+                        ui::text_button("ping-all", t)
+                            .mr(px(16.))
+                            .child(ui::icon("activity", 13., t.ctl_fg))
+                            .child(t!("providers.ping"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.store.update(cx, |store, cx| {
+                                    store.check_reach(store.providers.clone(), cx)
+                                })
+                            }))
+                            .into_any_element()
+                    })
+                })
                 .when(store.load_error.is_none(), |row| {
                     row.child(
                         ui::text_button("add-provider", t)
@@ -546,6 +568,19 @@ impl MainWindow {
                 t!("providers.summary_other", host = host, count = models).into()
             };
             let users = store.users_of(i);
+            // 测过速才有：最慢的往返时间或不通的原因；几个地址不一样时悬停列出各自的结果。
+            let reach = store.provider_reach(provider).map(|(all, each)| {
+                let text = net::reach_text(t, ElementId::named_usize("reach", i), &all).mr(px(6.));
+                if each.len() > 1 {
+                    let lines: Vec<String> = each
+                        .iter()
+                        .map(|(label, reach)| format!("{label}  {}", net::reach_line(reach)))
+                        .collect();
+                    text.tooltip(ui::tooltip(lines.join("\n")))
+                } else {
+                    text
+                }
+            });
             let hover_bg = t.card_2;
             let provider_clone = provider.clone();
 
@@ -631,6 +666,7 @@ impl MainWindow {
                                 })),
                         )
                     })
+                    .children(reach)
                     .child(key_pill)
                     .child(ui::icon("chevron-right", 13., t.faint).ml(px(4.))),
             );

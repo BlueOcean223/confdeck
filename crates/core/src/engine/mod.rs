@@ -31,6 +31,7 @@ use chrono::Local;
 use crate::backup::{self, Backup, Reason, Shelf};
 use crate::data::DataDir;
 use crate::fsx::{self, Digest, Mode};
+use crate::net::Proxy;
 use crate::patch::{self, Format, KeyPath, LivePatch, PatchError};
 pub use state::Place;
 use state::{Owned, State};
@@ -212,6 +213,20 @@ impl Engine {
         let path = self.data.state();
         let mut state = State::load(&path);
         state.set_hidden(place, agent, hidden);
+        state.save(&path).map_err(io_error(&path))
+    }
+
+    /// 设置页的出站代理。
+    pub fn proxy(&self) -> Proxy {
+        State::load(&self.data.state()).proxy().clone()
+    }
+
+    /// 改出站代理。只存在本机。
+    pub fn set_proxy(&self, proxy: Proxy) -> Result<(), EngineError> {
+        let _lock = self.lock()?;
+        let path = self.data.state();
+        let mut state = State::load(&path);
+        state.set_proxy(proxy);
         state.save(&path).map_err(io_error(&path))
     }
 

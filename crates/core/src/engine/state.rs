@@ -8,6 +8,7 @@
 //!   下次切换时，值还是这个的才删；用户改过的留着。记在这里而不是现查上一家供应商：那家可能已经改了或删了。
 //! - `hidden_on_page`、`hidden_in_panel`：用户在设置页「显示哪些 agent」里关掉的 agent（id），
 //!   分别对应主窗口的 Agent 页和菜单栏面板。没写就是都显示，新接上的 agent 自然也显示。
+//! - `proxy`：设置页的出站代理（[`crate::net::Proxy`]）。没写是「跟随系统」。代理多半是本机的端口，所以只存本机。
 //!
 //! 这份记录只是提示，丢了或读不出来就当作空的：后果只是多备份一次、认不出同地址的几家里是哪一家，
 //! 所以不像用户的文件那样「读不出就报错」。
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::fsx::{self, Digest, Mode};
+use crate::net::Proxy;
 use crate::patch::KeyPath;
 
 const VERSION: u32 = 1;
@@ -43,6 +45,8 @@ pub struct State {
     /// 菜单栏面板里藏起来的 agent（id）。
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     hidden_in_panel: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Proxy::is_default")]
+    proxy: Proxy,
 }
 
 /// 「显示哪些 agent」分两处：主窗口的 Agent 页、菜单栏面板。
@@ -121,6 +125,14 @@ impl State {
         } else {
             set.remove(agent);
         }
+    }
+
+    pub fn proxy(&self) -> &Proxy {
+        &self.proxy
+    }
+
+    pub fn set_proxy(&mut self, proxy: Proxy) {
+        self.proxy = proxy;
     }
 
     pub fn owned(&self, agent: &str) -> &[Owned] {

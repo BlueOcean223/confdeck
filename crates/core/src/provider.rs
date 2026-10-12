@@ -39,7 +39,7 @@ pub enum Modality {
     Image,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
     /// 显示名；没有时显示 `id`。
@@ -57,6 +57,22 @@ pub struct Model {
     /// 支持的推理档位（`low`、`high` 等）；空表示不支持推理。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning: Vec<String>,
+    /// 这家卖的价格。以后用量页按它算花费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
+}
+
+/// 价格，美元 / 百万 token（和 models.dev 一样）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Cost {
+    pub input: f64,
+    pub output: f64,
+    /// 命中缓存的输入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    /// 写入缓存的输入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
 }
 
 /// 某个 agent 对这家供应商的覆盖。每一项都可以不填，不填就用适配器算出来的。
@@ -295,6 +311,7 @@ pub(crate) mod tests {
                     output: Some(128_000),
                     input: vec![Modality::Text, Modality::Image],
                     reasoning: vec!["low".into(), "high".into()],
+                    cost: None,
                 },
                 Model {
                     id: "glm-4.5".into(),

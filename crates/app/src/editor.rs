@@ -4,13 +4,20 @@
 //! - 在用的 agent 一排芯片（名字 + 它用的模型）；名字；ID（新建时从名字生成、可改，建好后只读）；
 //!   Key（遮罩 + 显示）；四种接口地址各一行，空着就是不提供；模型目录简表，点一行展开改全部字段，
 //!   「添加模型」是同一个表单；每行最前面是默认模型的标记。
+//! - 「接口地址」右边「测速」：按表单里现在的地址测（还没存也行），结果写在每个地址框的右边。
+//! - 「模型目录」右边「拉取」：从这家的接口拉模型列表，弹一层勾要加的（目录里已有的勾着、灰着），补好参数加进目录；
+//!   「补全」：按预设和 models.dev 补目录里空着的上下文、输出上限、图像、推理档位、价格（只补空的）。
 //! - 保存走 `Store::save_provider`（core 的 `apply::save_provider`），结果交给主窗口提示。
 //! - 删除先列出在用的 agent（`apply::used_by`）确认。有没保存的改动时关掉先问。
+
+use std::collections::BTreeSet;
 
 use confdeck_core::agent::Mode;
 use confdeck_core::apply::{Synced, UsedBy};
 use confdeck_core::preset::Preset;
-use confdeck_core::provider::{Modality, Model, Protocol, Provider, ProviderError};
+use confdeck_core::provider::{
+    Cost, Modality, Model, Protocol, Provider, ProviderError, normalize_url,
+};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -18,6 +25,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{self, Store};
+use crate::net::{self, Reach};
 use crate::theme::Theme;
 use crate::ui::{self, Button};
 
@@ -43,6 +51,10 @@ const PROTOCOLS: [Protocol; 4] = [
 ];
 
 pub const WIDTH: f32 = 560.;
+/// 模型表单里两格一行时标签的宽度。
+const PAIR_LABEL: f32 = 64.;
+/// 拉取列表一行的高度。
+const PICK_ROW: f32 = 34.;
 
 /// 模型目录里的一行：收起时是简表，展开是表单。
 struct ModelRow {
@@ -54,6 +66,37 @@ struct ModelRow {
     reasoning: Entity<InputState>,
     /// 原来的输入模态，保存时只增减「图像」。
     input: Vec<Modality>,
+    /// 价格（美元 / 百万 token）：输入、输出、缓存读、缓存写。前两个都填了才算有价格。
+    price: [Entity<InputState>; 4],
+}
+
+/// 「拉取」拉回来的列表，勾要加进目录的。
+struct ModelPicker {
+    models: Vec<Model>,
+    /// 勾了的（不含目录里本来就有的）。
+    chosen: BTreeSet<String>,
+    /// 打开时目录里已有的。
+    existing: BTreeSet<String>,
+    filter: Entity<InputState>,
+    scroll: UniformListScrollHandle,
+}
+
+impl ModelPicker {
+    /// 过滤后的下标。
+    fn shown(&self, cx: &App) -> Vec<usize> {
+        let query = self.filter.read(cx).value().trim().to_lowercase();
+        (0..self.models.len())
+            .filter(|&n| {
+                let model = &self.models[n];
+                query.is_empty()
+                    || model.id.to_lowercase().contains(&query)
+                    || model
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.to_lowercase().contains(&query))
+            })
+            .collect()
+    }
 }
 
 enum Confirm {
@@ -81,7 +124,13 @@ pub struct Editor {
     default_row: Option<usize>,
     expanded: Option<usize>,
     error: Option<SharedString>,
+    /// 底栏左边的一句结果（「补全了 3 个模型」），下一次改动就换回提示。
+    notice: Option<SharedString>,
     confirm: Option<Confirm>,
+    /// 正在拉模型列表 / 正在补全。
+    fetching: bool,
+    filling: bool,
+    picker: Option<ModelPicker>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -163,6 +212,7 @@ impl Editor {
             subscriptions.push(cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
                 if let InputEvent::Change = event {
                     this.error = None;
+                    this.notice = None;
                     cx.notify();
                 }
             }));
@@ -209,6 +259,8 @@ impl Editor {
             }
         }));
         key.update(cx, |key, cx| key.set_masked(true, window, cx));
+        // 测速的结果在 store 里，回来了跟着重画。
+        subscriptions.push(cx.observe(&store, |_, _, cx| cx.notify()));
 
         // Esc 关掉（有改动先问）。输入框自己也绑了 Esc，在它之前拦下来。
         let editor = cx.entity().downgrade();
@@ -249,7 +301,11 @@ impl Editor {
             default_row,
             expanded: None,
             error: None,
+            notice: None,
             confirm: None,
+            fetching: false,
+            filling: false,
+            picker: None,
             _subscriptions: subscriptions,
         }
     }
@@ -276,6 +332,17 @@ impl Editor {
                 cx,
             ),
             input: model.input.clone(),
+            price: {
+                let cost = model.cost;
+                let price = |value: Option<f64>| value.map(price_text).unwrap_or_default();
+                // 不放示例值当占位：空着的价格框旁边就是填了的，示例值会被看成真价格。
+                [
+                    input("".into(), &price(cost.map(|c| c.input)), cx),
+                    input("".into(), &price(cost.map(|c| c.output)), cx),
+                    input("".into(), &price(cost.and_then(|c| c.cache_read)), cx),
+                    input("".into(), &price(cost.and_then(|c| c.cache_write)), cx),
+                ]
+            },
         }
     }
 
@@ -310,6 +377,16 @@ impl Editor {
                         .filter(|s| !s.is_empty())
                         .map(String::from)
                         .collect(),
+                    cost: {
+                        let [input, output, read, write] =
+                            row.price.each_ref().map(|state| parse_price(&value(state)));
+                        input.zip(output).map(|(input, output)| Cost {
+                            input,
+                            output,
+                            cache_read: read,
+                            cache_write: write,
+                        })
+                    },
                 }
             })
             .collect();
@@ -348,7 +425,9 @@ impl Editor {
 
     /// 取消、Esc、点外面：有改动先问。
     pub fn request_close(&mut self, cx: &mut Context<Self>) {
-        if self.confirm.is_some() {
+        if self.picker.is_some() {
+            self.picker = None;
+        } else if self.confirm.is_some() {
             self.confirm = None;
         } else if self.dirty(cx) {
             self.confirm = Some(Confirm::Discard);
@@ -419,7 +498,8 @@ impl Editor {
         }
     }
 
-    fn add_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 目录末尾加一行，返回它的下标。
+    fn push_row(&mut self, model: &Model, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let mut subscriptions = Vec::new();
         let mut input = |placeholder: SharedString, value: &str, cx: &mut Context<Self>| {
             let state = cx.new(|cx| {
@@ -430,17 +510,198 @@ impl Editor {
             subscriptions.push(cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
                 if let InputEvent::Change = event {
                     this.error = None;
+                    this.notice = None;
                     cx.notify();
                 }
             }));
             state
         };
-        let row = Self::model_row(&Model::default(), &mut input, cx);
-        row.id.update(cx, |id, cx| id.focus(window, cx));
+        let row = Self::model_row(model, &mut input, cx);
         self._subscriptions.extend(subscriptions);
         self.models.push(row);
-        self.expanded = Some(self.models.len() - 1);
+        self.models.len() - 1
+    }
+
+    fn add_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.push_row(&Model::default(), window, cx);
+        self.models[n].id.update(cx, |id, cx| id.focus(window, cx));
+        self.expanded = Some(n);
         cx.notify();
+    }
+
+    /// 「测速」：按表单里现在的地址测。
+    fn ping(&mut self, cx: &mut Context<Self>) {
+        let mut draft = self.draft(cx);
+        draft.normalize();
+        self.store
+            .update(cx, |store, cx| store.check_reach(vec![draft], cx));
+    }
+
+    /// 「拉取」：从这家的接口拉模型列表，拉到了弹一层勾要加的。
+    fn fetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fetching {
+            return;
+        }
+        let mut draft = self.draft(cx);
+        draft.normalize();
+        if draft.endpoints.is_empty() {
+            self.error = Some(describe(&ProviderError::NoEndpoint { id: draft.id }));
+            cx.notify();
+            return;
+        }
+        self.fetching = true;
+        self.error = None;
+        self.notice = None;
+        let task = self
+            .store
+            .update(cx, |store, cx| store.fetch_models(draft, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                this.fetching = false;
+                match result {
+                    Ok(models) => this.open_picker(models, window, cx),
+                    Err(err) => this.error = Some(net::describe_listing(&err)),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_picker(&mut self, models: Vec<Model>, window: &mut Window, cx: &mut Context<Self>) {
+        let existing: BTreeSet<String> = self
+            .models
+            .iter()
+            .map(|row| row.id.read(cx).value().trim().to_string())
+            .collect();
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder(t!("editor.pick_filter")));
+        self._subscriptions
+            .push(cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    cx.notify();
+                }
+            }));
+        filter.update(cx, |input, cx| input.focus(window, cx));
+        self.picker = Some(ModelPicker {
+            models,
+            chosen: BTreeSet::new(),
+            existing,
+            filter,
+            scroll: UniformListScrollHandle::new(),
+        });
+    }
+
+    fn toggle_pick(&mut self, n: usize, cx: &mut Context<Self>) {
+        if let Some(picker) = &mut self.picker {
+            let id = picker.models[n].id.clone();
+            if picker.existing.contains(&id) {
+                return;
+            }
+            if !picker.chosen.remove(&id) {
+                picker.chosen.insert(id);
+            }
+            cx.notify();
+        }
+    }
+
+    /// 勾了的加进目录，按列表里的顺序，参数已经补好了。
+    fn add_picked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        let picked: Vec<Model> = picker
+            .models
+            .into_iter()
+            .filter(|model| picker.chosen.contains(&model.id))
+            .collect();
+        for model in &picked {
+            self.push_row(model, window, cx);
+        }
+        self.expanded = None;
+        self.notice = (!picked.is_empty()).then(|| {
+            if picked.len() == 1 {
+                t!("editor.added_one").into()
+            } else {
+                t!("editor.added_other", count = picked.len()).into()
+            }
+        });
+        cx.notify();
+    }
+
+    /// 「补全」：目录里空着的参数按预设和 models.dev 补上。
+    fn fill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filling || self.models.is_empty() {
+            return;
+        }
+        let mut draft = self.draft(cx);
+        draft.normalize();
+        self.filling = true;
+        self.error = None;
+        self.notice = None;
+        let task = self
+            .store
+            .update(cx, |store, cx| store.fill_models(draft, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                this.filling = false;
+                match result {
+                    Ok((models, filled)) => {
+                        this.apply_filled(&models, window, cx);
+                        this.notice = Some(match filled {
+                            0 => t!("editor.filled_none").into(),
+                            1 => t!("editor.filled_one").into(),
+                            n => t!("editor.filled_other", count = n).into(),
+                        });
+                    }
+                    Err(err) => this.error = Some(net::describe(&err)),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 补好的目录写回表单：按 ID 对上，只写原来空着的框。
+    fn apply_filled(&mut self, models: &[Model], window: &mut Window, cx: &mut Context<Self>) {
+        let number = |n: Option<u64>| n.map(|n| n.to_string()).unwrap_or_default();
+        for row in &mut self.models {
+            let id = row.id.read(cx).value().trim().to_string();
+            let Some(model) = models.iter().find(|model| model.id == id) else {
+                continue;
+            };
+            let mut set = |state: &Entity<InputState>, value: String, cx: &mut Context<Self>| {
+                if state.read(cx).value().trim().is_empty() && !value.is_empty() {
+                    state.update(cx, |input, cx| input.set_value(value, window, cx));
+                }
+            };
+            set(&row.name, model.name.clone().unwrap_or_default(), cx);
+            set(&row.context, number(model.context), cx);
+            set(&row.output, number(model.output), cx);
+            set(&row.reasoning, model.reasoning.join(", "), cx);
+            if let Some(cost) = model.cost {
+                set(&row.price[0], price_text(cost.input), cx);
+                set(&row.price[1], price_text(cost.output), cx);
+                set(
+                    &row.price[2],
+                    cost.cache_read.map(price_text).unwrap_or_default(),
+                    cx,
+                );
+                set(
+                    &row.price[3],
+                    cost.cache_write.map(price_text).unwrap_or_default(),
+                    cx,
+                );
+            }
+            if !row.image && model.input.contains(&Modality::Image) {
+                row.image = true;
+            }
+        }
     }
 
     fn remove_model(&mut self, row: usize, cx: &mut Context<Self>) {
@@ -470,19 +731,58 @@ impl Editor {
             .collect()
     }
 
-    fn section(&self, t: &Theme, title: SharedString, hint: Option<SharedString>) -> Div {
+    /// 分段标题，右边可以放几个文字按钮。
+    fn section(
+        &self,
+        t: &Theme,
+        title: SharedString,
+        hint: Option<SharedString>,
+        actions: Vec<AnyElement>,
+    ) -> Div {
         div()
             .v_flex()
             .gap(px(2.))
             .mt(px(6.))
             .child(
                 div()
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(t.fg_2)
-                    .child(title),
+                    .h_flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.fg_2)
+                            .child(title),
+                    )
+                    .children(actions),
             )
             .children(hint.map(|hint| ui::hint(t, hint)))
+    }
+
+    /// 分段标题右边的文字按钮；`busy` 时换成「…中」的灰字、点不了。
+    fn section_button(
+        &self,
+        id: &'static str,
+        t: &Theme,
+        label: SharedString,
+        busy: Option<SharedString>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        match busy {
+            Some(busy) => div()
+                .text_size(px(12.))
+                .text_color(t.muted)
+                .child(busy)
+                .into_any_element(),
+            None => ui::text_button(id, t)
+                .text_size(px(12.))
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+                .into_any_element(),
+        }
     }
 
     // 标签贴着第一行（输入框）对齐，不是整行居中：右边带说明、说明折行时，居中的标签会悬在半空。
@@ -555,7 +855,7 @@ impl Editor {
                 )
             })
             .child(div().flex_1())
-            .when(!self.is_new, |header| {
+            .when(!self.is_new && self.picker.is_none(), |header| {
                 header.child(
                     ui::button("delete", t, Button::Danger)
                         .px(px(8.))
@@ -699,38 +999,33 @@ impl Editor {
                     cx.notify();
                 }))
                 .child(radio)
+                // 挤不下时先截显示名，再截右边的参数，ID 最后（太长才截）。
                 .child(
                     div()
-                        .h_flex()
-                        .items_baseline()
-                        .gap(px(8.))
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_family("Menlo")
-                                .text_size(px(12.))
-                                .child(if id_text.is_empty() {
-                                    t!("editor.model_unnamed").to_string()
-                                } else {
-                                    id_text
-                                }),
-                        )
-                        .when(!name_text.is_empty(), |d| {
-                            d.child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(11.5))
-                                    .text_color(t.muted)
-                                    .child(name_text),
-                            )
+                        .flex_none()
+                        .max_w(px(300.))
+                        .truncate()
+                        .font_family("Menlo")
+                        .text_size(px(12.))
+                        .child(if id_text.is_empty() {
+                            t!("editor.model_unnamed").to_string()
+                        } else {
+                            id_text
                         }),
                 )
                 .child(
                     div()
-                        .flex_none()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.5))
+                        .text_color(t.muted)
+                        .child(name_text),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
                         .text_size(px(11.))
                         .text_color(t.muted)
                         .child(self.model_line(row, cx)),
@@ -762,6 +1057,33 @@ impl Editor {
     ) -> Div {
         let field =
             |state: &Entity<InputState>, mono: bool| ui::field(t, state, mono, None, window, cx);
+        // 价格框右边写单位。
+        let price = |state: &Entity<InputState>| {
+            let unit = div()
+                .flex_none()
+                .text_size(px(11.))
+                .text_color(t.faint)
+                .child("$/M");
+            ui::field(t, state, true, Some(unit.into_any_element()), window, cx)
+        };
+        // 一行两格，标签定宽，上下几行的框对齐。
+        let pair = |left: (SharedString, Div), right: (SharedString, Div)| {
+            let cell = |(label, field): (SharedString, Div)| {
+                div()
+                    .flex_1()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(ui::hint(t, label).flex_none().w(px(PAIR_LABEL)))
+                    .child(div().flex_1().child(field))
+            };
+            div()
+                .h_flex()
+                .items_center()
+                .gap(px(12.))
+                .child(cell(left))
+                .child(cell(right))
+        };
         let image = row.image;
         div()
             .v_flex()
@@ -779,30 +1101,10 @@ impl Editor {
                     .child(div().flex_1().child(field(&row.id, true)))
                     .child(div().flex_1().child(field(&row.name, false))),
             )
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .h_flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(ui::hint(t, t!("editor.context")).flex_none())
-                            .child(div().flex_1().child(field(&row.context, true))),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .h_flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(ui::hint(t, t!("editor.output")).flex_none())
-                            .child(div().flex_1().child(field(&row.output, true))),
-                    ),
-            )
+            .child(pair(
+                (t!("editor.context").into(), field(&row.context, true)),
+                (t!("editor.output").into(), field(&row.output, true)),
+            ))
             .child(
                 div()
                     .h_flex()
@@ -826,6 +1128,14 @@ impl Editor {
                     .child(ui::hint(t, t!("editor.reasoning")).flex_none())
                     .child(div().w(px(220.)).child(field(&row.reasoning, true))),
             )
+            .child(pair(
+                (t!("editor.price_input").into(), price(&row.price[0])),
+                (t!("editor.price_output").into(), price(&row.price[1])),
+            ))
+            .child(pair(
+                (t!("editor.price_cache_read").into(), price(&row.price[2])),
+                (t!("editor.price_cache_write").into(), price(&row.price[3])),
+            ))
             .child(
                 div().h_flex().justify_end().child(
                     ui::button(ElementId::named_usize("remove-model", n), t, Button::Danger)
@@ -921,6 +1231,10 @@ impl Editor {
                 }),
         );
 
+        let pinging = self.endpoints.iter().any(|(protocol, state)| {
+            let url = normalize_url(*protocol, &state.read(cx).value());
+            matches!(store.reach(&url), Some(Reach::Checking))
+        });
         let mut body = div()
             .id("editor-body")
             .v_flex()
@@ -939,12 +1253,54 @@ impl Editor {
                 t,
                 t!("editor.endpoints").into(),
                 Some(t!("editor.endpoints_hint").into()),
+                vec![self.section_button(
+                    "ping",
+                    t,
+                    t!("editor.ping").into(),
+                    pinging.then(|| t!("editor.pinging").into()),
+                    |this, _, cx| this.ping(cx),
+                    cx,
+                )],
             ));
-        for (protocol, state) in &self.endpoints {
-            body = body.child(self.form_row(t, protocol.to_string().into(), field(state, true)));
+        for (n, (protocol, state)) in self.endpoints.iter().enumerate() {
+            let url = normalize_url(*protocol, &state.read(cx).value());
+            let reach = (!url.is_empty())
+                .then(|| store.reach(&url))
+                .flatten()
+                .map(|reach| {
+                    net::reach_text(t, ElementId::named_usize("reach", n), reach).into_any_element()
+                });
+            body = body.child(self.form_row(
+                t,
+                protocol.to_string().into(),
+                ui::field(t, state, true, reach, window, cx),
+            ));
         }
+        let busy = |on: bool, text: SharedString| on.then_some(text);
         body = body
-            .child(self.section(t, t!("editor.models").into(), None))
+            .child(self.section(
+                t,
+                t!("editor.models").into(),
+                None,
+                vec![
+                    self.section_button(
+                        "fill",
+                        t,
+                        t!("editor.fill").into(),
+                        busy(self.filling, t!("editor.filling").into()),
+                        |this, window, cx| this.fill(window, cx),
+                        cx,
+                    ),
+                    self.section_button(
+                        "fetch",
+                        t,
+                        t!("editor.fetch").into(),
+                        busy(self.fetching, t!("editor.fetching").into()),
+                        |this, window, cx| this.fetch(window, cx),
+                        cx,
+                    ),
+                ],
+            ))
             .child(self.model_rows(t, window, cx))
             .child(
                 ui::text_button("add-model", t)
@@ -978,9 +1334,17 @@ impl Editor {
                     .child(div().min_w_0().truncate().child(error.clone())),
                 None => div()
                     .flex_1()
+                    .min_w_0()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(5.))
                     .text_size(px(11.5))
                     .text_color(t.muted)
-                    .child(t!("editor.footer_hint")),
+                    .when_some(self.notice.clone(), |d, notice| {
+                        d.child(ui::icon("check", 13., t.success))
+                            .child(div().min_w_0().truncate().child(notice))
+                    })
+                    .when(self.notice.is_none(), |d| d.child(t!("editor.footer_hint"))),
             })
             .child(
                 ui::button("cancel", t, Button::Secondary)
@@ -991,6 +1355,223 @@ impl Editor {
                 ui::button("save", t, Button::Primary)
                     .child(t!("common.save"))
                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+            )
+    }
+
+    /// 「拉取」拉回来的列表：搜索框 + 每个模型一行（勾选、ID、名字、上下文）。目录里已有的勾着、灰着。
+    fn picker_body(
+        &self,
+        picker: &ModelPicker,
+        t: &Theme,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        let shown = picker.shown(cx);
+        let max_h = f32::from(window.viewport_size().height) - 72.;
+        // 卡片顶栏、底栏各 56，搜索框一行 50，剩下的给列表。
+        let list_h = (shown.len() as f32 * PICK_ROW)
+            .min(max_h - 56. * 2. - 50. - 2.)
+            .max(PICK_ROW);
+        let search = div()
+            .flex_none()
+            .px(px(20.))
+            .pt(px(12.))
+            .pb(px(8.))
+            .child(ui::field(
+                t,
+                &picker.filter,
+                false,
+                Some(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.5))
+                        .text_color(t.faint)
+                        .child(if shown.len() == picker.models.len() {
+                            shown.len().to_string()
+                        } else {
+                            format!("{} / {}", shown.len(), picker.models.len())
+                        })
+                        .into_any_element(),
+                ),
+                window,
+                cx,
+            ));
+        let list = if shown.is_empty() {
+            div()
+                .h(px(list_h))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.))
+                .text_color(t.muted)
+                .child(t!("editor.pick_none"))
+                .into_any_element()
+        } else {
+            uniform_list(
+                "picker",
+                shown.len(),
+                cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+                    let t = Theme::window(window.appearance());
+                    let Some(picker) = &this.picker else {
+                        return Vec::new();
+                    };
+                    range
+                        .map(|i| this.pick_row(picker, shown[i], &t, cx))
+                        .collect()
+                }),
+            )
+            .track_scroll(&picker.scroll)
+            .h(px(list_h))
+            .into_any_element()
+        };
+        div()
+            .v_flex()
+            .flex_none()
+            .child(search)
+            .child(div().px(px(12.)).pb(px(8.)).child(list))
+    }
+
+    fn pick_row(
+        &self,
+        picker: &ModelPicker,
+        n: usize,
+        t: &Theme,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let model = &picker.models[n];
+        let existing = picker.existing.contains(&model.id);
+        let checked = existing || picker.chosen.contains(&model.id);
+        let hover_bg = t.card_2;
+        let mut details: Vec<String> = Vec::new();
+        if let Some(context) = model.context {
+            details.push(tokens(context));
+        }
+        if model.input.contains(&Modality::Image) {
+            details.push(t!("editor.image").into());
+        }
+        div()
+            .id(ElementId::named_usize("pick", n))
+            .w_full()
+            .h_flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(PICK_ROW))
+            .px(px(8.))
+            .rounded(px(7.))
+            .when(existing, |row| row.opacity(0.45))
+            .when(!existing, |row| {
+                row.cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_pick(n, cx)))
+            })
+            .child(ui::checkbox(t, checked).flex_none())
+            .child(
+                div()
+                    .h_flex()
+                    .items_baseline()
+                    .gap(px(8.))
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_family("Menlo")
+                            .text_size(px(12.))
+                            .child(model.id.clone()),
+                    )
+                    .when_some(
+                        model.name.clone().filter(|name| *name != model.id),
+                        |d, name| {
+                            d.child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(11.5))
+                                    .text_color(t.muted)
+                                    .child(name),
+                            )
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .text_color(t.muted)
+                    .child(details.join(" · ")),
+            )
+    }
+
+    fn picker_footer(&self, picker: &ModelPicker, t: &Theme, cx: &Context<Self>) -> Div {
+        let shown = picker.shown(cx);
+        let choosable: Vec<&String> = shown
+            .iter()
+            .map(|&n| &picker.models[n].id)
+            .filter(|id| !picker.existing.contains(*id))
+            .collect();
+        let all = !choosable.is_empty() && choosable.iter().all(|id| picker.chosen.contains(*id));
+        let count = picker.chosen.len();
+        div()
+            .h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.))
+            .px(px(20.))
+            .h(px(56.))
+            .border_t_1()
+            .border_color(t.line_2)
+            .child(div().flex_1().when(!choosable.is_empty(), |d| {
+                d.child(
+                    ui::text_button("pick-all", t)
+                        .text_size(px(12.))
+                        .child(if all {
+                            t!("editor.pick_clear")
+                        } else {
+                            t!("editor.pick_all")
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let Some(picker) = &mut this.picker else {
+                                return;
+                            };
+                            let ids: Vec<String> = picker
+                                .shown(cx)
+                                .into_iter()
+                                .map(|n| picker.models[n].id.clone())
+                                .filter(|id| !picker.existing.contains(id))
+                                .collect();
+                            for id in ids {
+                                if all {
+                                    picker.chosen.remove(&id);
+                                } else {
+                                    picker.chosen.insert(id);
+                                }
+                            }
+                            cx.notify();
+                        })),
+                )
+            }))
+            .child(
+                ui::button("pick-cancel", t, Button::Secondary)
+                    .child(t!("common.cancel"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.picker = None;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                ui::button("pick-add", t, Button::Primary)
+                    .when(count == 0, |b| b.opacity(0.5).cursor_default())
+                    .child(match count {
+                        0 => t!("editor.pick_add"),
+                        1 => t!("editor.pick_add_one"),
+                        _ => t!("editor.pick_add_other", count = count),
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if count > 0 {
+                            this.add_picked(window, cx);
+                        }
+                    })),
             )
     }
 
@@ -1160,8 +1741,15 @@ impl Render for Editor {
             .text_color(t.fg)
             .text_size(px(13.))
             .child(self.header(&t, window, cx))
-            .child(self.body(&t, window, cx))
-            .child(self.footer(&t, cx))
+            .map(|card| match &self.picker {
+                // 拉取的列表占住表单的位置，Esc、取消回到表单。
+                Some(picker) => card
+                    .child(self.picker_body(picker, &t, window, cx))
+                    .child(self.picker_footer(picker, &t, cx)),
+                None => card
+                    .child(self.body(&t, window, cx))
+                    .child(self.footer(&t, cx)),
+            })
             .children(self.confirm_card(&t, window, cx))
     }
 }
@@ -1199,6 +1787,18 @@ fn parse_tokens(text: &str) -> Option<u64> {
     };
     let value: f64 = digits.parse().ok()?;
     Some((value * factor as f64).round() as u64)
+}
+
+/// 价格框里的写法：`0.28`、`15`（f64 的最短写法，存回去一样）。
+fn price_text(value: f64) -> String {
+    format!("{value}")
+}
+
+/// 解析价格：`0.28`、`$0.28`；空的、负的、不是数的都当没填。
+fn parse_price(text: &str) -> Option<f64> {
+    let text = text.trim().trim_start_matches('$').trim();
+    let value: f64 = text.parse().ok()?;
+    (value.is_finite() && value >= 0.).then_some(value)
 }
 
 /// 简表里显示的 token 数：`128K`、`384K`、`1M`。十进制的整数倍先按十进制算（128000 → 128K），
@@ -1250,7 +1850,7 @@ fn describe(err: &ProviderError) -> SharedString {
 #[cfg(test)]
 mod tests {
     // 不能 `use super::*`：gpui 也导出一个 `test` 属性宏，会把 `#[test]` 抢走。
-    use super::{parse_tokens, slug, tokens};
+    use super::{parse_price, parse_tokens, price_text, slug, tokens};
 
     #[test]
     fn slugs_come_from_the_name() {
@@ -1279,5 +1879,17 @@ mod tests {
         assert_eq!(tokens(128_000), "128K");
         assert_eq!(tokens(196_608), "192K");
         assert_eq!(tokens(12_345), "12345");
+    }
+
+    #[test]
+    fn prices_round_trip() {
+        for value in [0.28, 15., 0.028, 3.75, 0.1 + 0.2] {
+            assert_eq!(parse_price(&price_text(value)), Some(value));
+        }
+        assert_eq!(price_text(15.), "15");
+        assert_eq!(parse_price("$0.5"), Some(0.5));
+        assert_eq!(parse_price(""), None);
+        assert_eq!(parse_price("-1"), None);
+        assert_eq!(parse_price("free"), None);
     }
 }
