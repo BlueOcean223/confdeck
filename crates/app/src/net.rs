@@ -30,7 +30,8 @@ use crate::ui;
 pub struct NetState {
     /// 地址 → 测连通的结果。
     reach: HashMap<String, Reach>,
-    models_dev: Option<Arc<ModelsDev>>,
+    /// 用量页也用（只读磁盘上的缓存，不联网）。
+    pub(crate) models_dev: Option<Arc<ModelsDev>>,
 }
 
 #[derive(Clone, Debug)]

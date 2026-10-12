@@ -18,6 +18,7 @@ use crate::picker::{Picker, PickerEvent};
 use crate::settings_page::SettingsPage;
 use crate::theme::Theme;
 use crate::ui;
+use crate::usage_page::UsagePage;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -148,6 +149,8 @@ pub struct MainWindow {
     config: Option<OpenConfig>,
     /// 顶栏齿轮打开的设置页，盖在当前标签的页面上；再点齿轮或点标签就关。
     settings: Option<Entity<SettingsPage>>,
+    /// 用量页：第一次点开时建，之后留着（选的时间段不丢）。
+    usage: Option<Entity<UsagePage>>,
     overlay: Option<Overlay>,
     toasts: Vec<Toast>,
     toast_seq: u64,
@@ -183,6 +186,7 @@ impl MainWindow {
             picker: None,
             config: None,
             settings: None,
+            usage: None,
             overlay: None,
             toasts: Vec::new(),
             toast_seq: 0,
@@ -274,17 +278,42 @@ impl MainWindow {
                             this.picker = None;
                             this.config = None;
                             this.settings = None;
+                            if *tab == Tab::Usage {
+                                this.open_usage(cx);
+                            }
                             cx.notify();
                         }),
                     )),
             )
             .child(div().flex_1())
-            .child(ui::icon_button("refresh", t, "rotate-cw"))
+            .child(
+                ui::icon_button("refresh", t, "rotate-cw").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        if this.tab == Tab::Usage {
+                            this.store
+                            .update(cx, |store, cx| store.refresh_usage(true, cx));
+                        }
+                    },
+                )),
+            )
             .child(
                 ui::icon_button("settings", t, "settings")
                     .when(self.settings.is_some(), |b| b.bg(t.pill_hover))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
             )
+    }
+
+    /// 切到用量页：第一次建页面（建的时候扫一遍），之后每次切过来扫一遍新加的。
+    fn open_usage(&mut self, cx: &mut Context<Self>) {
+        match &self.usage {
+            Some(_) => self
+                .store
+                .update(cx, |store, cx| store.refresh_usage(false, cx)),
+            None => {
+                let store = self.store.clone();
+                self.usage = Some(cx.new(|cx| UsagePage::new(store, cx)));
+            }
+        }
     }
 
     /// 齿轮：开着就关，关着就开。
@@ -1036,6 +1065,11 @@ impl Render for MainWindow {
             (None, Tab::Agents, Some(config)) => config.page.clone().into_any_element(),
             (None, Tab::Agents, None) => self.agents_page(&t, window, cx).into_any_element(),
             (None, Tab::Providers, _) => self.providers_page(&t, window, cx).into_any_element(),
+            (None, Tab::Usage, _) if self.usage.is_some() => self
+                .usage
+                .clone()
+                .map(|usage| usage.into_any_element())
+                .unwrap_or_else(|| div().into_any_element()),
             _ => self.placeholder(&t).into_any_element(),
         };
 

@@ -844,3 +844,140 @@ transfer:
   too_new:
     en: Exported by a newer confdeck
     zh-CN: 这个文件是更新版本的 confdeck 导出的
+
+# 用量页（照 magpie 的用量页）。
+usage:
+  today:
+    en: Today
+    zh-CN: 今天
+  week:
+    en: 7 days
+    zh-CN: 7 天
+  month:
+    en: 30 days
+    zh-CN: 30 天
+  all:
+    en: All
+    zh-CN: 全部
+  # 总花费后面的小字：按什么价格算的。
+  prices:
+    en: effective prices
+    zh-CN: 标价
+  unpriced_one:
+    en: 1 call had no known price and is not counted
+    zh-CN: 1 次调用没有价格，未计入
+  unpriced_other:
+    en: "%{count} calls had no known price and are not counted"
+    zh-CN: "%{count} 次调用没有价格，未计入"
+  load_error:
+    en: "Couldn't read usage: %{error}"
+    zh-CN: "读不了用量：%{error}"
+  none_today:
+    en: No calls today.
+    zh-CN: 今天还没有调用。
+  none_week:
+    en: No calls in the last 7 days.
+    zh-CN: 最近 7 天没有调用。
+  none_month:
+    en: No calls in the last 30 days.
+    zh-CN: 最近 30 天没有调用。
+  none_all:
+    en: No calls yet.
+    zh-CN: 还没有调用。
+  tokens:
+    en: Tokens
+    zh-CN: Token
+  in_out:
+    en: "%{input} in · %{output} out"
+    zh-CN: "输入 %{input} · 输出 %{output}"
+  cache_read:
+    en: Cache read
+    zh-CN: 缓存读取
+  hit_rate:
+    en: "hit rate %{rate}"
+    zh-CN: "命中率 %{rate}"
+  cache_written:
+    en: "%{count} written to cache"
+    zh-CN: "写入缓存 %{count}"
+  cached:
+    en: "%{count} cached"
+    zh-CN: "缓存 %{count}"
+  reasoning:
+    en: Reasoning
+    zh-CN: 推理
+  inside_output:
+    en: inside output
+    zh-CN: 计入输出
+  # 统计块的标题，数字在上面。
+  call:
+    en: call
+    zh-CN: 次调用
+  calls:
+    en: calls
+    zh-CN: 次调用
+  calls_one:
+    en: 1 call
+    zh-CN: 1 次调用
+  calls_other:
+    en: "%{count} calls"
+    zh-CN: "%{count} 次调用"
+  week_of:
+    en: "week of %{date}"
+    zh-CN: "%{date} 起的一周"
+  bar:
+    en: "%{when} · %{tokens} tokens · %{calls}"
+    zh-CN: "%{when} · %{tokens} token · %{calls}"
+  bar_empty:
+    en: "%{when} · nothing"
+    zh-CN: "%{when} · 没有调用"
+  bars:
+    en: Bars
+    zh-CN: 柱状图
+  heatmap:
+    en: Heatmap
+    zh-CN: 热力图
+  requests:
+    en: Calls
+    zh-CN: 调用
+  cost:
+    en: Cost
+    zh-CN: 花费
+  less:
+    en: Less
+    zh-CN: 少
+  more:
+    en: More
+    zh-CN: 多
+  share:
+    en: "%{percent}% of tokens"
+    zh-CN: "占 token 的 %{percent}%"
+  sources:
+    en: Providers
+    zh-CN: 供应商
+  agents:
+    en: Agents
+    zh-CN: Agent
+  models:
+    en: Models
+    zh-CN: 模型
+  # 供应商列表里 agent 自带登录那一行的名字下面。
+  official:
+    en: Official
+    zh-CN: 官方
+  unknown:
+    en: Unknown
+    zh-CN: 未知
+  # 余额卡。
+  balance:
+    en: Balance
+    zh-CN: 余额
+  # OpenRouter 没设上限的 Key：只知道用了多少。
+  spent:
+    en: Used
+    zh-CN: 已用
+  balance_auth:
+    en: Key rejected
+    zh-CN: Key 不对
+  balance_unknown:
+    en: Unrecognized response
+    zh-CN: 返回的内容认不出

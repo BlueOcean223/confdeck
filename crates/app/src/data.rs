@@ -230,6 +230,8 @@ pub struct Store {
     pub load_error: Option<String>,
     /// 联网的那几样（测连通、models.dev）的状态，见 `net.rs`。
     pub(crate) net: crate::net::NetState,
+    /// 用量的汇总，见 `usage.rs`。
+    pub(crate) usage: crate::usage::UsageState,
 }
 
 impl EventEmitter<Notice> for Store {}
@@ -244,6 +246,7 @@ impl Store {
             agents: Vec::new(),
             load_error: None,
             net: Default::default(),
+            usage: Default::default(),
         };
         store.reload();
         store
@@ -266,6 +269,7 @@ impl Store {
             self.engine.hidden(Place::Panel),
         );
         self.agents = AGENTS.iter().map(|def| self.agent(def, &hidden)).collect();
+        self.note_selections();
     }
 
     fn agent(&self, def: &AgentDef, hidden: &(BTreeSet<String>, BTreeSet<String>)) -> Agent {

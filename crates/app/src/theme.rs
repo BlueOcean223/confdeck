@@ -27,6 +27,8 @@ pub struct Theme {
     pub danger: Hsla,
     /// 保存成功的提示。
     pub success: Hsla,
+    /// 用量页的花费（`--green`）。
+    pub green: Hsla,
     /// 弹层编辑器底下盖住列表的那层。
     pub backdrop: Hsla,
     /// 输入框的底色。
@@ -111,6 +113,7 @@ impl Theme {
             pop_bg: hexa(0xfffffff0),
             danger: hex(0xdc2626),
             success: hex(0x15803d),
+            green: hex(0x189a58),
             backdrop: hexa(0x1c1c2140),
             field: hex(0xffffff),
         }
@@ -138,6 +141,7 @@ impl Theme {
             pop_bg: hexa(0x26262bf5),
             danger: hex(0xf87171),
             success: hex(0x4ade80),
+            green: hex(0x6fd99b),
             backdrop: hexa(0x00000080),
             field: hex(0x1c1c20),
         }

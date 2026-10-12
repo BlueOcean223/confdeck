@@ -18,6 +18,8 @@ mod settings_page;
 mod theme;
 mod tray;
 mod ui;
+mod usage;
+mod usage_page;
 
 use std::path::PathBuf;
 
