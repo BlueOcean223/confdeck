@@ -14,6 +14,7 @@ mod main_window;
 mod net;
 mod panel;
 mod picker;
+mod sessions_page;
 mod settings_page;
 mod theme;
 mod tray;

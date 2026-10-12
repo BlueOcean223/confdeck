@@ -1020,3 +1020,78 @@ usage:
   balance_unknown:
     en: Unrecognized response
     zh-CN: 返回的内容认不出
+
+sessions:
+  search:
+    en: Search sessions
+    zh-CN: 搜索会话
+  all:
+    en: All
+    zh-CN: 全部
+  count_one:
+    en: 1 session
+    zh-CN: 1 个会话
+  count_other:
+    en: "%{count} sessions"
+    zh-CN: "%{count} 个会话"
+  none:
+    en: No sessions yet
+    zh-CN: 还没有会话
+  no_match:
+    en: No matching sessions
+    zh-CN: 没有匹配的会话
+  more:
+    en: "Show %{count} more"
+    zh-CN: "再显示 %{count} 个"
+  # 复制按钮的提示：复制的是 `cd 目录 && claude --resume …` 这样的命令。
+  copy:
+    en: Copy resume command
+    zh-CN: 复制恢复命令
+  copy_short:
+    en: Copy
+    zh-CN: 复制
+  copied:
+    en: Resume command copied
+    zh-CN: 已复制恢复命令
+  back:
+    en: Sessions
+    zh-CN: 会话
+  started:
+    en: "started %{when}"
+    zh-CN: "%{when} 开始"
+  active:
+    en: "last active %{when}"
+    zh-CN: "%{when}活动"
+  no_folder:
+    en: No folder
+    zh-CN: 没有目录
+  reading:
+    en: Reading…
+    zh-CN: 正在读取…
+  read_error:
+    en: "Can't read the session: %{error}"
+    zh-CN: "读不了这个会话：%{error}"
+  empty:
+    en: No messages
+    zh-CN: 没有消息
+  earlier:
+    en: "Show %{count} earlier"
+    zh-CN: "再显示前面 %{count} 条"
+  just_now:
+    en: just now
+    zh-CN: 刚刚
+  minutes_ago:
+    en: "%{count}m ago"
+    zh-CN: "%{count} 分钟前"
+  hours_ago:
+    en: "%{count}h ago"
+    zh-CN: "%{count} 小时前"
+  today:
+    en: today
+    zh-CN: 今天
+  yesterday:
+    en: yesterday
+    zh-CN: 昨天
+  days_ago:
+    en: "%{count}d ago"
+    zh-CN: "%{count} 天前"

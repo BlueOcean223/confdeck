@@ -2,6 +2,7 @@
 //!
 //! - 打开用量页、点顶栏的刷新时扫一次；扫的时候再点不重复扫。第一次要读全部历史（本机 release 约 6 秒），之后几十毫秒。
 //! - 汇总一次算好四个时间段和热力图，切时间段不用等。算完把请求丢掉，只留汇总。
+//! - 会话页的会话列表也从这里来：扫的时候顺带记下的（core 的 `session`），文件已经不在的不要。
 //! - 价格用 models.dev 时只读磁盘上的缓存，不联网（供应商页拉列表、补全时会下）。
 //! - 余额（core 的 `balance`）和订阅额度（core 的 `quota`）：能查的每家一个后台任务，同时查；5 分钟内不重查，
 //!   点刷新按钮才重查。重查时先留着上次的数，查回来再换。Codex 官方的额度不联网，扫会话记录时一起读出来（`Loaded::codex`）。
@@ -18,6 +19,7 @@ use confdeck_core::fsx;
 use confdeck_core::models_dev::{self, ModelsDev};
 use confdeck_core::net::Http;
 use confdeck_core::quota::{self, Quota, QuotaError};
+use confdeck_core::session::Session;
 use confdeck_core::usage::history::{self, Target};
 use confdeck_core::usage::summary::{self, Context as Pricing, Heatmap, Period, Source, Summary};
 use confdeck_core::usage::{Db, UsageError};
@@ -69,6 +71,8 @@ pub struct Loaded {
     pub names: HashMap<String, String>,
     /// Codex 官方的额度：会话记录里最新的 `rate_limits`。没用过官方登录是 `None`。
     pub codex: Option<Quota>,
+    /// 全部会话，最近活动的在前。
+    pub sessions: Vec<Session>,
 }
 
 impl Loaded {
@@ -101,6 +105,8 @@ impl Store {
             let requests = db.requests(None)?;
             let switches = history::load(&data)?;
             let codex = db.limit("codex")?;
+            let mut sessions = db.sessions()?;
+            sessions.retain(|session| session.path.exists());
             let pricing = Pricing {
                 providers: &providers,
                 history: &switches,
@@ -127,6 +133,7 @@ impl Store {
                     heatmap,
                     names,
                     codex,
+                    sessions,
                 },
                 dev,
             ))

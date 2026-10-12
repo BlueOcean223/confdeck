@@ -15,6 +15,7 @@ use crate::data::{self, Notice, NoticeKind, Store};
 use crate::editor::{Editor, EditorEvent};
 use crate::net;
 use crate::picker::{Picker, PickerEvent};
+use crate::sessions_page::SessionsPage;
 use crate::settings_page::SettingsPage;
 use crate::theme::Theme;
 use crate::ui;
@@ -151,6 +152,7 @@ pub struct MainWindow {
     settings: Option<Entity<SettingsPage>>,
     /// 用量页：第一次点开时建，之后留着（选的时间段不丢）。
     usage: Option<Entity<UsagePage>>,
+    sessions: Option<Entity<SessionsPage>>,
     overlay: Option<Overlay>,
     toasts: Vec<Toast>,
     toast_seq: u64,
@@ -187,6 +189,7 @@ impl MainWindow {
             config: None,
             settings: None,
             usage: None,
+            sessions: None,
             overlay: None,
             toasts: Vec::new(),
             toast_seq: 0,
@@ -264,7 +267,7 @@ impl MainWindow {
                         self.tab,
                         self.tab_anim,
                         window,
-                        cx.listener(|this, tab: &Tab, _, cx| {
+                        cx.listener(|this, tab: &Tab, window, cx| {
                             if this.tab == *tab {
                                 return;
                             }
@@ -278,8 +281,10 @@ impl MainWindow {
                             this.picker = None;
                             this.config = None;
                             this.settings = None;
-                            if *tab == Tab::Usage {
-                                this.open_usage(cx);
+                            match *tab {
+                                Tab::Usage => this.open_usage(cx),
+                                Tab::Sessions => this.open_sessions(window, cx),
+                                _ => {}
                             }
                             cx.notify();
                         }),
@@ -289,9 +294,14 @@ impl MainWindow {
             .child(
                 ui::icon_button("refresh", t, "rotate-cw").on_click(cx.listener(
                     |this, _, _, cx| {
-                        if this.tab == Tab::Usage {
-                            this.store
-                            .update(cx, |store, cx| store.refresh_usage(true, cx));
+                        match this.tab {
+                            Tab::Usage => this
+                                .store
+                                .update(cx, |store, cx| store.refresh_usage(true, cx)),
+                            Tab::Sessions => this
+                                .store
+                                .update(cx, |store, cx| store.refresh_usage(false, cx)),
+                            _ => {}
                         }
                     },
                 )),
@@ -312,6 +322,19 @@ impl MainWindow {
             None => {
                 let store = self.store.clone();
                 self.usage = Some(cx.new(|cx| UsagePage::new(store, cx)));
+            }
+        }
+    }
+
+    /// 切到会话页：第一次建页面，之后每次切过来扫一遍新加的（点开的会话还开着）。
+    fn open_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.sessions {
+            Some(_) => self
+                .store
+                .update(cx, |store, cx| store.refresh_usage(false, cx)),
+            None => {
+                let store = self.store.clone();
+                self.sessions = Some(cx.new(|cx| SessionsPage::new(store, window, cx)));
             }
         }
     }
@@ -1069,6 +1092,11 @@ impl Render for MainWindow {
                 .usage
                 .clone()
                 .map(|usage| usage.into_any_element())
+                .unwrap_or_else(|| div().into_any_element()),
+            (None, Tab::Sessions, _) if self.sessions.is_some() => self
+                .sessions
+                .clone()
+                .map(|sessions| sessions.into_any_element())
                 .unwrap_or_else(|| div().into_any_element()),
             _ => self.placeholder(&t).into_any_element(),
         };
