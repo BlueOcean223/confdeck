@@ -37,6 +37,15 @@ pub fn round_corners(window: &Window, radius: f64) {
     ns_window.invalidateShadow();
 }
 
+/// 关窗口之前先交出第一响应者。面板里的输入框还是第一响应者、主窗口又刚变成 key 窗口时关面板，
+/// AppKit 的 TouchBar 观察者会在下一次刷新里把 `nextResponder` 的观察解注册两次，抛 `NSRangeException`
+/// 让整个应用崩溃（notes/panel-focus-crash.md）。
+pub fn resign_first_responder(window: &Window) {
+    if let Some(ns_window) = ns_window(window) {
+        ns_window.makeFirstResponder(None);
+    }
+}
+
 /// 改窗口高度，顶边不动、向下长。GPUI 的 `Window::resize` 固定的是左下角，
 /// 面板会往上长、顶到菜单栏上面去。
 ///
@@ -77,8 +86,7 @@ pub fn window_number(window: &Window) -> Option<isize> {
 #[cfg(debug_assertions)]
 pub fn force_appearance(name: &str) {
     use objc2_app_kit::{
-        NSAppearance, NSAppearanceNameAqua,
-        NSAppearanceNameDarkAqua, NSApplication,
+        NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     };
     use objc2_foundation::MainThreadMarker;
 

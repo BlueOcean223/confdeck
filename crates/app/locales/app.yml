@@ -424,14 +424,14 @@ write:
     en: "Removed %{count} backups"
     zh-CN: "清理了 %{count} 份"
   codex_catalog_skipped:
-    en: "Codex model catalog not written (%{reason}): /model still lists GPT models and this provider's models get a 272K window"
-    zh-CN: "Codex 的模型目录没写成（%{reason}）：/model 列的还是 GPT 模型，这家的模型按 272K 窗口算"
+    en: "Codex model catalog not written: %{reason}"
+    zh-CN: "Codex 的模型目录没写成：%{reason}"
   codex_catalog_refreshed:
     en: "Codex model catalog rewritten for the installed Codex (%{file})"
     zh-CN: "按本机的 Codex 重写了模型目录（%{file}）"
   codex_catalog_refresh_failed:
-    en: "Could not refresh the Codex model catalog: %{reason}. The old one still works"
-    zh-CN: "没能按本机的 Codex 重写模型目录：%{reason}。旧目录照样能用"
+    en: "Codex model catalog not refreshed: %{reason}"
+    zh-CN: "Codex 的模型目录没更新：%{reason}"
 
 # Codex 模型目录没生成出来的三种原因（core 的 `Skipped`），填进上面 write.codex_* 的 %{reason}。
 codex:

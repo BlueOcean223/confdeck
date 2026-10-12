@@ -382,13 +382,18 @@ impl Panel {
 }
 
 /// 关掉面板。不能在 AppKit 的窗口回调（比如失焦）里同步关窗口，会抛 NSRangeException
-/// 让整个应用崩溃，所以放到下一轮主线程任务里关。
+/// 让整个应用崩溃，所以先交出第一响应者，等一帧再关（notes/panel-focus-crash.md）。
 fn close(window: &mut Window, cx: &mut App) {
     let state = cx.default_global::<PanelState>();
     state.handle = None;
     state.closed_at = Some(Instant::now());
+    window.blur(cx);
+    #[cfg(target_os = "macos")]
+    crate::mac::resign_first_responder(window);
     let handle = window.window_handle();
+    let timer = cx.background_executor().timer(Duration::from_millis(32));
     cx.spawn(async move |cx| {
+        timer.await;
         cx.update(|cx| {
             handle
                 .update(cx, |_, window, _| window.remove_window())

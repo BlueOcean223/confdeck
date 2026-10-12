@@ -51,6 +51,8 @@ pub fn start(cx: &mut App) {
         std::env::var("CONFDECK_SHOTS").unwrap_or_else(|_| "/tmp/confdeck-shots".into()),
     );
     std::fs::create_dir_all(&shots).ok();
+    #[cfg(target_os = "macos")]
+    trap_objc_exceptions();
 
     cx.spawn(async move |cx| {
         let mut target = Target::Main;
@@ -83,13 +85,44 @@ pub fn start(cx: &mut App) {
                 .await;
             // 等完也补画一帧：不然动画（比如编辑器落下来那 260ms）停在开头那帧上，
             // 下一次点击按旧帧的位置命中，差几个像素就点不到输入框。
+            // 目标窗口已经关了（比如面板里选完就关）补不了画，不算错。
             #[cfg(feature = "shots")]
-            if let Err(err) = cx.update(|cx| run("redraw", "", target, &shots, cx)) {
-                eprintln!("drive: redraw: {err:#}");
-            }
+            cx.update(|cx| run("redraw", "", target, &shots, cx)).ok();
         }
     })
     .detach();
+}
+
+/// 跑脚本时 AppKit 抛出来的未捕获异常：打印原因就退出，不走 abort。abort 会弹系统的「意外退出」对话框，
+/// 打扰正在用电脑的人；退出码 70 和日志里的 `drive: uncaught exception` 让 flows.sh 认出是崩溃。
+#[cfg(target_os = "macos")]
+fn trap_objc_exceptions() {
+    use std::ffi::{CStr, c_char};
+
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    unsafe extern "C" fn handler(exception: *mut AnyObject) {
+        // SAFETY: AppKit 传进来的是 NSException，`reason` 是 NSString（可能为空）。
+        let reason = unsafe {
+            let reason: *mut AnyObject = msg_send![exception, reason];
+            if reason.is_null() {
+                String::from("?")
+            } else {
+                let utf8: *const c_char = msg_send![reason, UTF8String];
+                CStr::from_ptr(utf8).to_string_lossy().into_owned()
+            }
+        };
+        eprintln!("drive: uncaught exception: {reason}");
+        std::process::exit(70);
+    }
+
+    #[link(name = "Foundation", kind = "framework")]
+    unsafe extern "C" {
+        fn NSSetUncaughtExceptionHandler(handler: Option<unsafe extern "C" fn(*mut AnyObject)>);
+    }
+    // SAFETY: 只在进程里装一次，处理函数不碰别的状态。
+    unsafe { NSSetUncaughtExceptionHandler(Some(handler)) };
 }
 
 fn run(cmd: &str, arg: &str, target: Target, shots: &Path, cx: &mut App) -> anyhow::Result<()> {
@@ -138,7 +171,11 @@ fn run(cmd: &str, arg: &str, target: Target, shots: &Path, cx: &mut App) -> anyh
             }
             "type" => {
                 for ch in arg.chars() {
-                    let key = if ch == ' ' { "space".into() } else { ch.to_string() };
+                    let key = if ch == ' ' {
+                        "space".into()
+                    } else {
+                        ch.to_string()
+                    };
                     window.dispatch_keystroke(Keystroke::parse(&key)?, cx);
                 }
             }

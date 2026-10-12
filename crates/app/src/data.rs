@@ -603,6 +603,24 @@ impl Store {
         let Some(kind) = self.agents[agent].kind else {
             return Task::ready(Vec::new());
         };
+        // 选的就是现在这家、文件是 confdeck 写的样子、state.json 也记着它：没什么可写，也不提示「已切到」。
+        // 文件认出来是这家但 state 里没记（比如刚把文件里的连接存成供应商）还是要走一遍，把选择记下来。
+        let picked_id = provider.map(|p| self.providers[p].id.as_str());
+        let recorded = self
+            .engine
+            .selection(kind.id())
+            .is_some_and(|recorded| recorded.as_deref() == picked_id);
+        let unchanged = recorded
+            && match (&self.agents[agent].selection, &self.agents[agent].current) {
+                (Selection::Single(current), Some(Current::Provider(id))) => {
+                    *current == provider && picked_id == Some(id.as_str())
+                }
+                (Selection::Single(None), Some(Current::Default)) => provider.is_none(),
+                _ => false,
+            };
+        if unchanged {
+            return Task::ready(Vec::new());
+        }
         let picked = provider.map(|p| self.providers[p].clone());
         let name = picked.as_ref().map(|p| p.name.clone());
         let row = &mut self.agents[agent];
@@ -720,7 +738,7 @@ impl Store {
     }
 
     /// 启动时在后台按本机的 Codex 重写模型目录（core 的 `refresh_codex_catalog`）：
-    /// 重写了、没写成都说一声，不用写就不吭声。
+    /// 重写了、没写成说一声；不用写、或者本机根本没有 codex 就不吭声（旧目录照样能用，没必要每次启动都报）。
     pub fn refresh_codex_catalog(&self, cx: &mut Context<Self>) {
         let engine = self.engine.clone();
         let home = self.home.clone();
@@ -739,6 +757,7 @@ impl Store {
                             .unwrap_or_default();
                         Some(Notice::ok(t!("write.codex_catalog_refreshed", file = file)))
                     }
+                    Ok(Some(Err(Skipped::NotFound))) => None,
                     Ok(Some(Err(skipped))) => Some(Notice::err(t!(
                         "write.codex_catalog_refresh_failed",
                         reason = describe_skipped(skipped)
