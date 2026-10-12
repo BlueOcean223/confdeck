@@ -6,6 +6,7 @@
 //! - [`history`]：confdeck 把单选 agent 切到哪家的记录。Claude Code、Codex、Grok Build 的会话记录里没有接口地址，
 //!   靠它认一段时间里连的是哪家；它不能重算，所以放数据目录、不放缓存。
 //! - [`summary`]：认供应商、算花费，一段时间的总量和按天、按供应商 / agent / 模型的分组。
+//! - 扫的时候顺带记下每个会话的概况（目录、第一句提问、标题、最后活动时间），会话页用（[`crate::session`]）。
 
 mod claude;
 mod codex;
@@ -36,6 +37,39 @@ pub enum UsageError {
         path: PathBuf,
         source: std::io::Error,
     },
+}
+
+/// 会话概况的一笔更新：解析器读到新内容时交出来，库里合进去——ID、目录、第一句提问、开始时间已经有了就不改；
+/// 名字、标题用新的；最后活动时间取文件的修改时间。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct SessionPatch {
+    pub id: Option<String>,
+    pub cwd: Option<String>,
+    pub prompt: Option<String>,
+    /// 用户起的名字（Claude 的 /rename、Pi 的 `session_info`）；`Some("")` 是清掉了。
+    pub name: Option<String>,
+    /// agent 自己起的标题（Claude 的 `ai-title`、Grok 的 `session_summary`）。
+    pub title: Option<String>,
+    pub started: Option<i64>,
+}
+
+/// 第一句提问：去掉首尾空白、连续的空白并成一个，最多 200 个字。是空的、或者是 agent 自己插的（`<` 开头）返回 `None`。
+pub(crate) fn prompt_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || text.starts_with('<') {
+        return None;
+    }
+    let mut out = String::new();
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+        if out.chars().count() >= 200 {
+            break;
+        }
+    }
+    Some(out.chars().take(200).collect())
 }
 
 /// 一次请求的 token，各家的口径统一成这样（见各 agent 的模块）。

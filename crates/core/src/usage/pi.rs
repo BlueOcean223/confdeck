@@ -4,6 +4,9 @@
 //! 这类总结也花 token，用量在行上的 `usage`。供应商直接写在 `message.provider` 里（confdeck 写的是 `confdeck-<id>`）。
 //! `input` 不含缓存，`reasoning` 含在 `output` 里；`cost.total` 是 Pi 按它自己的价格算的美元。
 //! 会话是树，换分支不复制；`/fork` 出来的新文件复制整段历史，键用（时间、供应商、模型、responseId）去重。
+//!
+//! 会话概况：第一行 `type == "session"` 带 `id`、`cwd`、`timestamp`；第一条 `role: user` 的消息是第一句提问；
+//! `session_info` 行的 `name` 是用户起的名字（空的是清掉）。
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::scan::{Parsed, Parser, is_jsonl, walk};
-use super::{Request, Tokens, clean_model, parse_time};
+use super::{Request, SessionPatch, Tokens, clean_model, parse_time, prompt_text};
 use crate::agent::AgentKind;
 
 pub(super) fn files(home: &Path) -> Vec<PathBuf> {
@@ -22,7 +25,7 @@ pub(super) fn files(home: &Path) -> Vec<PathBuf> {
     )
 }
 
-pub(super) fn open(path: &Path, _: &str) -> Box<dyn Parser> {
+pub(super) fn open(path: &Path, state: &str) -> Box<dyn Parser> {
     // 文件名是 `<时间>_<会话 id>.jsonl`。
     let stem = path
         .file_stem()
@@ -32,12 +35,62 @@ pub(super) fn open(path: &Path, _: &str) -> Box<dyn Parser> {
     Box::new(Pi {
         session,
         requests: Vec::new(),
+        patch: SessionPatch::default(),
+        // 状态只记一件事：第一句提问已经读到了。
+        prompted: state == "prompted",
     })
 }
 
 struct Pi {
     session: String,
     requests: Vec<Request>,
+    patch: SessionPatch,
+    prompted: bool,
+}
+
+impl Pi {
+    fn overview(&mut self, line: &str) {
+        let header = line.starts_with("{\"type\":\"session\"");
+        let named = line.contains("\"session_info\"");
+        let asks = !self.prompted && line.contains("\"role\":\"user\"");
+        if !header && !named && !asks {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        match value["type"].as_str() {
+            Some("session") => {
+                self.patch.id = value["id"].as_str().map(str::to_string);
+                self.patch.cwd = value["cwd"].as_str().map(str::to_string);
+                self.patch.started = value["timestamp"].as_str().and_then(parse_time);
+            }
+            Some("session_info") => {
+                self.patch.name = Some(
+                    value["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                );
+            }
+            Some("message") if asks && value["message"]["role"] == "user" => {
+                let content = &value["message"]["content"];
+                let first = content.as_str().or_else(|| {
+                    content
+                        .as_array()?
+                        .iter()
+                        .find(|block| block["type"] == "text")?["text"]
+                        .as_str()
+                });
+                if let Some(prompt) = first.and_then(prompt_text) {
+                    self.patch.prompt = Some(prompt);
+                    self.prompted = true;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -71,6 +124,7 @@ struct Cost {
 
 impl Parser for Pi {
     fn line(&mut self, _: u64, line: &str) {
+        self.overview(line);
         if !line.contains("\"usage\"") {
             return;
         }
@@ -140,6 +194,12 @@ impl Parser for Pi {
     fn finish(self: Box<Self>) -> Parsed {
         Parsed {
             requests: self.requests,
+            state: if self.prompted {
+                "prompted".into()
+            } else {
+                String::new()
+            },
+            session: Some(self.patch),
             ..Parsed::default()
         }
     }

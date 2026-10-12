@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use super::db::FileRow;
-use super::{Db, Limit, Request, UsageError, claude, codex, grok, opencode, pi};
+use super::{Db, Limit, Request, SessionPatch, UsageError, claude, codex, grok, opencode, pi};
 use crate::agent::AgentKind;
 
 /// 一次扫描的结果。
@@ -36,6 +36,8 @@ pub(super) struct Parsed {
     pub state: String,
     /// 额度快照：来源和内容。
     pub limit: Option<(&'static str, Limit)>,
+    /// 会话概况的更新；不是会话（子代理）的是 `None`。
+    pub session: Option<SessionPatch>,
 }
 
 struct Source {
@@ -131,7 +133,13 @@ fn scan_file(db: &mut Db, source: &Source, path: &Path) -> Result<Option<usize>,
         .limit
         .as_ref()
         .map(|(source, limit)| (*source, limit));
-    db.commit(&key, &row, &parsed.requests, limit).map(Some)
+    // 最后活动时间用文件的修改时间，不用一行一行去解析时间。
+    let session = parsed
+        .session
+        .as_ref()
+        .map(|patch| (source.agent, patch, mtime / 1_000_000));
+    db.commit(&key, &row, &parsed.requests, limit, session)
+        .map(Some)
 }
 
 /// 从 `offset` 起逐个读整行（不带换行符），交给 `line`；最后一行还没写完（没有换行符）的不读。
@@ -186,7 +194,9 @@ pub(super) fn is_jsonl(path: &Path) -> bool {
 mod tests {
     use std::io::Write;
 
-    use super::read_lines;
+    use super::{read_lines, scan};
+    use crate::agent::AgentKind;
+    use crate::usage::Db;
 
     #[test]
     fn only_finished_lines_are_read() {
@@ -208,5 +218,115 @@ mod tests {
         let end = read_lines(&path, end, |at, line| lines.push((at, line.to_string()))).unwrap();
         assert_eq!(lines, vec![(8, "three".to_string())]);
         assert_eq!(end, 14);
+    }
+
+    fn write(home: &std::path::Path, relative: &str, lines: &[&str]) {
+        let path = home.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    fn sessions_are_noted_while_scanning() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        write(
+            home,
+            ".claude/projects/-w-app/c1.jsonl",
+            &[
+                r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>x</local-command-caveat>"},"cwd":"/w/app","timestamp":"2026-10-12T01:00:00.000Z","sessionId":"c1"}"#,
+                r#"{"type":"user","message":{"role":"user","content":"  fix   the build\nplease "},"cwd":"/w/app","timestamp":"2026-10-12T01:00:01.000Z","sessionId":"c1"}"#,
+                r#"{"type":"ai-title","aiTitle":"Fixing the build","sessionId":"c1"}"#,
+                r#"{"type":"user","message":{"role":"user","content":"second question"},"cwd":"/w/app","timestamp":"2026-10-12T01:05:00.000Z","sessionId":"c1"}"#,
+            ],
+        );
+        // 打开就退出了：一句没问，不列。
+        write(
+            home,
+            ".claude/projects/-w-app/c2.jsonl",
+            &[
+                r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>x</local-command-caveat>"},"cwd":"/w/app","timestamp":"2026-10-12T01:00:00.000Z","sessionId":"c2"}"#,
+            ],
+        );
+        write(
+            home,
+            ".claude/projects/-w-app/c1/subagents/agent-1.jsonl",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"sub task"},"cwd":"/w/app","timestamp":"2026-10-12T01:02:00.000Z","sessionId":"c1"}"#,
+            ],
+        );
+        write(
+            home,
+            ".codex/sessions/2026/10/12/rollout-2026-10-12T01-00-00-t1.jsonl",
+            &[
+                r#"{"timestamp":"2026-10-12T02:00:00.000Z","type":"session_meta","payload":{"id":"t1","cwd":"/w/api","timestamp":"2026-10-12T02:00:00.000Z","model_provider":"openai","source":"cli","thread_source":"user"}}"#,
+                r##"{"timestamp":"2026-10-12T02:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /w/api"},{"type":"input_text","text":"<environment_context>x</environment_context>"}]}}"##,
+                r#"{"timestamp":"2026-10-12T02:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add an endpoint"}]}}"#,
+            ],
+        );
+        write(
+            home,
+            ".codex/sessions/2026/10/12/rollout-2026-10-12T01-00-00-t2.jsonl",
+            &[
+                r#"{"timestamp":"2026-10-12T02:00:00.000Z","type":"session_meta","payload":{"id":"t2","cwd":"/w/api","source":{"subagent":{}},"thread_source":"subagent"}}"#,
+            ],
+        );
+        write(
+            home,
+            ".pi/agent/sessions/--w-cli--/2026-10-12T03-00-00_p1.jsonl",
+            &[
+                r#"{"type":"session","version":3,"id":"p1","timestamp":"2026-10-12T03:00:00.000Z","cwd":"/w/cli"}"#,
+                r#"{"type":"message","id":"u1","timestamp":"2026-10-12T03:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"rename things"}]}}"#,
+                r#"{"type":"session_info","id":"n1","name":"Renaming"}"#,
+            ],
+        );
+        write(
+            home,
+            ".grok/sessions/w-site/g1/updates.jsonl",
+            &[
+                r#"{"timestamp":1789620532,"params":{"sessionId":"g1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"make it faster"}}}}"#,
+            ],
+        );
+        write(
+            home,
+            ".grok/sessions/w-site/g1/summary.json",
+            &[
+                r#"{"info":{"id":"g1","cwd":"/w/site"},"session_summary":"Speeding up the site","created_at":"2026-10-12T04:00:00Z"}"#,
+            ],
+        );
+
+        let mut db = Db::in_memory();
+        scan(home, &mut db);
+        let mut sessions = db.sessions().unwrap();
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["c1", "g1", "p1", "t1"]);
+        let claude = &sessions[0];
+        assert_eq!(claude.agent, AgentKind::ClaudeCode);
+        assert_eq!(claude.cwd.as_deref(), Some("/w/app"));
+        assert_eq!(claude.prompt.as_deref(), Some("fix the build please"));
+        assert_eq!(claude.label(), "Fixing the build");
+        assert!(claude.started.is_some() && claude.active > 0);
+        assert_eq!(sessions[1].label(), "Speeding up the site");
+        assert_eq!(sessions[1].prompt.as_deref(), Some("make it faster"));
+        assert_eq!(sessions[2].label(), "Renaming");
+        assert_eq!(sessions[2].cwd.as_deref(), Some("/w/cli"));
+        assert_eq!(sessions[3].prompt.as_deref(), Some("add an endpoint"));
+
+        // 接着写：/rename 起了名字；第一句提问不变。
+        let path = home.join(".claude/projects/-w-app/c1.jsonl");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(r#"{"type":"custom-title","customTitle":"Build","sessionId":"c1"}"#);
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+        scan(home, &mut db);
+        let claude = db
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "c1")
+            .unwrap();
+        assert_eq!(claude.label(), "Build");
+        assert_eq!(claude.prompt.as_deref(), Some("fix the build please"));
     }
 }

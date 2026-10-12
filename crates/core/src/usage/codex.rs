@@ -9,6 +9,9 @@
 //!   有了 `token_usage_record` 的文件不再看 `token_count`，它们记的是同一批。
 //! - `input_tokens` 含缓存读写，`output_tokens` 含推理。
 //! - `token_count` 还带官方订阅的 `rate_limits`，存成 `codex` 的额度快照。
+//! - 会话概况：`session_meta` 的 `id`、`cwd`、`timestamp`；第一句提问是 `response_item` 里第一条 `role: user` 的消息里
+//!   不是 Codex 自己插的那段（`<environment_context>` 这类 `<` 开头的、`# AGENTS.md` 开头的）。
+//!   子代理（`session_meta.thread_source == "subagent"`）不是会话。
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::scan::{Parsed, Parser, is_jsonl, walk};
-use super::{Limit, Request, Tokens, clean_model, parse_time};
+use super::{Limit, Request, SessionPatch, Tokens, clean_model, parse_time, prompt_text};
 use crate::agent::AgentKind;
 
 pub(super) fn files(home: &Path) -> Vec<PathBuf> {
@@ -35,6 +38,7 @@ pub(super) fn open(path: &Path, state: &str) -> Box<dyn Parser> {
         state: serde_json::from_str(state).unwrap_or_default(),
         requests: Vec::new(),
         limit: None,
+        session: SessionPatch::default(),
     })
 }
 
@@ -53,6 +57,12 @@ struct State {
     /// 上一条 `token_count` 的累计值。
     #[serde(default)]
     total: Option<Raw>,
+    /// 第一句提问已经读到了。
+    #[serde(default)]
+    prompted: bool,
+    /// 子代理的文件：不是会话。
+    #[serde(default)]
+    subagent: bool,
 }
 
 /// Codex 原样的用量。
@@ -106,6 +116,7 @@ struct Codex {
     state: State,
     requests: Vec<Request>,
     limit: Option<Limit>,
+    session: SessionPatch,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +207,28 @@ impl Codex {
     }
 }
 
+impl Codex {
+    fn prompt(&mut self, line: &str) {
+        let Ok(line) = serde_json::from_str::<Line>(line) else {
+            return;
+        };
+        let payload = &line.payload;
+        if line.kind != "response_item" || payload["type"] != "message" || payload["role"] != "user"
+        {
+            return;
+        }
+        let texts = payload["content"].as_array().into_iter().flatten();
+        let prompt = texts
+            .filter_map(|part| part["text"].as_str())
+            .filter(|text| !text.trim_start().starts_with("# AGENTS.md"))
+            .find_map(prompt_text);
+        if let Some(prompt) = prompt {
+            self.session.prompt = Some(prompt);
+            self.state.prompted = true;
+        }
+    }
+}
+
 impl Parser for Codex {
     fn line(&mut self, offset: u64, line: &str) {
         // 先按行头的类型筛掉消息、工具输出这些大行，只解析要用的几种。
@@ -204,6 +237,17 @@ impl Parser for Codex {
             end -= 1;
         }
         let head = &line[..end];
+        if !self.state.prompted && head.contains("\"response_item\"") {
+            // `payload` 里 `role` 前面还有个很长的 `id`，要多看一段。
+            let mut end = line.len().min(400);
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            if line[..end].contains("\"role\":\"user\"") {
+                self.prompt(line);
+            }
+            return;
+        }
         let wanted = [
             "session_meta",
             "turn_context",
@@ -227,6 +271,14 @@ impl Parser for Codex {
                 {
                     self.state.thread = id.to_string();
                     self.state.provider = payload["model_provider"].as_str().map(str::to_string);
+                    self.state.subagent = payload["thread_source"] == "subagent"
+                        || payload["source"].get("subagent").is_some();
+                    self.session.id = Some(id.to_string());
+                    self.session.cwd = payload["cwd"].as_str().map(str::to_string);
+                    self.session.started = payload["timestamp"]
+                        .as_str()
+                        .or(line.timestamp.as_deref())
+                        .and_then(parse_time);
                 }
             }
             "turn_context" => {
@@ -255,6 +307,7 @@ impl Parser for Codex {
             requests: self.requests,
             state: serde_json::to_string(&self.state).unwrap_or_default(),
             limit: self.limit.map(|limit| ("codex", limit)),
+            session: (!self.state.subagent).then_some(self.session),
         }
     }
 }

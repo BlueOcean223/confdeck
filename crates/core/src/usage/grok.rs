@@ -6,6 +6,9 @@
 //! 子代理会话（`summary.json` 的 `session_kind` 以 `subagent` 开头）的用量已经算进父会话那一轮，不读；
 //! fork 出来的会话复制了全部事件，键用 `prompt_id` 去重。
 //! confdeck 写的模型表叫 `confdeck-<模型 id>`：去掉前缀，供应商记成 `confdeck`，靠切换记录认是哪家。
+//!
+//! 会话概况在同一个目录的 `summary.json` 里：`info.id`、`info.cwd`、`session_summary`（Grok 起的标题）、`created_at`；
+//! 第一句提问是第一条 `user_message_chunk`（一句话可能拆成几块，只取第一块）。
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::scan::{Parsed, Parser, walk};
-use super::{Request, Tokens, clean_model};
+use super::{Request, SessionPatch, Tokens, clean_model, parse_time, prompt_text};
 use crate::agent::AgentKind;
 use crate::agent::grok::TABLE_PREFIX;
 
@@ -28,30 +31,48 @@ fn is_updates(path: &Path) -> bool {
     path.file_name().is_some_and(|name| name == "updates.jsonl")
 }
 
-pub(super) fn open(path: &Path, _: &str) -> Box<dyn Parser> {
-    Box::new(Grok {
-        skip: is_subagent(path),
-        requests: Vec::new(),
-    })
-}
-
-fn is_subagent(path: &Path) -> bool {
-    let Some(summary) = path.parent().map(|dir| dir.join("summary.json")) else {
-        return false;
-    };
-    let Ok(text) = std::fs::read_to_string(summary) else {
-        return false;
-    };
-    serde_json::from_str::<Value>(&text).is_ok_and(|summary| {
-        summary["session_kind"]
+pub(super) fn open(path: &Path, state: &str) -> Box<dyn Parser> {
+    let summary = path
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("summary.json")).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_default();
+    let skip = summary["session_kind"]
+        .as_str()
+        .is_some_and(|kind| kind.starts_with("subagent"));
+    let text = |value: &Value| {
+        value
             .as_str()
-            .is_some_and(|kind| kind.starts_with("subagent"))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    };
+    // 老版本没有 summary.json：会话 ID 是目录名。
+    let id = text(&summary["info"]["id"]).or_else(|| {
+        path.parent()?
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    });
+    Box::new(Grok {
+        skip,
+        requests: Vec::new(),
+        patch: SessionPatch {
+            id,
+            cwd: text(&summary["info"]["cwd"]),
+            title: text(&summary["session_summary"]),
+            started: summary["created_at"].as_str().and_then(parse_time),
+            ..SessionPatch::default()
+        },
+        prompted: state == "prompted",
     })
 }
 
 struct Grok {
     skip: bool,
     requests: Vec<Request>,
+    patch: SessionPatch,
+    /// 第一句提问已经读到了。
+    prompted: bool,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +115,16 @@ struct Usage {
 
 impl Parser for Grok {
     fn line(&mut self, _: u64, line: &str) {
+        if !self.skip && !self.prompted && line.contains("\"user_message_chunk\"") {
+            let prompt = serde_json::from_str::<Value>(line).ok().and_then(|value| {
+                prompt_text(value["params"]["update"]["content"]["text"].as_str()?)
+            });
+            if let Some(prompt) = prompt {
+                self.patch.prompt = Some(prompt);
+                self.prompted = true;
+            }
+            return;
+        }
         if self.skip || !line.contains("\"turn_completed\"") {
             return;
         }
@@ -157,6 +188,12 @@ impl Parser for Grok {
     fn finish(self: Box<Self>) -> Parsed {
         Parsed {
             requests: self.requests,
+            state: if self.prompted {
+                "prompted".into()
+            } else {
+                String::new()
+            },
+            session: (!self.skip).then_some(self.patch),
             ..Parsed::default()
         }
     }

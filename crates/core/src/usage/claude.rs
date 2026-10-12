@@ -3,26 +3,83 @@
 //! `type == "assistant"` 的行带 `message.usage`。同一次回复按内容块拆成几行，用量都一样，按（`message.id`，`requestId`）去重；
 //! resume 出来的新文件带着旧消息，也靠这个键去重。`input_tokens` 不含缓存。
 //! 模型取 `requestedModel`（Claude Code 请求时用的、也就是配置里写的那个），老版本没有它时取回复里的 `message.model`。
+//!
+//! 会话概况：会话 ID 是文件名，目录和开始时间取第一句提问那行的 `cwd`、`timestamp`；`custom-title` 行是 /rename 起的名字，
+//! `ai-title` 行是 Claude Code 自己起的标题（都会反复追加，取最新的）。子代理的文件不是会话。
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use serde_json::Value;
+
 use super::scan::{Parsed, Parser, is_jsonl, walk};
-use super::{Request, Tokens, clean_model, parse_time};
+use super::{Request, SessionPatch, Tokens, clean_model, parse_time, prompt_text};
 use crate::agent::AgentKind;
 
 pub(super) fn files(home: &Path) -> Vec<PathBuf> {
     walk(&home.join(".claude").join("projects"), 4, is_jsonl)
 }
 
-pub(super) fn open(_: &Path, _: &str) -> Box<dyn Parser> {
-    Box::new(Claude::default())
+pub(super) fn open(path: &Path, state: &str) -> Box<dyn Parser> {
+    let subagent = path
+        .components()
+        .any(|part| part.as_os_str() == "subagents");
+    Box::new(Claude {
+        requests: Vec::new(),
+        session: (!subagent).then(|| SessionPatch {
+            id: path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned()),
+            ..SessionPatch::default()
+        }),
+        // 状态只记一件事：第一句提问已经读到了，后面的提问不用再解析。
+        prompted: state == "prompted",
+    })
 }
 
-#[derive(Default)]
 struct Claude {
     requests: Vec<Request>,
+    session: Option<SessionPatch>,
+    prompted: bool,
+}
+
+impl Claude {
+    fn session(&mut self, line: &str) {
+        let Some(patch) = self.session.as_mut() else {
+            return;
+        };
+        let titled = line.contains("-title\"");
+        let asks = !self.prompted && line.contains("\"user\"");
+        if !titled && !asks {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        let text = |key: &str| value[key].as_str().map(|t| t.trim().to_string());
+        match value["type"].as_str() {
+            Some("custom-title") => patch.name = text("customTitle"),
+            Some("ai-title") => patch.title = text("aiTitle").filter(|t| !t.is_empty()),
+            Some("user") if asks && value["isMeta"] != true => {
+                let content = &value["message"]["content"];
+                let first = content.as_str().or_else(|| {
+                    content
+                        .as_array()?
+                        .iter()
+                        .find(|block| block["type"] == "text")?["text"]
+                        .as_str()
+                });
+                if let Some(prompt) = first.and_then(prompt_text) {
+                    patch.prompt = Some(prompt);
+                    patch.cwd = text("cwd");
+                    patch.started = value["timestamp"].as_str().and_then(parse_time);
+                    self.prompted = true;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -67,6 +124,7 @@ struct OutputDetails {
 
 impl Parser for Claude {
     fn line(&mut self, offset: u64, line: &str) {
+        self.session(line);
         if !line.contains("\"usage\"") || !line.contains("\"assistant\"") {
             return;
         }
@@ -124,6 +182,12 @@ impl Parser for Claude {
     fn finish(self: Box<Self>) -> Parsed {
         Parsed {
             requests: self.requests,
+            state: if self.prompted {
+                "prompted".into()
+            } else {
+                String::new()
+            },
+            session: self.session,
             ..Parsed::default()
         }
     }
