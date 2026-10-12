@@ -15,7 +15,8 @@
 //! - [`toggles`]：设一次就不动的开关（跳过首次确认、VS Code 插件跟着切换、署名），和供应商无关，按键补丁直接写。
 //! - [`net`]：confdeck 自己发出去的请求（测连通、拉模型列表、下 models.dev），出站代理在这里生效；
 //!   [`remote`]：对一家供应商测各个接口地址、拉模型列表；[`models_dev`]：按 models.dev 补模型的上下文、价格等。
-//! - [`usage`]：扫各 agent 的会话记录算用量，认是哪家供应商、按价格算花费；[`balance`]：查供应商账户里还有多少钱。
+//! - [`usage`]：扫各 agent 的会话记录算用量，认是哪家供应商、按价格算花费；[`balance`]：查供应商账户里还有多少钱；
+//!   [`quota`]：官方订阅和套餐的限额窗口用了多少。
 //! - [`backup`]、[`data`]、[`fsx`]：备份、数据目录、文件操作的基本件；[`diff`]：备份和现在的文件按行比。
 //!
 //! 按键补丁、写入引擎和各 agent 的关键字段清单移植自 ccs-lite（BlueOcean223/cc-switch，MIT 许可）
@@ -35,6 +36,7 @@ pub mod net;
 pub mod patch;
 pub mod preset;
 pub mod provider;
+pub mod quota;
 pub mod remote;
 pub mod store;
 pub mod toggles;
