@@ -1074,7 +1074,24 @@ pub fn preset_logo(preset_id: &str) -> Option<Logo> {
         "zhipu" | "zai" => Logo::Color("icons/brand/zhipu-color.svg"),
         "minimax" => Logo::Color("icons/brand/minimax-color.svg"),
         "qianwen" | "qwencloud" => Logo::Color("icons/brand/qwen-color.svg"),
+        "bailian" => Logo::Mono("icons/brand/bailian.svg"),
+        "volcengine" => Logo::Color("icons/brand/volcengine.png"),
+        "byteplus" => Logo::Color("icons/brand/byteplus.png"),
+        "siliconflow" => Logo::Color("icons/brand/siliconflow-color.svg"),
+        "ant" => Logo::Color("icons/brand/antling.png"),
+        "anthropic" => Logo::Mono("icons/brand/anthropic.svg"),
+        "openai" => Logo::Mono("icons/brand/openai.svg"),
+        "google" => Logo::Color("icons/brand/gemini-color.svg"),
+        "xai" => Logo::Mono("icons/brand/xai.svg"),
+        "mistral" => Logo::Color("icons/brand/mistral-color.svg"),
+        "meta" => Logo::Color("icons/brand/meta-color.svg"),
         "openrouter" => Logo::Mono("icons/brand/openrouter.svg"),
+        "vercel" => Logo::Mono("icons/brand/vercel.svg"),
+        "opencode" => Logo::Mono("icons/brand/opencode.svg"),
+        "huggingface" => Logo::Color("icons/brand/huggingface-color.svg"),
+        "nvidia" => Logo::Color("icons/brand/nvidia-color.svg"),
+        // 小米（cc-switch 那张是「Xiaomi MiMo」字标，20px 看不清）、Groq、Cerebras、Together、Fireworks、Baseten
+        // 还没有图标，用首字。
         _ => return None,
     })
 }

@@ -1,4 +1,4 @@
-//! 添加供应商的预设卡片表（提案 10 第三节）：分国内 / 海外站 / 中转 / 自己填，带搜索。
+//! 添加供应商的预设卡片表（提案 10 第三节）：分国内 / 海外 / 中转 / 推理平台 / 自己填，带搜索。
 //! 加过的打勾，再点是「再加一家」（同一家的另一个 Key）。选一张就交给编辑器，只要填 Key。
 
 use confdeck_core::preset::{self, Preset};
@@ -27,23 +27,51 @@ const DOMESTIC: &[&str] = &[
     "zhipu-coding",
     "minimax",
     "qianwen",
+    "bailian-token-plan",
     "volcengine",
     "volcengine-coding",
+    "xiaomi",
+    "xiaomi-token-plan",
+    "ant-ling",
     "siliconflow",
 ];
 const OVERSEAS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "google",
+    "xai",
+    "mistral",
+    "meta",
     "kimi-intl",
     "kimi-coding-intl",
     "zai",
     "zai-coding",
     "minimax-intl",
     "qwencloud",
+    "bailian-token-plan-intl",
     "byteplus-coding",
+    "xiaomi-token-plan-sgp",
+    "xiaomi-token-plan-ams",
     "siliconflow-intl",
 ];
-const RELAY: &[&str] = &["openrouter"];
+const RELAY: &[&str] = &[
+    "openrouter",
+    "vercel",
+    "huggingface",
+    "opencode-zen",
+    "opencode-go",
+];
+/// 托管开源模型的推理平台。
+const HOSTING: &[&str] = &[
+    "together",
+    "fireworks",
+    "groq",
+    "cerebras",
+    "baseten",
+    "nvidia",
+];
 
-pub const WIDTH: f32 = 600.;
+pub const WIDTH: f32 = 656.;
 
 pub struct AddProvider {
     store: Entity<Store>,
@@ -199,25 +227,26 @@ impl AddProvider {
         let cards: Vec<Stateful<Div>> = presets
             .into_iter()
             .map(|(preset, added)| {
-            let host = preset
-                .endpoints
-                .values()
-                .next()
-                .and_then(|url| confdeck_core::provider::host(url))
-                .unwrap_or_default()
-                .to_string();
-            let logo = data::preset_logo(&preset.id).unwrap_or_else(|| Logo::letter(&preset.name));
-            self.card(
-                ElementId::Name(format!("preset-{}", preset.id).into()),
-                logo,
-                preset.name.clone().into(),
-                host.into(),
-                added,
-                t,
-                window,
-                cx,
-            )
-            .on_click(cx.listener(move |_, _, _, cx| cx.emit(AddEvent::Chosen(Some(preset)))))
+                let host = preset
+                    .endpoints
+                    .values()
+                    .next()
+                    .and_then(|url| confdeck_core::provider::host(url))
+                    .unwrap_or_default()
+                    .to_string();
+                let logo =
+                    data::preset_logo(&preset.id).unwrap_or_else(|| Logo::letter(&preset.name));
+                self.card(
+                    ElementId::Name(format!("preset-{}", preset.id).into()),
+                    logo,
+                    preset.name.clone().into(),
+                    host.into(),
+                    added,
+                    t,
+                    window,
+                    cx,
+                )
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(AddEvent::Chosen(Some(preset)))))
             })
             .collect();
         Some(self.section(title, t).child(grid(cards)))
@@ -259,6 +288,7 @@ impl Render for AddProvider {
             (t!("add.domestic"), DOMESTIC),
             (t!("add.overseas"), OVERSEAS),
             (t!("add.relay"), RELAY),
+            (t!("add.hosting"), HOSTING),
         ];
         let mut body = div()
             .id("add-body")
@@ -298,7 +328,10 @@ impl Render for AddProvider {
                 cx,
             )
             .on_click(cx.listener(|_, _, _, cx| cx.emit(AddEvent::Chosen(None))));
-        body = body.child(self.section(t!("add.custom_group").into(), &t).child(grid(vec![custom])));
+        body = body.child(
+            self.section(t!("add.custom_group").into(), &t)
+                .child(grid(vec![custom])),
+        );
 
         div()
             .v_flex()
@@ -372,19 +405,19 @@ mod tests {
     // 不能 `use super::*`：gpui 也导出一个 `test` 属性宏，会把 `#[test]` 抢走。
     use confdeck_core::preset;
 
-    use super::{DOMESTIC, OVERSEAS, RELAY};
+    use super::{DOMESTIC, HOSTING, OVERSEAS, RELAY};
 
     /// 每个预设都要分到一组，不然卡片表里看不到它。
     #[test]
     fn every_preset_is_in_exactly_one_group() {
         for preset in preset::all() {
-            let groups = [DOMESTIC, OVERSEAS, RELAY]
+            let groups = [DOMESTIC, OVERSEAS, RELAY, HOSTING]
                 .iter()
                 .filter(|group| group.contains(&preset.id.as_str()))
                 .count();
             assert_eq!(groups, 1, "{} should be in exactly one group", preset.id);
         }
-        for id in DOMESTIC.iter().chain(OVERSEAS).chain(RELAY) {
+        for id in DOMESTIC.iter().chain(OVERSEAS).chain(RELAY).chain(HOSTING) {
             assert!(preset::get(id).is_some(), "{id} is not a preset");
         }
     }

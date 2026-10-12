@@ -535,10 +535,13 @@ add:
     zh-CN: 国内
   overseas:
     en: International
-    zh-CN: 海外站
+    zh-CN: 海外
   relay:
     en: Relays
     zh-CN: 中转
+  hosting:
+    en: Inference platforms
+    zh-CN: 推理平台
   custom_group:
     en: Your own
     zh-CN: 自己填

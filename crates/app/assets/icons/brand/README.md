@@ -21,3 +21,8 @@
 - `codex-color.svg`：删掉了第一条 `fill="#fff"` 的圆角方块路径。原件带白色底板，放在卡片上像套了一层白框。
 - `claudecode-color.svg`：原件只有一条 `evenodd` 路径，两只眼睛是镂空的，露出底色；补了一条 `#141413` 的路径把眼睛填黑
   （Clawd 的眼睛是黑的，用户 10-11 指出）。
+- 内置供应商的图标（10-12 补）：`openai.svg`、`xai.svg`、`vercel.svg`、`bailian.svg`、`gemini-color.svg`、`meta-color.svg`、
+  `mistral-color.svg`、`nvidia-color.svg`、`huggingface-color.svg`、`siliconflow-color.svg` 原样复制自 cc-switch 的
+  `src/icons/extracted/`（`gemini.svg` 等改了文件名，内容没动）；`antling.png`（cc-switch 的 `bailing.png`，蚂蚁百灵）、
+  `volcengine.png`（`huoshan.png`）、`byteplus.png` 是原图 PNG。cc-switch 的 `xiaomimimo.svg` 是「Xiaomi MiMo」字标，
+  缩到 20px 认不出，没用。

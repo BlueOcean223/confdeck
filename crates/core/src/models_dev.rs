@@ -442,6 +442,8 @@ mod tests {
         }},
         "anthropic": {"models": {
             "claude-fable-5-1": {"name": "Claude Fable 5.1", "limit": {"context": 1000000, "output": 128000},
+                "cost": {"input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75}},
+            "claude-sonnet-4-5": {"name": "Claude Sonnet 4.5", "limit": {"context": 1000000, "output": 64000},
                 "cost": {"input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75}}
         }},
         "broken": "not an object"
@@ -519,9 +521,9 @@ mod tests {
         let found = super::known(&relay, "deepseek-v4-pro", Some(&dev)).unwrap();
         assert_eq!(found.reasoning, ["low", "high", "max"]);
         assert_eq!(found.input, [Modality::Text, Modality::Image]);
-        // 官方三家没写 `api`，按内置地址认。
+        // 官方三家没写 `api`，按内置地址认（Anthropic 的地址也是预设，挑一个预设里没有的模型）。
         let anthropic = at(&[(Protocol::Anthropic, "https://api.anthropic.com")]);
-        let found = super::known(&anthropic, "claude-fable-5-1", Some(&dev)).unwrap();
+        let found = super::known(&anthropic, "claude-sonnet-4-5", Some(&dev)).unwrap();
         assert_eq!(found.cost.unwrap().cache_write, Some(3.75));
         assert_eq!(super::known(&relay, "no-such-model", Some(&dev)), None);
     }
