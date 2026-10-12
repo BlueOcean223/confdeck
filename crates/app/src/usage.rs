@@ -3,8 +3,9 @@
 //! - 打开用量页、点顶栏的刷新时扫一次；扫的时候再点不重复扫。第一次要读全部历史（本机 release 约 6 秒），之后几十毫秒。
 //! - 汇总一次算好四个时间段和热力图，切时间段不用等。算完把请求丢掉，只留汇总。
 //! - 价格用 models.dev 时只读磁盘上的缓存，不联网（供应商页拉列表、补全时会下）。
-//! - 余额（core 的 `balance`）：能查的每家一个后台任务，同时查；5 分钟内不重查，点刷新按钮才重查。
-//!   重查时先留着上次的数，查回来再换。
+//! - 余额（core 的 `balance`）和订阅额度（core 的 `quota`）：能查的每家一个后台任务，同时查；5 分钟内不重查，
+//!   点刷新按钮才重查。重查时先留着上次的数，查回来再换。Codex 官方的额度不联网，扫会话记录时一起读出来（`Loaded::codex`）。
+//! - Claude 官方的登录在钥匙串里：只在家目录是真的时读（debug 构建用 `CONFDECK_HOME` 指到别处时不读）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use confdeck_core::current::Current;
 use confdeck_core::fsx;
 use confdeck_core::models_dev::{self, ModelsDev};
 use confdeck_core::net::Http;
+use confdeck_core::quota::{self, Quota, QuotaError};
 use confdeck_core::usage::history::{self, Target};
 use confdeck_core::usage::summary::{self, Context as Pricing, Heatmap, Period, Source, Summary};
 use confdeck_core::usage::{Db, UsageError};
@@ -36,11 +38,27 @@ pub struct UsageState {
     pub balances: HashMap<String, Result<Balance, BalanceError>>,
     /// 正在查余额的供应商 ID。
     pub checking: Vec<String>,
-    balances_at: Option<Instant>,
+    /// Claude、Grok Build 官方和各家套餐的额度。还在查、没查过的没有。
+    pub quotas: HashMap<QuotaOf, Result<Quota, QuotaError>>,
+    pub quota_checking: Vec<QuotaOf>,
+    /// 上次查余额和额度的时候。
+    checked_at: Option<Instant>,
 }
 
-/// 余额多久以内不重查（点刷新按钮除外）。
-const BALANCE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+/// 谁的额度。
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum QuotaOf {
+    /// 官方订阅（Claude Code、Grok Build 的登录）。
+    Agent(AgentKind),
+    /// 套餐（供应商 ID）。
+    Provider(String),
+}
+
+/// 后台查一家额度。
+type QuotaJob = Box<dyn FnOnce(&Http) -> Result<Quota, QuotaError> + Send>;
+
+/// 余额和额度多久以内不重查（点刷新按钮除外）。
+const REMOTE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
 pub struct Loaded {
     /// 和 [`PERIODS`] 一一对应。
@@ -49,6 +67,8 @@ pub struct Loaded {
     pub heatmap: Heatmap,
     /// 供应商 ID → 名字：现在的，删了的从切换记录里找。
     pub names: HashMap<String, String>,
+    /// Codex 官方的额度：会话记录里最新的 `rate_limits`。没用过官方登录是 `None`。
+    pub codex: Option<Quota>,
 }
 
 impl Loaded {
@@ -59,9 +79,9 @@ impl Loaded {
 }
 
 impl Store {
-    /// 扫新加的会话记录、重算汇总，查余额。正在扫就不再扫；`force` 时余额不管上次是什么时候查的都重查。
+    /// 扫新加的会话记录、重算汇总，查余额和额度。正在扫就不再扫；`force` 时余额和额度不管上次是什么时候查的都重查。
     pub fn refresh_usage(&mut self, force: bool, cx: &mut Context<Self>) {
-        self.refresh_balances(force, cx);
+        self.refresh_remote(force, cx);
         if self.usage.scanning {
             return;
         }
@@ -80,6 +100,7 @@ impl Store {
             confdeck_core::usage::scan(&home, &mut db);
             let requests = db.requests(None)?;
             let switches = history::load(&data)?;
+            let codex = db.limit("codex")?;
             let pricing = Pricing {
                 providers: &providers,
                 history: &switches,
@@ -91,6 +112,7 @@ impl Store {
                 .map(|period| summary::summarize(&requests, &pricing, *period, &now))
                 .collect();
             let heatmap = summary::heatmap(&requests, &pricing, &now);
+            let codex = codex.map(|limit| quota::codex(&limit, now.timestamp_millis()));
             let names = summaries
                 .iter()
                 .flat_map(|summary| &summary.sources)
@@ -104,6 +126,7 @@ impl Store {
                     summaries,
                     heatmap,
                     names,
+                    codex,
                 },
                 dev,
             ))
@@ -129,15 +152,17 @@ impl Store {
         .detach();
     }
 
-    fn refresh_balances(&mut self, force: bool, cx: &mut Context<Self>) {
+    /// 联网查的那些：余额、Claude 和 Grok Build 官方的额度、套餐额度。
+    fn refresh_remote(&mut self, force: bool, cx: &mut Context<Self>) {
         let fresh = self
             .usage
-            .balances_at
-            .is_some_and(|at| at.elapsed() < BALANCE_MAX_AGE);
+            .checked_at
+            .is_some_and(|at| at.elapsed() < REMOTE_MAX_AGE);
         if fresh && !force {
             return;
         }
-        self.usage.balances_at = Some(Instant::now());
+        self.usage.checked_at = Some(Instant::now());
+        self.refresh_quotas(cx);
         let proxy = self.proxy();
         for provider in self.providers.iter().filter(|p| balance::supported(p)) {
             if self.usage.checking.contains(&provider.id) {
@@ -168,6 +193,68 @@ impl Store {
             .detach();
         }
         cx.notify();
+    }
+
+    fn refresh_quotas(&mut self, cx: &mut Context<Self>) {
+        let proxy = self.proxy();
+        let home = self.home.clone();
+        // 测试时家目录指到别处，钥匙串里却是本机用户的登录，不能读。
+        let keychain = std::env::home_dir().as_ref() == Some(&home);
+        let mut jobs: Vec<(QuotaOf, QuotaJob)> = Vec::new();
+        for agent in &self.agents {
+            if !agent.installed {
+                continue;
+            }
+            let home = home.clone();
+            match agent.kind {
+                AgentKind::ClaudeCode => jobs.push((
+                    QuotaOf::Agent(agent.kind),
+                    Box::new(move |http| quota::claude(http, &home, keychain)),
+                )),
+                AgentKind::GrokBuild => jobs.push((
+                    QuotaOf::Agent(agent.kind),
+                    Box::new(move |http| quota::grok(http, &home)),
+                )),
+                _ => {}
+            }
+        }
+        for provider in self.providers.iter().filter(|p| quota::plan_supported(p)) {
+            let provider = provider.clone();
+            jobs.push((
+                QuotaOf::Provider(provider.id.clone()),
+                Box::new(move |http| quota::plan(http, &provider)),
+            ));
+        }
+        for (of, job) in jobs {
+            if self.usage.quota_checking.contains(&of) {
+                continue;
+            }
+            self.usage.quota_checking.push(of.clone());
+            let proxy = proxy.clone();
+            let task = cx.background_executor().spawn(async move {
+                #[cfg(debug_assertions)]
+                if let Some(result) = fake_quota(&of) {
+                    return (of, result);
+                }
+                let result = Http::new(&proxy)
+                    .map_err(QuotaError::Net)
+                    .and_then(|http| job(&http));
+                (of, result)
+            });
+            cx.spawn(async move |this, cx| {
+                let (of, result) = task.await;
+                this.update(cx, |store, cx| {
+                    store
+                        .usage
+                        .quota_checking
+                        .retain(|checking| checking != &of);
+                    store.usage.quotas.insert(of, result);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 
     /// 单选 agent 现在连的是哪家，记进切换记录（和上一笔一样不记）。在别处改了配置，用量也能对上是哪家。
@@ -226,6 +313,50 @@ fn fake_balance(id: &str) -> Option<Result<Balance, BalanceError>> {
             } else {
                 Currency::Usd
             },
+        }),
+    })
+}
+
+/// 截图用的假额度（debug 构建）：`CONFDECK_QUOTAS` 指一个 JSON 文件，键是 agent 的 ID（`claude-code`、`grok-build`）或供应商 ID，
+/// `{"plan": "max", "windows": [{"span": "5h", "used": 23, "resets_in": 95}]}`（`span` 是 `5h`、`week`、`month`、
+/// 别的字写成「每周 · 那个模型」；`resets_in` 是分钟），`{"error": "expired" | "auth" | "none" | "net" | "login"}`。
+/// 文件里没有的照常查。
+#[cfg(debug_assertions)]
+fn fake_quota(of: &QuotaOf) -> Option<Result<Quota, QuotaError>> {
+    use confdeck_core::net::{NetError, Unreachable};
+    use confdeck_core::quota::{Span, Window};
+    let path = std::env::var_os("CONFDECK_QUOTAS")?;
+    let all: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let key = match of {
+        QuotaOf::Agent(agent) => agent.id(),
+        QuotaOf::Provider(id) => id.as_str(),
+    };
+    let fake = all.get(key)?;
+    std::thread::sleep(Duration::from_millis(300));
+    let now = chrono::Local::now().timestamp_millis();
+    Some(match fake["error"].as_str() {
+        Some("expired") => Err(QuotaError::Expired),
+        Some("auth") => Err(QuotaError::Auth),
+        Some("none") => Err(QuotaError::NoPlan),
+        Some("login") => Err(QuotaError::NotLoggedIn),
+        Some(_) => Err(QuotaError::Net(NetError::Unreachable(Unreachable::Dns))),
+        None => Ok(Quota {
+            plan: fake["plan"].as_str().map(str::to_string),
+            windows: fake["windows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|w| Window {
+                    span: match w["span"].as_str().unwrap_or_default() {
+                        "5h" => Span::FiveHours,
+                        "week" => Span::Week,
+                        "month" => Span::Month,
+                        model => Span::WeekOf(model.to_string()),
+                    },
+                    used: w["used"].as_f64().unwrap_or(0.),
+                    resets_at: w["resets_in"].as_i64().map(|m| now + m * 60_000),
+                })
+                .collect(),
         }),
     })
 }

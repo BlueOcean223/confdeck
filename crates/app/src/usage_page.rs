@@ -5,8 +5,10 @@
 use std::borrow::Cow;
 
 use chrono::{Datelike as _, Duration, Local, NaiveDate, TimeZone as _};
+use confdeck_core::agent::AgentKind;
 use confdeck_core::balance::{self, BalanceError, Currency};
 use confdeck_core::preset;
+use confdeck_core::quota::{self, Quota, QuotaError, Span};
 use confdeck_core::usage::Tokens;
 use confdeck_core::usage::summary::{
     HEATMAP_WEEKS, Heatmap, Period, Source, Step, Summary, Totals,
@@ -19,7 +21,7 @@ use rust_i18n::t;
 use crate::data::{self, Logo, Store};
 use crate::theme::Theme;
 use crate::ui;
-use crate::usage::{self, Loaded, PERIODS};
+use crate::usage::{self, Loaded, PERIODS, QuotaOf};
 
 /// 柱状图的高度。
 const CHART_HEIGHT: f32 = 72.;
@@ -290,7 +292,10 @@ impl Render for UsagePage {
                     .child(t!("usage.load_error", error = error)),
             );
         }
-        page = page.children(balances(&t, self.store.read(cx), window, cx));
+        let store = self.store.read(cx);
+        page = page
+            .children(quotas(&t, store, loaded.as_deref(), window, cx))
+            .children(balances(&t, store, window, cx));
         let (Some(loaded), Some(summary)) = (loaded.as_ref(), summary) else {
             return page.child(skeleton(&t));
         };
@@ -379,31 +384,13 @@ fn balances(t: &Theme, store: &Store, window: &Window, cx: &App) -> Option<Div> 
                     )
                 }
             };
-            div()
-                .flex_1()
-                .min_w_0()
-                .v_flex()
-                .gap(px(12.))
-                .pt(px(12.))
-                .pb(px(11.))
-                .px(px(14.))
-                .bg(t.card)
-                .border_1()
-                .border_color(t.line)
-                .rounded(px(12.))
-                .child(
-                    div()
-                        .h_flex()
-                        .gap(px(8.))
-                        .child(ui::logo(data::logo(provider), 18., t, window, cx))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(provider.name.clone()),
-                        ),
-                )
+            account_card(t)
+                .child(card_head(
+                    t,
+                    ui::logo(data::logo(provider), 18., t, window, cx),
+                    provider.name.clone(),
+                    None,
+                ))
                 .child(
                     div()
                         .h_flex()
@@ -419,6 +406,55 @@ fn balances(t: &Theme, store: &Store, window: &Window, cx: &App) -> Option<Div> 
                 )
         })
         .collect();
+    card_grid(cards, 3)
+}
+
+/// 余额、额度卡片的外框。
+fn account_card(t: &Theme) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .v_flex()
+        .gap(px(12.))
+        .pt(px(12.))
+        .pb(px(11.))
+        .px(px(14.))
+        .bg(t.card)
+        .border_1()
+        .border_color(t.line)
+        .rounded(px(12.))
+}
+
+/// 卡片顶上一行：图标、名字，右边是套餐名。
+fn card_head(
+    t: &Theme,
+    logo: AnyElement,
+    name: impl Into<SharedString>,
+    plan: Option<&str>,
+) -> Div {
+    div()
+        .h_flex()
+        .gap(px(8.))
+        .child(logo)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .child(name.into()),
+        )
+        .children(plan.map(|plan| {
+            let mut plan = plan.to_string();
+            if let Some(first) = plan.get(..1) {
+                plan = first.to_uppercase() + &plan[1..];
+            }
+            div().text_size(px(11.5)).text_color(t.muted).child(plan)
+        }))
+}
+
+/// 卡片 `per_row` 张一排。
+fn card_grid(cards: Vec<Div>, per_row: usize) -> Option<Div> {
     if cards.is_empty() {
         return None;
     }
@@ -426,10 +462,10 @@ fn balances(t: &Theme, store: &Store, window: &Window, cx: &App) -> Option<Div> 
     let mut cards = cards.into_iter().peekable();
     while cards.peek().is_some() {
         let mut row = div().flex().flex_row().gap(px(8.));
-        for slot in 0..3 {
+        for slot in 0..per_row {
             row = match cards.next() {
                 Some(card) => row.child(card),
-                // 不满三张的那排补空位，卡片宽度和上一排一样。空位也要有卡片的内边距和边框：
+                // 不满的那排补空位，卡片宽度和上一排一样。空位也要有卡片的内边距和边框：
                 // `flex_1` 从 0 起分剩下的宽度，内边距和边框算在起点里，没有的话空位会窄一截。
                 None if slot > 0 => row.child(
                     div()
@@ -444,6 +480,226 @@ fn balances(t: &Theme, store: &Store, window: &Window, cx: &App) -> Option<Div> 
         rows = rows.child(row);
     }
     Some(rows)
+}
+
+/// 额度卡：Claude、Codex、Grok Build 官方（装了的；没有官方登录的不画），再是能查套餐额度的供应商。
+/// 照 magpie 的 `.subscription-card`：每个窗口一格，格里是窗口名和用了多少、进度条、多久后重置。
+/// 卡片两张一排、窗口三格一排（最多三个窗口），同一排的卡片一样高，出错的卡不会空出一大块。
+fn quotas(
+    t: &Theme,
+    store: &Store,
+    loaded: Option<&Loaded>,
+    window: &Window,
+    cx: &App,
+) -> Option<Div> {
+    let mut cards = Vec::new();
+    for agent in store.agents.iter().filter(|a| a.installed) {
+        let state = match agent.kind {
+            AgentKind::Codex => match loaded.and_then(|l| l.codex.as_ref()) {
+                Some(found) => Some(Ok(found)),
+                None => continue,
+            },
+            AgentKind::ClaudeCode | AgentKind::GrokBuild => {
+                match store.usage.quotas.get(&QuotaOf::Agent(agent.kind)) {
+                    Some(Err(QuotaError::NotLoggedIn)) => continue,
+                    Some(result) => Some(result.as_ref()),
+                    None => None,
+                }
+            }
+            _ => continue,
+        };
+        let logo = ui::logo(agent.logo, 18., t, window, cx);
+        cards.push(quota_card(t, agent.kind.id(), logo, agent.name, state));
+    }
+    for provider in store.providers.iter().filter(|p| quota::plan_supported(p)) {
+        let state = store
+            .usage
+            .quotas
+            .get(&QuotaOf::Provider(provider.id.clone()))
+            .map(Result::as_ref);
+        let logo = ui::logo(data::logo(provider), 18., t, window, cx);
+        cards.push(quota_card(
+            t,
+            &provider.id,
+            logo,
+            provider.name.clone(),
+            state,
+        ));
+    }
+    card_grid(cards, 2)
+}
+
+fn quota_card(
+    t: &Theme,
+    id: &str,
+    logo: AnyElement,
+    name: impl Into<SharedString>,
+    state: Option<Result<&Quota, &QuotaError>>,
+) -> Div {
+    let plan = match state {
+        Some(Ok(found)) => found.plan.as_deref(),
+        _ => None,
+    };
+    let card = account_card(t).child(card_head(t, logo, name, plan));
+    let status = |text: SharedString, color: Hsla| {
+        div()
+            .h(px(20.))
+            .text_size(px(12.5))
+            .text_color(color)
+            .child(text)
+    };
+    match state {
+        // 还在查：两格灰条。
+        None => card.child(window_cells(
+            (0..2)
+                .map(|_| {
+                    div()
+                        .v_flex()
+                        .gap(px(6.))
+                        .child(div().w(px(72.)).h(px(12.)).rounded(px(3.)).bg(t.pill))
+                        .child(div().h(px(4.)).rounded(px(2.)).bg(t.pill))
+                })
+                .collect(),
+        )),
+        Some(Ok(found)) => {
+            let now = Local::now().timestamp_millis();
+            let cells = found
+                .windows
+                .iter()
+                .enumerate()
+                .map(|(i, w)| quota_window(t, &format!("{id}-{i}"), w, now))
+                .collect();
+            card.child(window_cells(cells))
+        }
+        Some(Err(QuotaError::Expired)) => {
+            card.child(status(t!("usage.quota_expired").into(), t.danger))
+        }
+        Some(Err(QuotaError::Auth)) => {
+            card.child(status(t!("usage.balance_auth").into(), t.danger))
+        }
+        Some(Err(QuotaError::NoPlan)) => card.child(status(t!("usage.quota_none").into(), t.muted)),
+        Some(Err(err)) => {
+            let why: SharedString = match err {
+                QuotaError::Net(err) => crate::net::describe(err),
+                _ => t!("usage.balance_unknown").into(),
+            };
+            card.child(
+                div()
+                    .id(ElementId::Name(format!("quota-error-{id}").into()))
+                    .h(px(20.))
+                    .text_size(px(15.))
+                    .text_color(t.faint)
+                    .tooltip(ui::tooltip(why))
+                    .child("—"),
+            )
+        }
+    }
+}
+
+/// 窗口三格一排，不满的补空位：各张卡的格子一样宽。
+fn window_cells(cells: Vec<Div>) -> Div {
+    let mut rows = div().v_flex().gap(px(10.));
+    let mut cells = cells.into_iter().peekable();
+    while cells.peek().is_some() {
+        let mut row = div().flex().flex_row().gap(px(16.));
+        for _ in 0..3 {
+            row = row.child(match cells.next() {
+                Some(cell) => cell.flex_1().min_w_0(),
+                None => div().flex_1(),
+            });
+        }
+        rows = rows.child(row);
+    }
+    rows
+}
+
+/// 一个窗口：名字和用了百分之几、进度条、多久后重置（悬停说几点）。
+fn quota_window(t: &Theme, id: &str, w: &quota::Window, now: i64) -> Div {
+    let used = w.used.max(0.);
+    let full = used >= 100.;
+    let reset = w.resets_at.filter(|at| *at > now);
+    let cell = div()
+        .id(ElementId::Name(format!("quota-{id}").into()))
+        .v_flex()
+        .child(
+            div()
+                .h_flex()
+                .items_baseline()
+                .gap(px(6.))
+                .mb(px(5.))
+                .text_size(px(11.5))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(t.muted)
+                        .child(span_label(&w.span)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if full { t.danger } else { t.fg })
+                        .child(format!("{used:.0}%")),
+                ),
+        )
+        .child(
+            div().h(px(4.)).rounded(px(2.)).bg(t.pill).child(
+                div()
+                    .h_full()
+                    .w(relative((used / 100.).min(1.) as f32))
+                    .rounded(px(2.))
+                    .bg(if full { t.danger } else { t.accent }),
+            ),
+        )
+        .child(
+            div()
+                .h(px(14.))
+                .mt(px(4.))
+                .text_size(px(10.5))
+                .text_color(t.faint)
+                .children(reset.map(|at| until_text(at - now))),
+        );
+    // 格子里只写百分比（「每周 · Opus」和「已用 12%」并排放不下），悬停说全。
+    let mut tip = t!("usage.quota_used", percent = format!("{used:.0}")).to_string();
+    if let Some(at) = reset.and_then(|at| Local.timestamp_millis_opt(at).earliest()) {
+        let when = if rust_i18n::locale().starts_with("zh") {
+            at.format("%-m月%-d日 %H:%M").to_string()
+        } else {
+            at.format("%b %-d, %H:%M").to_string()
+        };
+        tip.push_str(" · ");
+        tip.push_str(&t!("usage.quota_resets_at", when = when));
+    }
+    div().child(cell.tooltip(ui::tooltip(tip)))
+}
+
+fn span_label(span: &Span) -> String {
+    match span {
+        Span::FiveHours => t!("usage.span_5h").to_string(),
+        Span::Week => t!("usage.span_week").to_string(),
+        Span::Month => t!("usage.span_month").to_string(),
+        Span::WeekOf(model) => format!("{} · {model}", t!("usage.span_week")),
+        Span::Minutes(minutes) if minutes % 1440 == 0 => {
+            t!("usage.span_days", count = minutes / 1440).to_string()
+        }
+        Span::Minutes(minutes) => t!("usage.span_hours", count = minutes.div_ceil(60)).to_string(),
+        Span::Period => t!("usage.span_period").to_string(),
+    }
+}
+
+/// 「3 小时后重置」：一小时内按分钟，两天内按小时，再长按天。
+fn until_text(millis: i64) -> String {
+    let minutes = (millis / 60_000).max(1);
+    let (count, key) = if minutes < 60 {
+        (minutes, "usage.resets_minutes")
+    } else if minutes < 48 * 60 {
+        (minutes / 60, "usage.resets_hours")
+    } else {
+        (minutes / 1440, "usage.resets_days")
+    };
+    t!(key, count = count).to_string()
 }
 
 fn money_text(t: &Theme, amount: f64, currency: Currency) -> Div {

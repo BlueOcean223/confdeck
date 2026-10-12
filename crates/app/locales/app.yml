@@ -930,6 +930,45 @@ usage:
   bar_empty:
     en: "%{when} · nothing"
     zh-CN: "%{when} · 没有调用"
+  quota_expired:
+    en: Login expired
+    zh-CN: 登录过期
+  quota_none:
+    en: No plan
+    zh-CN: 没有套餐
+  quota_used:
+    en: "%{percent}% used"
+    zh-CN: "已用 %{percent}%"
+  quota_resets_at:
+    en: "resets %{when}"
+    zh-CN: "%{when} 重置"
+  span_5h:
+    en: 5 hours
+    zh-CN: 5 小时
+  span_week:
+    en: Weekly
+    zh-CN: 每周
+  span_month:
+    en: Monthly
+    zh-CN: 每月
+  span_days:
+    en: "%{count} days"
+    zh-CN: "%{count} 天"
+  span_hours:
+    en: "%{count} hours"
+    zh-CN: "%{count} 小时"
+  span_period:
+    en: Credits
+    zh-CN: 额度
+  resets_minutes:
+    en: "resets in %{count}m"
+    zh-CN: "%{count} 分钟后重置"
+  resets_hours:
+    en: "resets in %{count}h"
+    zh-CN: "%{count} 小时后重置"
+  resets_days:
+    en: "resets in %{count}d"
+    zh-CN: "%{count} 天后重置"
   bars:
     en: Bars
     zh-CN: 柱状图
