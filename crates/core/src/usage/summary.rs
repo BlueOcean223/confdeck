@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, NaiveDate, TimeZone};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone};
 
 use super::history::{self, Switch, Target};
 use super::{Request, Tokens};
@@ -27,10 +27,10 @@ use crate::provider::{Cost, Provider};
 pub enum Source {
     /// confdeck 的一家供应商（ID；可能已经删了）。
     Provider(String),
-    /// agent 自带的登录。
-    Official,
+    /// agent 自带的登录（Claude Code 是 Anthropic，Codex 是 OpenAI，Grok Build 是 xAI）。
+    Official(AgentKind),
     /// 记录里写着、但不是 confdeck 写的配置（Pi、OpenCode 自己配的供应商，Codex 别的 `model_provider`）。
-    Other(String),
+    Other(AgentKind, String),
     Unknown,
 }
 
@@ -62,19 +62,19 @@ impl Context<'_> {
             AgentKind::Pi | AgentKind::Opencode => match hint {
                 Some(name) => match name.strip_prefix(TABLE_PREFIX) {
                     Some(id) => Source::Provider(id.to_string()),
-                    None => Source::Other(name.to_string()),
+                    None => Source::Other(request.agent, name.to_string()),
                 },
                 None => self.by_model(request, false),
             },
             AgentKind::Codex => match hint {
-                Some("openai") => Source::Official,
+                Some("openai") => Source::Official(request.agent),
                 Some("custom") | None => self.by_history(request, hint.is_none()),
-                Some(name) => Source::Other(name.to_string()),
+                Some(name) => Source::Other(request.agent, name.to_string()),
             },
             AgentKind::ClaudeCode => self.by_history(request, true),
             AgentKind::GrokBuild => match hint {
                 Some(_) => self.by_history(request, false),
-                None => Source::Official,
+                None => Source::Official(request.agent),
             },
         }
     }
@@ -82,14 +82,14 @@ impl Context<'_> {
     fn by_history(&self, request: &Request, official: bool) -> Source {
         match history::at(self.history, request.agent, request.at) {
             Some(Target::Provider { id, .. }) => Source::Provider(id.clone()),
-            Some(Target::Official) if official => Source::Official,
+            Some(Target::Official) if official => Source::Official(request.agent),
             _ => self.by_model(request, official),
         }
     }
 
     fn by_model(&self, request: &Request, official: bool) -> Source {
         if official && is_official_model(request.agent, &request.model) {
-            return Source::Official;
+            return Source::Official(request.agent);
         }
         let mut found = self.providers.iter().filter(|provider| {
             provider
@@ -118,7 +118,7 @@ impl Context<'_> {
                 }
             }
             // 认不出是哪家的，也先按官方标价估。
-            Source::Official | Source::Unknown => {
+            Source::Official(_) | Source::Unknown => {
                 let id = match agent {
                     AgentKind::ClaudeCode => "anthropic",
                     AgentKind::Codex => "openai",
@@ -128,11 +128,21 @@ impl Context<'_> {
                 price.known = official(id, model, self.dev);
             }
             // Pi 自带的供应商用的是常见的 ID（`anthropic`、`deepseek`），预设里有就按预设的价格。
-            Source::Other(name) => price.known = official(name, model, self.dev),
+            Source::Other(_, name) => price.known = official(name, model, self.dev),
         }
         price
     }
+
+    /// 一次请求的花费（美元），没有价格是 `None`。同一来源同一模型的价格查一次记在 `prices` 里。
+    fn cost(&self, prices: &mut Prices, source: &Source, request: &Request) -> Option<f64> {
+        prices
+            .entry((source.clone(), request.agent, request.model.clone()))
+            .or_insert_with(|| self.price(source, request.agent, &request.model))
+            .of(request)
+    }
 }
+
+type Prices = HashMap<(Source, AgentKind, String), Price>;
 
 fn official(preset_id: &str, model: &str, dev: Option<&ModelsDev>) -> Option<Cost> {
     let preset = preset::get(preset_id)?;
@@ -237,6 +247,18 @@ fn start_of<Tz: TimeZone>(zone: &Tz, day: NaiveDate) -> i64 {
     )
 }
 
+/// 柱状图一根柱子多长时间。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Hour,
+    #[default]
+    Day,
+    Week,
+}
+
+/// 「全部」超过这么多天就按周画。
+const MAX_DAY_BARS: i64 = 92;
+
 /// 一根柱子。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bucket {
@@ -249,9 +271,10 @@ pub struct Bucket {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Summary {
     pub total: Totals,
-    /// 柱状图：今天是 24 个小时，其余按天（`All` 从第一条请求那天起）。
+    /// 柱状图：今天是 24 个小时，其余按天；`All` 从第一条请求那天起，超过三个月按周。
     pub buckets: Vec<Bucket>,
-    /// 下面三组按 token 总量从多到少。
+    pub step: Step,
+    /// 下面三组按输入加输出（不算缓存）从多到少。
     pub sources: Vec<(Source, Totals)>,
     pub agents: Vec<(AgentKind, Totals)>,
     pub models: Vec<(String, Totals)>,
@@ -266,20 +289,19 @@ pub fn summarize<Tz: TimeZone>(
 ) -> Summary {
     let since = period.since(now).unwrap_or(i64::MIN);
     let requests: Vec<&Request> = requests.iter().filter(|r| r.at >= since).collect();
+    let (step, buckets) = buckets(&requests, period, now);
     let mut summary = Summary {
-        buckets: buckets(&requests, period, now),
+        buckets,
+        step,
         ..Summary::default()
     };
-    let mut prices: HashMap<(Source, AgentKind, String), Price> = HashMap::new();
+    let mut prices = Prices::new();
     let mut sources: HashMap<Source, Totals> = HashMap::new();
     let mut agents: HashMap<AgentKind, Totals> = HashMap::new();
     let mut models: HashMap<String, Totals> = HashMap::new();
     for request in requests {
         let source = context.source(request);
-        let price = prices
-            .entry((source.clone(), request.agent, request.model.clone()))
-            .or_insert_with(|| context.price(&source, request.agent, &request.model));
-        let cost = price.of(request);
+        let cost = context.cost(&mut prices, &source, request);
         let tokens = &request.tokens;
         summary.total.add(tokens, cost);
         let index = summary
@@ -302,13 +324,61 @@ pub fn summarize<Tz: TimeZone>(
     summary
 }
 
+/// 热力图有多少周。
+pub const HEATMAP_WEEKS: i64 = 53;
+
+/// 热力图：最近 [`HEATMAP_WEEKS`] 周每天的合计。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Heatmap {
+    /// 第一天：52 周前那一周的周一。
+    pub first: NaiveDate,
+    /// 从 `first` 到今天，一天一个。
+    pub days: Vec<Totals>,
+}
+
+/// 按天汇总最近 [`HEATMAP_WEEKS`] 周的请求。`now` 定「今天」和时区。
+pub fn heatmap<Tz: TimeZone>(
+    requests: &[Request],
+    context: &Context,
+    now: &DateTime<Tz>,
+) -> Heatmap {
+    let zone = now.timezone();
+    let today = now.date_naive();
+    let back = i64::from(today.weekday().num_days_from_monday()) + 7 * (HEATMAP_WEEKS - 1);
+    let first = today - Duration::days(back);
+    let starts: Vec<i64> = first
+        .iter_days()
+        .take_while(|day| *day <= today)
+        .map(|day| start_of(&zone, day))
+        .collect();
+    let mut days = vec![Totals::default(); starts.len()];
+    let mut prices = Prices::new();
+    for request in requests.iter().filter(|r| r.at >= starts[0]) {
+        let index = starts.partition_point(|start| *start <= request.at) - 1;
+        let source = context.source(request);
+        let cost = context.cost(&mut prices, &source, request);
+        days[index].add(&request.tokens, cost);
+    }
+    Heatmap { first, days }
+}
+
 fn ranked<K: Ord>(groups: HashMap<K, Totals>) -> Vec<(K, Totals)> {
     let mut groups: Vec<_> = groups.into_iter().collect();
-    groups.sort_by(|(a, x), (b, y)| y.tokens.total().cmp(&x.tokens.total()).then(a.cmp(b)));
+    groups.sort_by(|(a, x), (b, y)| {
+        y.tokens
+            .in_out()
+            .cmp(&x.tokens.in_out())
+            .then(y.tokens.total().cmp(&x.tokens.total()))
+            .then(a.cmp(b))
+    });
     groups
 }
 
-fn buckets<Tz: TimeZone>(requests: &[&Request], period: Period, now: &DateTime<Tz>) -> Vec<Bucket> {
+fn buckets<Tz: TimeZone>(
+    requests: &[&Request],
+    period: Period,
+    now: &DateTime<Tz>,
+) -> (Step, Vec<Bucket>) {
     let zone = now.timezone();
     let today = now.date_naive();
     let bucket = |start| Bucket {
@@ -317,9 +387,8 @@ fn buckets<Tz: TimeZone>(requests: &[&Request], period: Period, now: &DateTime<T
     };
     if period == Period::Today {
         let midnight = start_of(&zone, today);
-        return (0..24)
-            .map(|hour| bucket(midnight + hour * 3_600_000))
-            .collect();
+        let hours = (0..24).map(|hour| bucket(midnight + hour * 3_600_000));
+        return (Step::Hour, hours.collect());
     }
     let first = match period.since(now) {
         Some(since) => zone.timestamp_millis_opt(since).earliest(),
@@ -329,18 +398,24 @@ fn buckets<Tz: TimeZone>(requests: &[&Request], period: Period, now: &DateTime<T
     }
     .map_or(today, |time| time.date_naive())
     .min(today);
-    first
+    let (step, days) = if (today - first).num_days() >= MAX_DAY_BARS {
+        (Step::Week, 7)
+    } else {
+        (Step::Day, 1)
+    };
+    let starts = first
         .iter_days()
+        .step_by(days)
         .take_while(|day| *day <= today)
-        .map(|day| bucket(start_of(&zone, day)))
-        .collect()
+        .map(|day| bucket(start_of(&zone, day)));
+    (step, starts.collect())
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{FixedOffset, TimeZone};
 
-    use super::{Context, Period, Source, summarize};
+    use super::{Context, Period, Source, Step, heatmap, summarize};
     use crate::agent::AgentKind;
     use crate::provider::{Cost, Model, Provider};
     use crate::usage::history::{Switch, Target};
@@ -410,11 +485,11 @@ mod tests {
         );
         assert_eq!(
             source(request(AgentKind::Pi, 0, "x", Some("anthropic"))),
-            Source::Other("anthropic".into())
+            Source::Other(AgentKind::Pi, "anthropic".into())
         );
         assert_eq!(
             source(request(AgentKind::Codex, 0, "glm-5", Some("openai"))),
-            Source::Official
+            Source::Official(AgentKind::Codex)
         );
         // 切换记录。
         assert_eq!(
@@ -424,7 +499,7 @@ mod tests {
         // 切换记录之前：按模型认。
         assert_eq!(
             source(request(AgentKind::ClaudeCode, 50, "claude-opus-5-5", None)),
-            Source::Official
+            Source::Official(AgentKind::ClaudeCode)
         );
         assert_eq!(
             source(request(AgentKind::ClaudeCode, 50, "GLM-5", None)),
@@ -436,7 +511,7 @@ mod tests {
         );
         assert_eq!(
             source(request(AgentKind::GrokBuild, 50, "grok-4.6", None)),
-            Source::Official
+            Source::Official(AgentKind::GrokBuild)
         );
         assert_eq!(context.provider_name("ds").as_deref(), Some("DS"));
     }
@@ -487,6 +562,32 @@ mod tests {
 
         let all = summarize(&requests, &context, Period::All, &now);
         assert_eq!(all.buckets.len(), 2);
+        assert_eq!(all.step, Step::Day);
         assert_eq!(all.total.requests, 4);
+
+        // 半年前的一条：按周画，最后一根含今天。
+        let mut old = requests.to_vec();
+        old.insert(
+            0,
+            request(AgentKind::Codex, today - 180 * 24 * hour, "gpt-6", None),
+        );
+        let all = summarize(&old, &context, Period::All, &now);
+        assert_eq!(all.step, Step::Week);
+        assert_eq!(all.buckets.len(), 26);
+        assert_eq!(all.buckets[0].totals.requests, 1);
+        assert_eq!(all.buckets[25].totals.requests, 4);
+
+        // 热力图：今天（周一）是第 53 周的第一天，一年多以前的不算。
+        old.insert(
+            0,
+            request(AgentKind::Codex, today - 400 * 24 * hour, "gpt-6", None),
+        );
+        let map = heatmap(&old, &context, &now);
+        assert_eq!(map.first, now.date_naive() - chrono::Duration::days(52 * 7));
+        assert_eq!(map.days.len(), 52 * 7 + 1);
+        assert_eq!(map.days[364].requests, 3);
+        assert_eq!(map.days[364].cost, 2.5);
+        assert_eq!(map.days[363].requests, 1);
+        assert_eq!(map.days.iter().map(|d| d.requests).sum::<u64>(), 5);
     }
 }

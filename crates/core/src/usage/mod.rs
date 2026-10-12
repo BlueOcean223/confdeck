@@ -62,6 +62,11 @@ impl Tokens {
         self.reasoning += other.reasoning;
     }
 
+    /// 不算缓存的输入加输出：用量页的「Token」。
+    pub fn in_out(&self) -> u64 {
+        self.input + self.output
+    }
+
     /// 全部输入（含缓存）加输出。
     pub fn total(&self) -> u64 {
         self.input + self.cache_read + self.cache_write + self.output
