@@ -165,6 +165,16 @@ pub fn setup(
     )?)
 }
 
+/// 和 [`setup`] 一样，只是读给定的内容（「配置 ›」页编辑框里还没保存的），不读磁盘。
+pub fn setup_of(
+    home: &Path,
+    agent: AgentKind,
+    bytes: &[u8],
+) -> Result<Option<FileSetup>, ApplyError> {
+    let source = source(home, agent)?;
+    Ok((source.setup)(&source.file.path, Some(bytes))?)
+}
+
 /// 单选 agent 的配置文件，和读它、往里写某一家的办法。
 struct Source {
     file: LiveFile,

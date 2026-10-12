@@ -348,18 +348,31 @@ impl Store {
             .flatten()
     }
 
-    /// 单选 agent 的配置文件里现在写的模型（「配置 ›」页的下拉框显示文件里的值）。
-    /// 读不了、连的不是一个地址、多选 agent 都是 `None`。
-    pub fn setup(&self, agent: usize) -> Option<FileSetup> {
+    /// 单选 agent 的配置文件连的就是选中的那家。刚选了别家、文件还没写完时不是，
+    /// 这时文件里还是上一家的模型，「配置 ›」页不拿来显示。
+    pub fn settled(&self, agent: usize) -> bool {
         let kind = self.agents[agent].kind;
-        // 刚选了别家、文件还没写完时，文件里还是上一家的模型，不拿来显示。
-        let on_disk = current::current(&self.engine, &self.home, kind, &self.providers).ok()?;
-        if Some(&on_disk) != self.agents[agent].current.as_ref() {
-            return None;
-        }
-        current::setup(&self.engine, &self.home, kind)
-            .ok()
-            .flatten()
+        current::current(&self.engine, &self.home, kind, &self.providers)
+            .is_ok_and(|on_disk| Some(&on_disk) == self.agents[agent].current.as_ref())
+    }
+
+    /// 「配置 ›」页编辑框里的内容写的模型（下拉框显示的就是它）。解析不了（手改到一半）是 `Err`；
+    /// 连的不是一个地址、多选 agent 是 `Ok(None)`。
+    pub fn setup_of(&self, agent: usize, text: &str) -> Result<Option<FileSetup>, ApplyError> {
+        current::setup_of(&self.home, self.agents[agent].kind, text.as_bytes())
+    }
+
+    /// 「配置 ›」页还没保存的改动：一家从 `before` 改成 `after`，编辑框里的 `text` 会变成什么样（core 的 `apply::preview`）。
+    pub fn preview(
+        &self,
+        agent: usize,
+        before: &Provider,
+        after: &Provider,
+        text: &str,
+    ) -> Result<String, ApplyError> {
+        let kind = self.agents[agent].kind;
+        let bytes = apply::preview(&self.home, kind, before, after, text.as_bytes())?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// 这个 agent 的配置文件（Codex 有两个，「原始文件」只编辑 config.toml）。
@@ -372,21 +385,26 @@ impl Store {
         self.engine.read(file)
     }
 
-    /// 「原始文件」保存：整份替换，打开后文件被改过就报冲突、解析不了报行列（core 的 `Engine::replace`），
-    /// 都不写。写了就重读一遍、说一声「已保存 settings.json」。
+    /// 「原始文件」保存：整份替换，读出来以后文件被改过就报冲突、解析不了报行列（core 的 `Engine::replace`），
+    /// 都不写。写了就重读一遍；`announce` 时说一声「已保存 settings.json」（同一次保存已经说过「已更新」就不说）。
     pub fn replace_file(
         &mut self,
         file: &LiveFile,
         bytes: &[u8],
         base: &Snapshot,
+        announce: bool,
         cx: &mut Context<Self>,
     ) -> Result<Outcome, EngineError> {
         let outcome = self.engine.replace(file, bytes, base)?;
         self.reload();
-        self.announce(
-            &[Notice::ok(t!("write.file_saved", file = file_name(file)))],
-            cx,
-        );
+        if announce {
+            self.announce(
+                &[Notice::ok(t!("write.file_saved", file = file_name(file)))],
+                cx,
+            );
+        } else {
+            cx.notify();
+        }
         Ok(outcome)
     }
 

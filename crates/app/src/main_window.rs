@@ -10,7 +10,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::add_provider::{AddEvent, AddProvider};
-use crate::config_page::{ConfigEvent, ConfigPage};
+use crate::config_page::{self, ConfigEvent, ConfigPage};
 use crate::data::{self, Notice, NoticeKind, Store};
 use crate::editor::{Editor, EditorEvent};
 use crate::net;
@@ -254,6 +254,9 @@ impl MainWindow {
                             if this.tab == *tab {
                                 return;
                             }
+                            if this.config_dirty(cx) {
+                                return;
+                            }
                             let from = TABS.iter().position(|(t, _)| *t == this.tab).unwrap_or(0);
                             this.clicks += 1;
                             this.tab_anim = Some((from, this.clicks));
@@ -457,6 +460,9 @@ impl MainWindow {
             window,
             move |this, _, event: &ConfigEvent, window, cx| match event {
                 ConfigEvent::Back => {
+                    if this.config_dirty(cx) {
+                        return;
+                    }
                     this.config = None;
                     cx.notify();
                 }
@@ -469,6 +475,27 @@ impl MainWindow {
             _subscription,
         });
         cx.notify();
+    }
+
+    /// 配置页有没保存的改动：不让离开，让它的底栏晃一下。设置页盖在上面时不算离开。
+    fn config_dirty(&self, cx: &mut Context<Self>) -> bool {
+        let Some(config) = &self.config else {
+            return false;
+        };
+        if self.settings.is_some() || !config.page.read(cx).dirty(cx) {
+            return false;
+        }
+        config.page.update(cx, |page, cx| page.nudge(cx));
+        true
+    }
+
+    /// 配置页的「保存 / 取消」底栏（设置页盖在上面时不画）。
+    fn save_bar(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.settings.is_some() || self.tab != Tab::Agents {
+            return None;
+        }
+        let page = &self.config.as_ref()?.page;
+        page.update(cx, |page, cx| page.save_bar(t, cx))
     }
 
     fn providers_page(
@@ -874,10 +901,21 @@ impl MainWindow {
         )
     }
 
-    fn toast_layer(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// `above_bar`：配置页的底栏浮着，提示条往上让开。
+    fn toast_layer(
+        &self,
+        t: &Theme,
+        above_bar: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if self.toasts.is_empty() {
             return None;
         }
+        let bottom = if above_bar {
+            config_page::SAVE_BAR_SPACE
+        } else {
+            14.
+        };
         let toasts = self.toasts.iter().map(|toast| {
             let id = toast.id;
             let (icon, color) = match toast.kind {
@@ -921,7 +959,7 @@ impl MainWindow {
             deferred(
                 div()
                     .absolute()
-                    .bottom(px(14.))
+                    .bottom(px(bottom))
                     .left_0()
                     .right_0()
                     .v_flex()
@@ -954,6 +992,8 @@ impl MainWindow {
 impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Theme::window(window.appearance());
+        let save_bar = self.save_bar(&t, cx);
+        let toasts = self.toast_layer(&t, save_bar.is_some(), cx);
         let page = match (&self.settings, self.tab, &self.config) {
             (Some(settings), _, _) => settings.clone().into_any_element(),
             (None, Tab::Agents, Some(config)) => config.page.clone().into_any_element(),
@@ -984,8 +1024,9 @@ impl Render for MainWindow {
                     .pb(px(16.))
                     .child(page),
             )
+            .children(save_bar)
             .children(self.overlay_layer(&t, cx))
-            .children(self.toast_layer(&t, cx))
+            .children(toasts)
     }
 }
 

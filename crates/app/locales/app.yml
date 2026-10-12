@@ -593,9 +593,18 @@ config:
   raw_file:
     en: Raw file
     zh-CN: 原始文件
-  open:
-    en: Open
-    zh-CN: 打开
+  # 有改动还没保存时底栏的字（用户 10-12：改了先不写，点保存才写）。
+  unsaved:
+    en: Unsaved changes
+    zh-CN: 有改动还没保存
+  # 手改过编辑框，保存时发现文件读出来以后被别处改过：什么都没写。
+  conflict:
+    en: The file was changed elsewhere. Nothing was saved
+    zh-CN: 文件被别处改过了，没有保存
+  # 编辑框里的内容解析不了（保存、格式化时）。message 是解析器的原话（英文）。
+  parse_error:
+    en: "Can't parse line %{line}, column %{column}: %{message}"
+    zh-CN: "第 %{line} 行第 %{column} 列解析不了：%{message}"
   # 原始文件编辑框的「格式化」（⌥⇧F）。
   format:
     en: Format

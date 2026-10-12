@@ -427,6 +427,27 @@ fn in_use(
     })
 }
 
+/// 「配置 ›」页还没保存的改动：一家供应商从 `before` 改成 `after`，`text`（编辑框里现在的内容）会变成什么样。
+/// 和 [`write_changes`] 用同一个补丁（只动变了的键），只是不写文件；编辑框里手改的别的键原样留着。
+/// Codex 的模型目录文件不在这里算，保存时照常重写。
+pub fn preview(
+    home: &Path,
+    agent: AgentKind,
+    before: &Provider,
+    after: &Provider,
+    text: &[u8],
+) -> Result<Vec<u8>, ApplyError> {
+    let Writer { file, patch } = writer(home, agent)?;
+    let new = patch(after)?;
+    let Ok(old) = patch(before) else {
+        return Ok(new.apply(&file.path, Some(text))?);
+    };
+    let old = old.apply(&file.path, None)?;
+    let new = new.apply(&file.path, None)?;
+    let delta = patch::delta(file.format, &file.path, &old, &new)?;
+    Ok(delta.apply(&file.path, Some(text))?)
+}
+
 /// 把 `before` 改成 `after` 以后，这家在 agent 配置文件里生成的内容里变了的键写进去。
 fn write_changes(
     engine: &Engine,
@@ -832,6 +853,58 @@ mod tests {
     fn outcome(synced: &[Synced], agent: AgentKind) -> &Outcome {
         let synced = synced.iter().find(|synced| synced.agent == agent).unwrap();
         synced.result.as_ref().unwrap()
+    }
+
+    #[test]
+    fn a_preview_matches_what_saving_writes_and_keeps_hand_edits() {
+        let home = Home::new();
+        let providers = vec![relay()];
+        home.use_everywhere(&providers);
+        let path = ".claude/settings.json";
+        let on_disk = home.read(path);
+
+        let mut edited = relay();
+        edited
+            .overrides
+            .entry(AgentKind::ClaudeCode)
+            .or_default()
+            .slots
+            .insert("haiku".into(), "glm-4.5-air".into());
+        let shown = preview(
+            home.path(),
+            AgentKind::ClaudeCode,
+            &providers[0],
+            &edited,
+            on_disk.as_bytes(),
+        )
+        .unwrap();
+        home.save(&providers, &edited);
+        assert_eq!(String::from_utf8(shown).unwrap(), home.read(path));
+
+        // 编辑框里手加的键留着，只动这次改的槽位。
+        let mut by_hand: Value = serde_json::from_str(&home.read(path)).unwrap();
+        by_hand["env"]["MY_FLAG"] = "1".into();
+        let back = preview(
+            home.path(),
+            AgentKind::ClaudeCode,
+            &edited,
+            &providers[0],
+            serde_json::to_string_pretty(&by_hand).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let back: Value = serde_json::from_slice(&back).unwrap();
+        assert_eq!(back["env"]["MY_FLAG"], "1");
+        let setup = current::setup_of(
+            home.path(),
+            AgentKind::ClaudeCode,
+            &serde_json::to_vec(&back).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(
+            setup.slots.get("haiku").map(String::as_str),
+            Some("glm-4.5-air")
+        );
     }
 
     #[test]
