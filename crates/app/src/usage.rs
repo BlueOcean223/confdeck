@@ -160,7 +160,7 @@ impl Store {
     }
 
     /// 联网查的那些：余额、Claude 和 Grok Build 官方的额度、套餐额度。
-    fn refresh_remote(&mut self, force: bool, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_remote(&mut self, force: bool, cx: &mut Context<Self>) {
         let fresh = self
             .usage
             .checked_at

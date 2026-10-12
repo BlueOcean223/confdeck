@@ -249,6 +249,11 @@ impl Panel {
                             let write = this.store.update(cx, |s, cx| s.switch(agent, option, cx));
                             this.show_result(write, cx);
                         }
+                        PickerEvent::Account(id) => {
+                            let id = id.clone();
+                            let write = this.store.update(cx, |s, cx| s.use_account(agent, id, cx));
+                            this.show_result(write, cx);
+                        }
                         PickerEvent::AdoptKey { provider, key } => {
                             let (provider, key) = (*provider, key.clone());
                             let write = this

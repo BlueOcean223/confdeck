@@ -384,6 +384,12 @@ impl MainWindow {
                             .update(cx, |s, cx| s.switch(agent, option, cx))
                             .detach();
                     }
+                    PickerEvent::Account(id) => {
+                        let id = id.clone();
+                        this.store
+                            .update(cx, |s, cx| s.use_account(agent, id, cx))
+                            .detach();
+                    }
                     // 勾一下写一次，浮层不关（提案 01）。
                     PickerEvent::Toggled(provider) => {
                         let provider = *provider;

@@ -8,13 +8,16 @@
 //! 有改动时不让离开这页、不让换供应商，底栏晃一下。
 //! 模型旁不标来源，下拉框里就是编辑框里的值；不做 diff。
 //! 一次性的开关（跳过首次确认、VS Code 插件）不在这里，在设置页（decisions「配置页」）。
+//! Codex、Grok Build 在模型下面多一张「官方账号」卡：存下的账号、加账号、删账号（`accounts.rs`）。
 
 use std::cell::Cell;
 use std::f32::consts::PI;
 use std::rc::Rc;
 use std::time::Duration;
 
+use confdeck_core::account::{self, Live};
 use confdeck_core::agent::{self, AgentKind, FileSetup, Mode, claude, slots};
+use confdeck_core::current::Current;
 use confdeck_core::engine::{EngineError, LiveFile, Snapshot};
 use confdeck_core::patch::{self, Format, PatchError};
 use confdeck_core::provider::{AgentOverride, Model, Protocol, Provider};
@@ -92,6 +95,8 @@ pub struct ConfigPage {
     failure: Option<SharedString>,
     /// 有改动时想离开或换供应商的次数：底栏晃一下，字变红。保存、取消后清零。
     nudges: u64,
+    /// 点了删除、等确认的账号。
+    removing: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -217,6 +222,7 @@ impl ConfigPage {
             saving: false,
             failure: None,
             nudges: 0,
+            removing: None,
             _subscriptions: subscriptions,
         };
         page.settled = page.store.read(cx).settled(agent);
@@ -736,6 +742,12 @@ impl ConfigPage {
             window,
             move |this, _, event: &PickerEvent, _, cx| {
                 match event {
+                    PickerEvent::Account(id) => {
+                        let id = id.clone();
+                        this.store
+                            .update(cx, |s, cx| s.use_account(agent, id, cx))
+                            .detach();
+                    }
                     PickerEvent::Picked(option) => {
                         let option = *option;
                         this.store
@@ -1592,10 +1604,211 @@ impl Render for ConfigPage {
             .child(self.crumb(&t, cx))
             .child(self.header(&t, window, cx))
             .children(models)
+            .children(self.accounts_card(&t, window, cx))
             .children(self.raw_card(&t, cx))
             // 底栏浮着时，滚到底也能看见编辑框的最后几行。
             .when(bar, |page| page.pb(px(SAVE_BAR_SPACE - 16.)))
     }
+}
+
+impl ConfigPage {
+    /// Codex、Grok Build 的官方账号：存下的一个一行，登录文件里还没存的那个也列着（切走时自动存下）。
+    /// 登着、又在用官方登录的写「在用」，别的有「使用」；存下的能删。最后一行加账号，登录时换成「在浏览器里登录…」和「取消」。
+    fn accounts_card(&self, t: &Theme, window: &Window, cx: &Context<Self>) -> Option<Div> {
+        let store = self.store.read(cx);
+        let agent = &store.agents[self.agent];
+        let kind = agent.kind;
+        if !account::supported(kind) || !agent.installed {
+            return None;
+        }
+        let card = ui::list(t, false).child(ui::card_title(t, t!("accounts.title")));
+        if store.account_blocked(kind) {
+            return Some(
+                card.child(
+                    ui::row(t, false, false)
+                        .text_size(px(12.5))
+                        .text_color(t.muted)
+                        .child(t!("accounts.keyring")),
+                ),
+            );
+        }
+        let official = matches!(agent.selection, Selection::Single(None))
+            && matches!(agent.current, Some(Current::Default));
+        let live = store.live_account(kind);
+        // （账号 ID，邮箱，订阅，登着的是它）；还没存的 ID 是 `None`。
+        let mut entries: Vec<(Option<String>, SharedString, Option<String>, bool)> = store
+            .accounts_of(kind)
+            .into_iter()
+            .map(|account| {
+                let email = account.email.clone().unwrap_or_else(|| account.id.clone());
+                let is_live = matches!(live, Some(Live::Known(id)) if *id == account.id);
+                (
+                    Some(account.id.clone()),
+                    email.into(),
+                    account.plan.clone(),
+                    is_live,
+                )
+            })
+            .collect();
+        if let Some(Live::Unknown(identity)) = live {
+            let email = identity.email.clone().unwrap_or_default();
+            entries.push((None, email.into(), identity.plan.clone(), true));
+        }
+        let agent_index = self.agent;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (n, (id, email, plan, is_live)) in entries.into_iter().enumerate() {
+            let removing = id.is_some() && self.removing == id;
+            let right = if removing {
+                let confirm = id.clone().unwrap_or_default();
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .child(
+                        ui::text_button(ElementId::named_usize("keep-account", n), t)
+                            .child(t!("common.cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.removing = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        ui::text_button(ElementId::named_usize("drop-account", n), t)
+                            .text_color(t.danger)
+                            .child(t!("accounts.remove"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.removing = None;
+                                let id = confirm.clone();
+                                this.store
+                                    .update(cx, |s, cx| s.remove_account(kind, &id, cx));
+                            })),
+                    )
+            } else {
+                let use_id = id.clone();
+                let state: AnyElement = if is_live && official {
+                    div()
+                        .text_size(px(12.))
+                        .text_color(t.muted)
+                        .child(t!("accounts.in_use"))
+                        .into_any_element()
+                } else {
+                    ui::button(
+                        ElementId::named_usize("use-account", n),
+                        t,
+                        Button::Secondary,
+                    )
+                    .child(t!("accounts.use"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // 还没存的就是登录文件里那个：切回「默认」就是用它。
+                        let write = match use_id.clone() {
+                            Some(id) => this
+                                .store
+                                .update(cx, |s, cx| s.use_account(agent_index, id, cx)),
+                            None => this
+                                .store
+                                .update(cx, |s, cx| s.switch(agent_index, None, cx)),
+                        };
+                        write.detach();
+                    }))
+                    .into_any_element()
+                };
+                let remove: AnyElement = match id.clone() {
+                    Some(id) => {
+                        ui::icon_button(ElementId::named_usize("remove-account", n), t, "trash")
+                            .tooltip(ui::tooltip(t!("accounts.remove")))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.removing = Some(id.clone());
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                    }
+                    // 没存的删不了，空出同样的位置，按钮一列对齐。
+                    None => div().size(px(28.)).flex_none().into_any_element(),
+                };
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(state)
+                    .child(remove)
+            };
+            rows.push(
+                account_line(t, agent.logo, email, plan.as_deref(), window, cx)
+                    .child(right)
+                    .into_any_element(),
+            );
+        }
+        let last = match store.login_pending(kind) {
+            None => ui::row(t, false, rows.is_empty()).child(
+                ui::text_button("add-account", t)
+                    .child(ui::icon("plus", 14., t.ctl_fg))
+                    .child(t!("accounts.add"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store.update(cx, |s, cx| s.add_account(kind, cx));
+                    })),
+            ),
+            Some(pending) => ui::row(t, false, rows.is_empty())
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(12.5))
+                        .text_color(t.muted)
+                        .child(t!("accounts.logging_in")),
+                )
+                .children(pending.url.clone().map(|url| {
+                    ui::text_button("open-login", t)
+                        .child(ui::icon("external-link", 13., t.ctl_fg))
+                        .child(t!("accounts.open_login"))
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                }))
+                .child(
+                    ui::text_button("cancel-login", t)
+                        .child(t!("common.cancel"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.store.update(cx, |s, cx| s.cancel_login(kind, cx));
+                        })),
+                ),
+        };
+        Some(
+            card.children(rows.into_iter().map(|row| {
+                div()
+                    .border_t_1()
+                    .border_color(t.line_2)
+                    .child(row)
+                    .into_any_element()
+            }))
+            .child(last.border_t_1().border_color(t.line_2)),
+        )
+    }
+}
+
+/// 账号那一行的左半边：agent 图标、邮箱、订阅。
+fn account_line(
+    t: &Theme,
+    logo: data::Logo,
+    email: SharedString,
+    plan: Option<&str>,
+    window: &Window,
+    cx: &App,
+) -> Div {
+    ui::row(t, false, true)
+        .child(ui::logo(logo, 18., t, window, cx))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_flex()
+                .items_baseline()
+                .gap(px(8.))
+                .child(div().min_w_0().truncate().child(email))
+                .children(plan.map(|plan| {
+                    div()
+                        .flex_none()
+                        .text_size(px(11.5))
+                        .text_color(t.muted)
+                        .child(ui::capitalize(plan))
+                })),
+        )
 }
 
 /// 底栏的高度，和它占掉的底部空间（提示条往上让这么多）。

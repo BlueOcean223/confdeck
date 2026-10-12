@@ -232,6 +232,8 @@ pub struct Store {
     pub(crate) net: crate::net::NetState,
     /// 用量的汇总，见 `usage.rs`。
     pub(crate) usage: crate::usage::UsageState,
+    /// 官方账号，见 `accounts.rs`。
+    pub(crate) accounts: crate::accounts::AccountState,
 }
 
 impl EventEmitter<Notice> for Store {}
@@ -247,6 +249,7 @@ impl Store {
             load_error: None,
             net: Default::default(),
             usage: Default::default(),
+            accounts: Default::default(),
         };
         store.reload();
         store
@@ -270,6 +273,7 @@ impl Store {
         );
         self.agents = AGENTS.iter().map(|def| self.agent(def, &hidden)).collect();
         self.note_selections();
+        self.reload_accounts();
     }
 
     fn agent(&self, def: &AgentDef, hidden: &(BTreeSet<String>, BTreeSet<String>)) -> Agent {
@@ -982,6 +986,7 @@ impl Store {
 
     /// 胶囊里画什么：要叠的图标（单选是一个）和文字。
     pub fn pill(&self, agent: usize) -> (Vec<Logo>, SharedString) {
+        let index = agent;
         let agent = &self.agents[agent];
         match &agent.selection {
             Selection::Single(Some(p)) => (
@@ -1005,7 +1010,11 @@ impl Store {
                 }
                 // 配置文件解析不了：不能冒充「默认」，选一家时的报错会说明哪一行坏了。
                 None if agent.selectable() => (vec![agent.logo], t!("pill.unreadable").into()),
-                _ => (vec![agent.logo], t!("common.default").into()),
+                // 存过几个官方账号：写现在登的是哪个。
+                _ => match self.live_email(index) {
+                    Some(email) => (vec![agent.logo], email.into()),
+                    None => (vec![agent.logo], t!("common.default").into()),
+                },
             },
             Selection::Multi(enabled) if enabled.is_empty() => {
                 (vec![agent.logo], t!("multi.none").into())

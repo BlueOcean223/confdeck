@@ -445,11 +445,10 @@ fn card_head(
                 .child(name.into()),
         )
         .children(plan.map(|plan| {
-            let mut plan = plan.to_string();
-            if let Some(first) = plan.get(..1) {
-                plan = first.to_uppercase() + &plan[1..];
-            }
-            div().text_size(px(11.5)).text_color(t.muted).child(plan)
+            div()
+                .text_size(px(11.5))
+                .text_color(t.muted)
+                .child(ui::capitalize(plan))
         }))
 }
 

@@ -9,11 +9,14 @@
 //!   第一行写文件连到哪，下面挂着动作行：自定义时「把当前配置存成供应商…」，Key 不一致时「用 confdeck 里的 Key 重写」
 //!   和「把文件里的 Key 存进这家」。有过滤词时这组不显示，让人专心找供应商。
 //!
+//! - Codex、Grok Build 存过官方账号时（`accounts.rs`），「默认」换成一个账号一行，选一个就切回默认、换上这个账号的登录。
+//!
 //! 打开就能直接打字过滤；上下键移动高亮、回车选定（多选时是勾 / 取消）、Esc 关闭；鼠标悬停也会移动高亮。
 //! 多选时过滤框是空的，空格也能勾 / 取消；有过滤词时空格照常输入（供应商名里有空格）。
 
 use std::time::Duration;
 
+use confdeck_core::account::{self, Live};
 use confdeck_core::agent::{Connection, Credential, Mode};
 use confdeck_core::current::Current;
 use confdeck_core::provider::Provider;
@@ -39,6 +42,8 @@ pub enum PickerEvent {
     },
     /// 「自定义」：把配置文件里的连接存成一家新供应商，打开预先填好的新建表单。
     SaveAs(Provider),
+    /// 选了一个存下的官方账号（账号 ID）。
+    Account(String),
     Dismissed,
 }
 
@@ -63,11 +68,22 @@ impl Action {
     }
 }
 
-/// 选得了的一行：一个选项，或一个动作。
+/// 选得了的一行：一个选项，一个官方账号（`Picker::accounts` 里第几个），或一个动作。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pick {
     Option(Option<usize>),
+    Account(usize),
     Action(Action),
+}
+
+/// 「默认」展开后的一个官方账号。
+struct Choice {
+    /// 存下的账号的 ID；登录文件里还没存的账号是 `None`（选它就是「默认」）。
+    id: Option<String>,
+    email: SharedString,
+    plan: Option<SharedString>,
+    /// 登录文件现在是它。
+    live: bool,
 }
 
 /// 列表里的一行。
@@ -81,6 +97,7 @@ enum Row {
         /// 接口对不上的原因；有原因的置灰、选不了。
         reason: Option<SharedString>,
     },
+    Account(usize),
     Action(Action),
 }
 
@@ -91,6 +108,7 @@ impl Row {
                 option,
                 reason: None,
             } => Some(Pick::Option(*option)),
+            Row::Account(i) => Some(Pick::Account(*i)),
             Row::Action(action) => Some(Pick::Action(*action)),
             _ => None,
         }
@@ -99,7 +117,7 @@ impl Row {
     fn height(&self) -> f32 {
         match self {
             Row::Header(_) => 24.,
-            Row::Option { .. } | Row::Action(_) => 34.,
+            Row::Option { .. } | Row::Account(_) | Row::Action(_) => 34.,
             Row::Now => NOW_HEIGHT,
         }
     }
@@ -126,6 +144,8 @@ pub struct Picker {
     pinned: Vec<usize>,
     /// 配置不是 confdeck 写的时候才有。
     now: Option<Now>,
+    /// 存过官方账号时「默认」展开成的几行。打开时算一次。
+    accounts: Vec<Choice>,
     input: Entity<InputState>,
     /// 高亮的是 `rows()` 里第几行，只会落在选得了的行上。
     highlighted: usize,
@@ -167,6 +187,11 @@ impl Picker {
         } else {
             Self::now(store.read(cx), agent)
         };
+        let accounts = if multi {
+            Vec::new()
+        } else {
+            Self::accounts(store.read(cx), agent)
+        };
 
         // 过滤框本身绑定了上下键、回车和 Esc，会先把这几个键吃掉，
         // 所以在按键绑定生效之前就拦下来。
@@ -206,6 +231,7 @@ impl Picker {
             multi,
             pinned,
             now,
+            accounts,
             input,
             highlighted: 0,
             scroll: ScrollHandle::new(),
@@ -215,6 +241,11 @@ impl Picker {
         let rows = picker.rows(cx);
         let current = match &picker.store.read(cx).agents[agent].selection {
             Selection::Single(Some(p)) => Some(Pick::Option(Some(*p))),
+            Selection::Single(None) => picker
+                .accounts
+                .iter()
+                .position(|choice| choice.live)
+                .map(Pick::Account),
             _ => None,
         };
         picker.highlighted = rows
@@ -223,6 +254,40 @@ impl Picker {
             .or_else(|| rows.iter().position(|row| row.selectable().is_some()))
             .unwrap_or(0);
         picker
+    }
+
+    /// 存过官方账号时，「默认」展开成存下的账号，加上登录文件里还没存的那个。
+    fn accounts(store: &Store, agent: usize) -> Vec<Choice> {
+        let kind = store.agents[agent].kind;
+        let stored = store.accounts_of(kind);
+        if stored.is_empty() || !account::supported(kind) || store.account_blocked(kind) {
+            return Vec::new();
+        }
+        let live = store.live_account(kind);
+        let plan =
+            |plan: Option<&String>| plan.map(|plan| SharedString::from(ui::capitalize(plan)));
+        let mut choices: Vec<Choice> = stored
+            .iter()
+            .map(|account| Choice {
+                id: Some(account.id.clone()),
+                email: account
+                    .email
+                    .clone()
+                    .unwrap_or_else(|| account.id.clone())
+                    .into(),
+                plan: plan(account.plan.as_ref()),
+                live: matches!(live, Some(Live::Known(id)) if *id == account.id),
+            })
+            .collect();
+        if let Some(Live::Unknown(identity)) = live {
+            choices.push(Choice {
+                id: None,
+                email: identity.email.clone().unwrap_or_default().into(),
+                plan: plan(identity.plan.as_ref()),
+                live: true,
+            });
+        }
+        choices
     }
 
     /// 「现在」那组：文件连的不是 confdeck 列表里的哪家时才有。
@@ -299,11 +364,23 @@ impl Picker {
             rows.push(Row::Now);
             rows.extend(now.actions.iter().map(|&action| Row::Action(action)));
         }
-        let default_row =
-            (!self.multi && matches(&t!("picker.default_keywords"))).then_some(Row::Option {
-                option: None,
-                reason: None,
-            });
+        let default_keywords = matches(&t!("picker.default_keywords"));
+        let default_rows: Vec<Row> = if self.multi {
+            Vec::new()
+        } else if self.accounts.is_empty() {
+            default_keywords
+                .then_some(Row::Option {
+                    option: None,
+                    reason: None,
+                })
+                .into_iter()
+                .collect()
+        } else {
+            (0..self.accounts.len())
+                .filter(|&i| default_keywords || matches(&self.accounts[i].email))
+                .map(Row::Account)
+                .collect()
+        };
 
         let shown: Vec<usize> = (0..store.providers.len())
             .filter(|&p| {
@@ -337,13 +414,13 @@ impl Picker {
         } else if now.is_some() {
             // 有「现在」那组时「默认」也归到供应商那组底下，不然它会像是「现在」的一部分。
             rows.push(Row::Header(t!("picker.group_providers").into()));
-            rows.extend(default_row);
+            rows.extend(default_rows);
             rows.extend(usable.iter().map(|&p| Row::Option {
                 option: Some(p),
                 reason: None,
             }));
         } else {
-            rows.extend(default_row);
+            rows.extend(default_rows);
             group(&mut rows, t!("picker.group").into(), &usable);
         }
         if !unusable.is_empty() {
@@ -409,6 +486,10 @@ impl Picker {
                 (true, Some(p)) => cx.emit(PickerEvent::Toggled(p)),
                 (true, None) => {}
                 (false, option) => cx.emit(PickerEvent::Picked(option)),
+            },
+            Pick::Account(i) => match &self.accounts[i].id {
+                Some(id) => cx.emit(PickerEvent::Account(id.clone())),
+                None => cx.emit(PickerEvent::Picked(None)),
             },
             Pick::Action(Action::Rewrite(p)) => cx.emit(PickerEvent::Picked(Some(p))),
             Pick::Action(Action::AdoptKey(provider)) => {
@@ -533,6 +614,62 @@ impl Picker {
             })
     }
 
+    /// 一个官方账号：agent 的图标、邮箱、订阅；现在登的、又在「默认」时打勾。
+    fn account_row(
+        &self,
+        n: usize,
+        i: usize,
+        store: &Store,
+        t: &Theme,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let agent = &store.agents[self.agent];
+        let choice = &self.accounts[i];
+        let checked = choice.live && matches!(agent.selection, Selection::Single(None));
+        div()
+            .id(ElementId::named_usize("account", n))
+            .h_flex()
+            .items_center()
+            .gap(px(9.))
+            .h(px(34.))
+            .px(px(8.))
+            .rounded(px(7.))
+            .cursor_pointer()
+            .when(n == self.highlighted, |row| row.bg(t.sel))
+            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                if this.highlighted != n {
+                    this.highlighted = n;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.activate(Pick::Account(i), cx)))
+            .child(ui::logo(agent.logo, 16., t, window, cx))
+            .child(
+                div()
+                    .h_flex()
+                    .items_baseline()
+                    .gap(px(9.))
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .child(choice.email.clone()),
+                    )
+                    .children(choice.plan.clone().map(|plan| {
+                        div()
+                            .flex_none()
+                            .text_size(px(10.5))
+                            .text_color(t.muted)
+                            .child(plan)
+                    })),
+            )
+            .when(checked, |row| row.child(ui::icon("check", 13., t.accent)))
+    }
+
     /// 「现在」那组的第一行：上面是胶囊上那几个字，下面一行小字是文件里的地址或 Key 差在哪。没有悬停、选不了。
     fn now_row(&self, now: &Now, t: &Theme, window: &Window, cx: &App) -> Div {
         div()
@@ -644,6 +781,7 @@ impl Render for Picker {
                 Row::Option { option, reason } => {
                     list.child(self.option_row(n, *option, reason.clone(), store, &t, window, cx))
                 }
+                Row::Account(i) => list.child(self.account_row(n, *i, store, &t, window, cx)),
                 Row::Action(action) => list.child(self.action_row(n, *action, store, &t, cx)),
             };
         }

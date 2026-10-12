@@ -1095,3 +1095,43 @@ sessions:
   days_ago:
     en: "%{count}d ago"
     zh-CN: "%{count} 天前"
+
+# 「配置 ›」页的官方账号卡（Codex、Grok Build）。
+accounts:
+  title:
+    en: Accounts
+    zh-CN: 官方账号
+  in_use:
+    en: In use
+    zh-CN: 在用
+  use:
+    en: Use
+    zh-CN: 使用
+  remove:
+    en: Remove
+    zh-CN: 删除
+  add:
+    en: Add account
+    zh-CN: 添加账号
+  logging_in:
+    en: Sign in in your browser…
+    zh-CN: 在浏览器里登录…
+  open_login:
+    en: Open sign-in page
+    zh-CN: 打开登录页
+  added:
+    en: "Added %{account}"
+    zh-CN: "已添加 %{account}"
+  # 登录命令没找到：`codex`、`grok` 不在 PATH 和常见的安装位置。
+  no_program:
+    en: "Can't find the %{program} command"
+    zh-CN: "找不到 %{program} 命令"
+  login_failed:
+    en: "Sign-in didn't finish: %{error}"
+    zh-CN: "登录没有完成：%{error}"
+  unrecognized:
+    en: The sign-in has no account in it
+    zh-CN: 登录文件里没有认得出的账号
+  keyring:
+    en: Codex keeps its login in the keychain, so accounts can't be switched here
+    zh-CN: Codex 的登录存在钥匙串里，这里切不了账号

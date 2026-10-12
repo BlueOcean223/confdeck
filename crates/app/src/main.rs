@@ -1,3 +1,4 @@
+mod accounts;
 mod add_provider;
 mod assets;
 mod config_page;

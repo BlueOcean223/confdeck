@@ -535,6 +535,15 @@ pub fn radio(t: &Theme, on: bool) -> Div {
 }
 
 /// 卡片顶上的标题行（配置页：「模型」「原始文件」），右边可以放一个动作。
+/// 首字母大写：订阅名 `pro` 写成 Pro。
+pub fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 pub fn card_title(t: &Theme, title: impl Into<SharedString>) -> Div {
     div()
         .h_flex()
