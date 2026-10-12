@@ -37,6 +37,14 @@ pub const CLAUDE_TOGGLES: &[ClaudeToggle] = &[
     ClaudeToggle::Attribution,
 ];
 
+/// 开关会写的、不在 [`crate::apply::live_files`] 里的文件（备份页要列它们）。
+pub fn extra_files(home: &Path) -> Vec<LiveFile> {
+    vec![
+        ClaudeToggle::SkipOnboarding.file(home),
+        ClaudeToggle::VscodeFollows.file(home),
+    ]
+}
+
 impl ClaudeToggle {
     /// 文件里的键名。
     pub fn key(self) -> &'static str {

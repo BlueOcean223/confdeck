@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::backup::{self, Reason, Shelf};
 use crate::data::DataDir;
-use crate::engine::{Engine, EngineError};
+use crate::engine::{Engine, EngineError, LiveFile};
 use crate::fsx::{self, Mode};
+use crate::patch::Format;
 use crate::provider::{Provider, ProviderError};
 
 pub const VERSION: u32 = 1;
@@ -50,6 +51,16 @@ pub enum StoreError {
 
 pub fn shelf() -> Shelf {
     Shelf::new("confdeck", "providers.json")
+}
+
+/// `providers.json` 当成一个可恢复的文件（备份页「恢复」走 [`Engine::restore`]）。里面有 Key，0600。
+pub fn live_file(data: &DataDir) -> LiveFile {
+    LiveFile {
+        owner: "confdeck",
+        path: data.providers(),
+        mode: Mode::Private,
+        format: Format::Json,
+    }
 }
 
 /// 读供应商列表。文件不存在时是空列表。

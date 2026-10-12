@@ -11,13 +11,14 @@ use std::sync::Arc;
 use confdeck_core::agent::codex::catalog::Skipped;
 use confdeck_core::agent::{self, AgentKind, Connection, FileSetup, Mode};
 use confdeck_core::apply::{self, ApplyError, Switched, Synced, UsedBy};
+use confdeck_core::backup::{self, Backup, Reason};
 use confdeck_core::current::{self, Current};
 use confdeck_core::data::DataDir;
 use confdeck_core::engine::{Engine, EngineError, LiveFile, Outcome, Snapshot};
 use confdeck_core::preset;
 use confdeck_core::provider::{self, Protocol, Provider};
 use confdeck_core::store::{self, StoreError};
-use confdeck_core::toggles::ClaudeToggle;
+use confdeck_core::toggles::{self, ClaudeToggle};
 use gpui_kit::*;
 use rust_i18n::t;
 
@@ -189,6 +190,24 @@ pub enum Unusable {
     NoKey,
 }
 
+/// 设置 › 备份里的一行：一个有备份的文件和它的备份（最新的在前）。
+pub struct FileBackups {
+    pub file: LiveFile,
+    /// 文件归谁：agent 的图标，confdeck 自己的文件是卡带。
+    pub logo: Logo,
+    pub backups: Vec<Backup>,
+}
+
+impl FileBackups {
+    /// 原件以外还有几份（「清理」会删的）。
+    pub fn cleanable(&self) -> usize {
+        self.backups
+            .iter()
+            .filter(|backup| backup.reason != Reason::Original)
+            .count()
+    }
+}
+
 /// 写完文件给人看的一句话。`Store` 把它当事件发出去，谁订阅谁显示：主窗口做成底部提示条，面板写在底栏。
 #[derive(Clone, Debug)]
 pub struct Notice {
@@ -352,12 +371,10 @@ impl Store {
     ) -> Result<Outcome, EngineError> {
         let outcome = self.engine.replace(file, bytes, base)?;
         self.reload();
-        let name = file
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.announce(&[Notice::ok(t!("write.file_saved", file = name))], cx);
+        self.announce(
+            &[Notice::ok(t!("write.file_saved", file = file_name(file)))],
+            cx,
+        );
         Ok(outcome)
     }
 
@@ -422,6 +439,95 @@ impl Store {
             ))),
         };
         self.reload();
+        self.announce(notice.as_slice(), cx);
+    }
+
+    /// 设置 › 备份：confdeck 会写的每个文件（各 agent 的、开关的两个、`providers.json`）里有备份的那些。
+    pub fn backups(&self) -> Vec<FileBackups> {
+        let mut files: Vec<(LiveFile, Logo)> = Vec::new();
+        for agent in &self.agents {
+            let Some(kind) = agent.kind else {
+                continue;
+            };
+            for file in apply::live_files(&self.home, kind) {
+                files.push((file, agent.logo));
+            }
+        }
+        let claude = self
+            .agents
+            .iter()
+            .find(|agent| agent.kind == Some(AgentKind::ClaudeCode))
+            .map_or(Logo::Letter('C'), |agent| agent.logo);
+        for file in toggles::extra_files(&self.home) {
+            files.push((file, claude));
+        }
+        files.push((
+            store::live_file(self.engine.data()),
+            Logo::Mono("icons/confdeck.svg"),
+        ));
+        files
+            .into_iter()
+            .filter_map(|(file, logo)| {
+                let backups = backup::list(self.engine.data(), &file.shelf()).ok()?;
+                (!backups.is_empty()).then_some(FileBackups {
+                    file,
+                    logo,
+                    backups,
+                })
+            })
+            .collect()
+    }
+
+    /// `~/.confdeck/backups`，备份卡的小字。
+    pub fn backups_dir(&self) -> PathBuf {
+        self.engine.data().backups()
+    }
+
+    /// 一份备份的内容（读不了算空）。
+    pub fn read_backup(&self, backup: &Backup) -> String {
+        std::fs::read(&backup.path)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// 文件现在的内容（不存在、读不了算空）。
+    pub fn read_text(&self, file: &LiveFile) -> String {
+        self.engine
+            .read(file)
+            .ok()
+            .and_then(|snapshot| snapshot.bytes)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// 用一份备份替换文件（core 先把现在的内容备份成「恢复前」）。写了重读，说一句「已恢复 settings.json」。
+    pub fn restore(&mut self, file: &LiveFile, backup: &Backup, cx: &mut Context<Self>) {
+        let notice = match self.engine.restore(file, backup) {
+            Ok(_) => Notice::ok(t!("write.file_restored", file = file_name(file))),
+            Err(err) => Notice::err(err.to_string()),
+        };
+        self.reload();
+        self.announce(&[notice], cx);
+    }
+
+    /// 「清理」：删掉这个文件原件以外的备份，说一句清理了几份。
+    pub fn clean(&mut self, file: &LiveFile, cx: &mut Context<Self>) {
+        let shelf = file.shelf();
+        let data = self.engine.data();
+        let count = backup::list(data, &shelf)
+            .map(|backups| {
+                backups
+                    .iter()
+                    .filter(|backup| backup.reason != Reason::Original)
+                    .count()
+            })
+            .unwrap_or(0);
+        let notice = match backup::clean(data, &shelf) {
+            Ok(_) if count == 1 => Some(Notice::ok(t!("write.cleaned_one"))),
+            Ok(_) if count > 1 => Some(Notice::ok(t!("write.cleaned_other", count = count))),
+            Ok(_) => None,
+            Err(err) => Some(Notice::err(err.to_string())),
+        };
         self.announce(notice.as_slice(), cx);
     }
 
@@ -886,6 +992,14 @@ impl Store {
 }
 
 /// Codex 模型目录没生成出来的原因，按界面语言说（core 的 `Skipped` 只有中文）。
+/// 提示条里只说文件名（`settings.json`），路径太长。
+fn file_name(file: &LiveFile) -> String {
+    file.path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 fn describe_skipped(skipped: Skipped) -> std::borrow::Cow<'static, str> {
     match skipped {
         Skipped::NotFound => t!("codex.not_found"),

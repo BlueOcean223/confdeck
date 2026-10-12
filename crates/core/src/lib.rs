@@ -12,7 +12,7 @@
 //! - [`current`]：认出 agent 现在用的是哪家（单选连的哪家，多选勾了哪几家），只有 Key 不一样的算「Key 不一致」，
 //!   对不上的算「自定义」，可以拼成一家新供应商。
 //! - [`toggles`]：设一次就不动的开关（跳过首次确认、VS Code 插件跟着切换、署名），和供应商无关，按键补丁直接写。
-//! - [`backup`]、[`data`]、[`fsx`]：备份、数据目录、文件操作的基本件。
+//! - [`backup`]、[`data`]、[`fsx`]：备份、数据目录、文件操作的基本件；[`diff`]：备份和现在的文件按行比。
 //!
 //! 按键补丁、写入引擎和各 agent 的关键字段清单移植自 ccs-lite（BlueOcean223/cc-switch，MIT 许可）
 //! 的 `live/` 模块。
@@ -22,6 +22,7 @@ pub mod apply;
 pub mod backup;
 pub mod current;
 pub mod data;
+pub mod diff;
 pub mod engine;
 pub mod fsx;
 pub mod patch;
