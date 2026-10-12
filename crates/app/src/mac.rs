@@ -93,6 +93,14 @@ pub fn show_at(window: &Window, origin: Point<Pixels>, height: f64, cx: &App) {
         .detach();
 }
 
+/// 跑 `drive` 脚本时的窗口（`crate::quiet`）：全透明、鼠标穿过去，不挡着正在用电脑的人。
+pub fn hush(window: &Window) {
+    if let Some(ns_window) = ns_window(window) {
+        ns_window.setAlphaValue(0.);
+        ns_window.setIgnoresMouseEvents(true);
+    }
+}
+
 /// `show_at` 之后，GPUI 画好新的一帧了，窗口变回不透明。
 pub fn reveal(window: &Window) {
     if let Some(ns_window) = ns_window(window) {

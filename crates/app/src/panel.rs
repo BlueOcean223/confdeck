@@ -71,7 +71,7 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     let origin = point(icon.center().x - px(WIDTH / 2.), icon.bottom() + px(OFFSET));
     // 和 Wails 一样先激活应用再显示面板。不激活的话，应用在后台、主窗口又开着时，
     // gpui 为绕开 Cocoa 的一个问题会立刻收走面板刚拿到的焦点，接着 AppKit 抛异常崩溃。
-    cx.activate(true);
+    crate::activate(cx);
     if let Some(handle) = handle
         && handle
             .update(cx, |panel, window, cx| panel.reopen(origin, window, cx))
@@ -155,6 +155,7 @@ impl Panel {
     fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
+        crate::hush(window);
         #[cfg(target_os = "macos")]
         {
             crate::mac::round_corners(window, 12.);
@@ -168,8 +169,9 @@ impl Panel {
                 cx.notify();
             }),
             cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
+            // 失焦就关。跑 drive 脚本时应用不在前台（`crate::quiet`），焦点怎么变都和面板无关，只按脚本关。
             cx.observe_window_activation(window, |_, window, cx| {
-                if !window.is_window_active() {
+                if !window.is_window_active() && !crate::quiet() {
                     close(window, cx);
                 }
             }),
@@ -196,11 +198,15 @@ impl Panel {
         {
             crate::mac::show_at(window, origin, self.height as f64, cx);
             // 排在 `show_at` 的任务后面：窗口显示出来以后，等画完下一帧再变回不透明。
-            cx.spawn_in(window, async move |_, cx| {
-                cx.update(|window, _| window.on_next_frame(|window, _| crate::mac::reveal(window)))
+            if !crate::quiet() {
+                cx.spawn_in(window, async move |_, cx| {
+                    cx.update(|window, _| {
+                        window.on_next_frame(|window, _| crate::mac::reveal(window))
+                    })
                     .ok();
-            })
-            .detach();
+                })
+                .detach();
+            }
         }
         cx.notify();
     }

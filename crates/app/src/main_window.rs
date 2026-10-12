@@ -64,7 +64,7 @@ pub fn handle(cx: &App) -> Option<AnyWindowHandle> {
 
 /// 有主窗口就提到前台，没有就新开一个。
 pub fn show(store: Entity<Store>, cx: &mut App) {
-    cx.activate(true);
+    crate::activate(cx);
     let existing = cx.default_global::<MainWindowHandle>().window;
     if let Some(handle) = existing
         && handle
@@ -155,6 +155,7 @@ pub struct MainWindow {
 
 impl MainWindow {
     fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        crate::hush(window);
         let _subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
             // 写了文件（这个窗口、面板或启动时的后台任务）都从这里收到一句话，做成提示条。

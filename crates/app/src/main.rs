@@ -39,6 +39,9 @@ fn main() {
             panel::init(cx);
             // 关掉窗口后继续留在菜单栏，只有「退出」会结束进程。
             cx.set_quit_mode(QuitMode::Explicit);
+            if quiet() {
+                cx.set_activation_policy(ActivationPolicy::Accessory);
+            }
 
             #[cfg(all(debug_assertions, target_os = "macos"))]
             if let Ok(name) = std::env::var("CONFDECK_APPEARANCE") {
@@ -54,6 +57,38 @@ fn main() {
             #[cfg(debug_assertions)]
             drive::start(cx);
         });
+}
+
+/// 跑 `drive` 脚本时不打扰正在用电脑的人：不激活应用、不进 Dock，窗口全透明、点不到
+/// （`shots` 特性下截图是 GPUI 自己画的，不看屏幕）。要录屏看真实画面时设 `CONFDECK_LOUD=1`。
+pub fn quiet() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *QUIET.get_or_init(|| {
+            std::env::var_os("CONFDECK_DRIVE").is_some()
+                && std::env::var_os("CONFDECK_LOUD").is_none()
+        })
+    }
+    #[cfg(not(debug_assertions))]
+    false
+}
+
+/// 把应用提到前台（打开主窗口、面板时）。`quiet` 时不提。
+pub fn activate(cx: &mut App) {
+    if !quiet() {
+        cx.activate(true);
+    }
+}
+
+/// 新开的窗口：`quiet` 时变透明、不接鼠标。
+pub fn hush(window: &Window) {
+    #[cfg(target_os = "macos")]
+    if quiet() {
+        mac::hush(window);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
 }
 
 /// 数据目录和家目录。debug 构建里 `CONFDECK_DATA`、`CONFDECK_HOME` 可以指到别处，
