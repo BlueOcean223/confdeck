@@ -16,6 +16,7 @@ use crate::patch::{self, LivePatch, PatchError};
 use crate::provider::Provider;
 use crate::store::{self, StoreError};
 use crate::transfer;
+use crate::usage::history;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -58,7 +59,8 @@ pub struct Switched {
     pub catalog: Option<Result<Outcome, Skipped>>,
 }
 
-/// 单选 agent 换供应商；`None` 还原成 agent 自带的登录。写完记下选了哪家（只存在本机）。
+/// 单选 agent 换供应商；`None` 还原成 agent 自带的登录。写完记下选了哪家（只存在本机），
+/// 再记一笔切换记录（[`history`]，用量页认供应商用）。
 pub fn switch(
     engine: &Engine,
     home: &Path,
@@ -67,6 +69,8 @@ pub fn switch(
 ) -> Result<Switched, ApplyError> {
     let switched = write_switch(engine, home, agent, provider)?;
     engine.set_selection(agent.id(), provider.map(|provider| provider.id.as_str()))?;
+    // 切换已经写成了；记不下来只是用量页少一条线索，不算切换失败。
+    let _ = history::note(engine.data(), agent, history::Target::of(provider));
     Ok(switched)
 }
 
@@ -639,6 +643,20 @@ mod tests {
 
         switch(&home.engine, home.path(), AgentKind::ClaudeCode, None).unwrap();
         assert_eq!(home.engine.selection("claude-code"), Some(None));
+
+        // 切换记录只有写成的两次。
+        let targets: Vec<_> = history::load(home.engine.data())
+            .unwrap()
+            .into_iter()
+            .map(|switch| switch.to)
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                history::Target::of(Some(&relay())),
+                history::Target::Official
+            ]
+        );
     }
 
     #[test]

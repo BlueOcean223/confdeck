@@ -3,6 +3,8 @@
 //! - `providers.json`：供应商（[`crate::store`]）。
 //! - `state.json`：每个 agent 配置文件上次由 confdeck 写入后的 hash，只属于这台设备，不同步。
 //! - `backups/`：备份（[`crate::backup`]），有 Key，不同步。
+//! - `history.jsonl`：单选 agent 连到哪家的记录（[`crate::usage::history`]），用量页认供应商用，重算不出来。
+//! - `cache/`：丢了能重算的东西，比如用量的数据库 `cache/usage.db`（[`crate::usage::Db`]）。
 //! - `.lock`：写入时的跨进程锁。
 
 use std::path::{Path, PathBuf};
@@ -36,6 +38,14 @@ impl DataDir {
 
     pub fn backups(&self) -> PathBuf {
         self.root.join("backups")
+    }
+
+    pub fn history(&self) -> PathBuf {
+        self.root.join("history.jsonl")
+    }
+
+    pub fn usage_db(&self) -> PathBuf {
+        self.root.join("cache").join("usage.db")
     }
 
     pub fn lock_file(&self) -> PathBuf {
