@@ -155,6 +155,8 @@ pub struct MainWindow {
     just_closed: Option<usize>,
     /// 上一个标签和这次切换的编号，给分段标签的滑块放动画。
     tab_anim: Option<(usize, u64)>,
+    /// 页面的滚动区（各标签共用一个）。
+    page_scroll: ScrollHandle,
     clicks: u64,
     should_move: bool,
     _subscriptions: Vec<Subscription>,
@@ -186,6 +188,7 @@ impl MainWindow {
             toast_seq: 0,
             just_closed: None,
             tab_anim: None,
+            page_scroll: ScrollHandle::new(),
             clicks: 0,
             should_move: false,
             _subscriptions,
@@ -474,6 +477,7 @@ impl MainWindow {
                     cx.notify();
                 }
                 ConfigEvent::SaveAs(draft) => this.open_draft(agent, draft.clone(), window, cx),
+                ConfigEvent::Reveal(top, bottom) => this.reveal(*top, *bottom, cx),
             },
         );
         self.picker = None;
@@ -494,6 +498,32 @@ impl MainWindow {
         }
         config.page.update(cx, |page, cx| page.nudge(cx));
         true
+    }
+
+    /// 页面滚到能看见窗口里 `top..bottom` 这一段（配置页编辑框里的光标）；底下浮着保存栏时让开它。
+    /// 滚过头 GPUI 布局时会收回来。
+    fn reveal(&mut self, top: Pixels, bottom: Pixels, cx: &mut Context<Self>) {
+        let view = self.page_scroll.bounds();
+        let dirty = self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.page.read(cx).dirty(cx));
+        let below = px(if dirty {
+            config_page::SAVE_BAR_SPACE
+        } else {
+            16.
+        });
+        let above = px(16.);
+        let mut offset = self.page_scroll.offset();
+        if bottom > view.bottom() - below {
+            offset.y -= bottom - (view.bottom() - below);
+        } else if top < view.top() + above {
+            offset.y = (offset.y + view.top() + above - top).min(px(0.));
+        } else {
+            return;
+        }
+        self.page_scroll.set_offset(offset);
+        cx.notify();
     }
 
     /// 配置页的「保存 / 取消」底栏（设置页盖在上面时不画）。
@@ -1027,6 +1057,7 @@ impl Render for MainWindow {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.page_scroll)
                     .px(px(16.))
                     .pb(px(16.))
                     .child(page),

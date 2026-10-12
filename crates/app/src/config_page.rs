@@ -9,7 +9,9 @@
 //! 模型旁不标来源，下拉框里就是编辑框里的值；不做 diff。
 //! 一次性的开关（跳过首次确认、VS Code 插件）不在这里，在设置页（decisions「配置页」）。
 
+use std::cell::Cell;
 use std::f32::consts::PI;
+use std::rc::Rc;
 use std::time::Duration;
 
 use confdeck_core::agent::{self, AgentKind, FileSetup, Mode, claude, slots};
@@ -34,6 +36,8 @@ pub enum ConfigEvent {
     Back,
     /// 选择器里的「把当前配置存成供应商…」：交给主窗口开预先填好的新建表单。
     SaveAs(Provider),
+    /// 编辑框里的光标挪到了窗口里这一段（上、下边，窗口坐标）：编辑框不自己滚，由主窗口把页面滚过去。
+    Reveal(Pixels, Pixels),
 }
 
 struct OpenPicker {
@@ -52,6 +56,10 @@ struct RawEditor {
     expected: String,
     state: Entity<EditorState>,
     rows: usize,
+    /// 编辑框上一帧在窗口里的位置，算光标那一行在哪。
+    bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// 上次看到的光标位置和文本长度，变了才让页面跟过去（光标闪烁也会通知）。
+    caret: (usize, usize),
     /// 格式化失败、草稿补不进编辑框时的原因，显示在编辑框底下。
     error: Option<SharedString>,
 }
@@ -188,6 +196,9 @@ impl ConfigPage {
                     }
                 },
             ));
+            subscriptions.push(cx.observe_in(&raw.state, window, |this, _, window, cx| {
+                this.follow_caret(window, cx)
+            }));
         }
         let mut page = Self {
             store,
@@ -228,8 +239,12 @@ impl ConfigPage {
         };
         let rows = rows(&text);
         let state = cx.new(|cx| {
+            // 编辑框跟着内容撑高、不自己滚（只留页面那一个滚动条）：不自动换行，行数才算得准；
+            // 末行下面也不留空。
             EditorState::new(window, cx)
                 .language(language)
+                .soft_wrap(false)
+                .scroll_beyond_last_line(Some(0))
                 .default_value(text.clone())
         });
         Some(RawEditor {
@@ -239,6 +254,8 @@ impl ConfigPage {
             expected: text,
             state,
             rows,
+            bounds: Rc::default(),
+            caret: (0, 0),
             error,
         })
     }
@@ -344,6 +361,32 @@ impl ConfigPage {
         if let Ok(setup) = self.store.read(cx).setup_of(self.agent, &text) {
             self.setup = setup;
         }
+    }
+
+    /// 编辑框不自己滚，光标挪出窗口时让页面跟过去：算出光标那一行在窗口里的位置交给主窗口。
+    fn follow_caret(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(raw) = &mut self.raw else {
+            return;
+        };
+        if !raw.state.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        let state = raw.state.read(cx);
+        let text = state.value();
+        let cursor = state.cursor();
+        if raw.caret == (cursor, text.len()) {
+            return;
+        }
+        raw.caret = (cursor, text.len());
+        let Some(line) = state.line_height() else {
+            return;
+        };
+        let row = text
+            .get(..cursor)
+            .map_or(0, |before| before.matches('\n').count());
+        // 上内边距 8。
+        let top = raw.bounds.get().top() + px(8.) + line * row as f32;
+        cx.emit(ConfigEvent::Reveal(top, top + line));
     }
 
     /// 手改了编辑框。
@@ -1373,7 +1416,9 @@ impl ConfigPage {
     fn raw_card(&self, t: &Theme, cx: &Context<Self>) -> Option<Div> {
         let raw = self.raw.as_ref()?;
         let path: SharedString = self.store.read(cx).tilde(&raw.file.path).into();
-        let height = (raw.rows as f32 * 20. + 16.).clamp(120., 380.);
+        // 上下各 8 的内边距；行高画过一帧才知道，之前按 12px 字号的 18 算。
+        let line = raw.state.read(cx).line_height().map_or(18., f32::from);
+        let height = (raw.rows as f32 * line + 16.).max(120.);
         let formattable = raw.file.format != Format::Toml;
         Some(
             ui::list(t, false)
@@ -1405,12 +1450,19 @@ impl ConfigPage {
                 .child(
                     div()
                         .flex_none()
+                        .relative()
                         .mx(px(14.))
                         .rounded(px(8.))
                         .bg(t.field)
                         .border_1()
                         .border_color(t.line)
                         .overflow_hidden()
+                        .child({
+                            let cell = raw.bounds.clone();
+                            canvas(move |bounds, _, _| cell.set(bounds), |_, _, _, _| {})
+                                .absolute()
+                                .size_full()
+                        })
                         .child(
                             CodeEditor::new(&raw.state)
                                 .appearance(false)
@@ -1605,8 +1657,9 @@ fn read(store: &Store, file: &LiveFile) -> (Snapshot, String, Option<SharedStrin
     }
 }
 
+/// 编辑框里有几行：结尾的换行后面还有一个空行，`lines()` 不算它。
 fn rows(text: &str) -> usize {
-    text.lines().count().max(1)
+    text.split('\n').count()
 }
 
 /// 编辑框换成 `text`；一样就不动（换了会滚回顶上）。
