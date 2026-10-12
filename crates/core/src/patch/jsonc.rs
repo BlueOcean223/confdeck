@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use json_five::rt::parser::{
     ArrayValueContext, JSONArrayContext, JSONArrayValue, JSONKeyValuePair, JSONObjectContext,
-    JSONText, JSONValue, KeyValuePairContext,
+    JSONText, JSONTextContext, JSONValue, KeyValuePairContext,
 };
 use json_five::tokenize::{TokType, tokenize_rt_str};
 use serde::Serialize;
@@ -44,6 +44,143 @@ pub(super) fn rewrite(source: &str, before: &Value, after: &Value, unit: &[u8]) 
 struct Layout {
     unit: String,
     newline: &'static str,
+}
+
+/// 「格式化」：一个键（项）一行，缩进按 `unit`，冒号后一个空格，括号里的空白重排。
+/// 注释留在原来的位置，只改它们周围的空白：跟在逗号后面同一行的行注释还留在那一行，
+/// 独占一行的按所在层缩进。键、冒号、值之间夹着注释的那几处不动。解析不了返回 `None`。
+pub(super) fn format(source: &str, unit: &[u8]) -> Option<String> {
+    let mut text = parse(source)?;
+    let layout = Layout {
+        unit: std::str::from_utf8(unit).ok()?.to_string(),
+        newline: if source.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        },
+    };
+    let context = text.context.get_or_insert_with(|| JSONTextContext {
+        wsc: (String::new(), String::new()),
+    });
+    context.wsc.0 = relayout(&context.wsc.0, "", "", &layout, false);
+    context.wsc.1 = relayout(&context.wsc.1, "", layout.newline, &layout, true);
+    format_value(&mut text.value, "", &layout);
+    Some(text.to_string())
+}
+
+fn format_value(node: &mut JSONValue, indent: &str, layout: &Layout) {
+    let child = format!("{indent}{}", layout.unit);
+    let next = format!("{}{child}", layout.newline);
+    let close = format!("{}{indent}", layout.newline);
+    match node {
+        JSONValue::JSONObject {
+            key_value_pairs: pairs,
+            context,
+        } => {
+            let opening = &mut object_context(context).wsc.0;
+            *opening = if pairs.is_empty() && blank(opening) {
+                String::new()
+            } else {
+                let ending = if pairs.is_empty() { &close } else { &next };
+                relayout(opening, &child, ending, layout, true)
+            };
+            let last = pairs.len().saturating_sub(1);
+            for (index, pair) in pairs.iter_mut().enumerate() {
+                let gap = if index == last { &close } else { &next };
+                let wsc = &mut pair_context(pair).wsc;
+                wsc.0 = inline(&wsc.0, "");
+                wsc.1 = inline(&wsc.1, " ");
+                match &mut wsc.3 {
+                    Some(after_comma) => {
+                        wsc.2 = inline(&wsc.2, "");
+                        *after_comma = relayout(after_comma, &child, gap, layout, true);
+                    }
+                    None => wsc.2 = relayout(&wsc.2, &child, &close, layout, true),
+                }
+                format_value(&mut pair.value, &child, layout);
+            }
+        }
+        JSONValue::JSONArray { values, context } => {
+            let opening = &mut array_context(context).wsc.0;
+            *opening = if values.is_empty() && blank(opening) {
+                String::new()
+            } else {
+                let ending = if values.is_empty() { &close } else { &next };
+                relayout(opening, &child, ending, layout, true)
+            };
+            let last = values.len().saturating_sub(1);
+            for (index, value) in values.iter_mut().enumerate() {
+                let gap = if index == last { &close } else { &next };
+                let wsc = &mut value_context(value).wsc;
+                match &mut wsc.1 {
+                    Some(after_comma) => {
+                        wsc.0 = inline(&wsc.0, "");
+                        *after_comma = relayout(after_comma, &child, gap, layout, true);
+                    }
+                    None => wsc.0 = relayout(&wsc.0, &child, &close, layout, true),
+                }
+                format_value(&mut value.value, &child, layout);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 一段空白里的注释，和它前面有没有换行（没有就是跟在上一个记号后面同一行的）。
+fn comments(wsc: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = wsc;
+    let mut on_same_line = true;
+    while !rest.is_empty() {
+        if let Some(body) = rest.strip_prefix("//") {
+            let end = body.find('\n').map_or(body.len(), |at| at);
+            let text = format!("//{}", body[..end].trim_end_matches('\r'));
+            out.push((text, on_same_line));
+            rest = &body[end..];
+            on_same_line = false;
+        } else if let Some(body) = rest.strip_prefix("/*") {
+            let end = body.find("*/").map_or(body.len(), |at| at + 2);
+            out.push((format!("/*{}", &body[..end]), on_same_line));
+            rest = &body[end..];
+        } else {
+            let mut chars = rest.chars();
+            let ch = chars.next().expect("not empty");
+            if ch == '\n' {
+                on_same_line = false;
+            }
+            rest = chars.as_str();
+        }
+    }
+    out
+}
+
+/// 项与项之间的空白：注释各占一行（跟在上一项同一行的行注释留在那一行），然后是 `ending`
+/// （下一项或括号前的换行加缩进）。`own_line` 为假时注释不换行（文件开头的注释后面直接接值）。
+fn relayout(wsc: &str, indent: &str, ending: &str, layout: &Layout, own_line: bool) -> String {
+    let mut out = String::new();
+    for (index, (text, same_line)) in comments(wsc).into_iter().enumerate() {
+        if index == 0 && same_line && own_line {
+            out.push(' ');
+        } else if index > 0 || own_line {
+            out.push_str(layout.newline);
+            out.push_str(indent);
+        }
+        out.push_str(&text);
+        if !own_line {
+            out.push_str(layout.newline);
+        }
+    }
+    out.push_str(ending);
+    out
+}
+
+/// 键和冒号、冒号和值、值和逗号之间：纯空白就换成 `canonical`，夹着注释的不动。
+fn inline(wsc: &str, canonical: &str) -> String {
+    if blank(wsc) {
+        canonical.to_string()
+    } else {
+        wsc.to_string()
+    }
 }
 
 fn parse(source: &str) -> Option<JSONText> {
@@ -755,6 +892,44 @@ mod tests {
         assert_eq!(
             edit(source, &json!({"a": 2, "b": 1})),
             r#"{"a": 1, "a": 2, "b": 1}"#
+        );
+    }
+
+    fn fmt(source: &str) -> String {
+        format(source, b"  ").expect("format")
+    }
+
+    #[test]
+    fn format_lays_out_one_item_per_line_and_keeps_comments() {
+        let source = "// pi\n{\"providers\":{ // all\n\"a\":{\"baseUrl\":\"x\",\"models\":[1,2, // two\n3]}, /* b */ \"b\":[] ,\n\"c\":{}, }  } // end\n";
+        let out = fmt(source);
+        assert_eq!(
+            out,
+            "// pi\n{\n  \"providers\": { // all\n    \"a\": {\n      \"baseUrl\": \"x\",\n      \"models\": [\n        1,\n        2, // two\n        3\n      ]\n    }, /* b */\n    \"b\": [],\n    \"c\": {},\n  }\n} // end\n"
+        );
+        assert_eq!(
+            json5::from_str::<Value>(&out).unwrap(),
+            json5::from_str::<Value>(source).unwrap()
+        );
+        // 再格式化一次不变。
+        assert_eq!(fmt(&out), out);
+    }
+
+    #[test]
+    fn format_keeps_the_file_ending_and_crlf() {
+        assert_eq!(fmt("{\"a\":1}"), "{\n  \"a\": 1\n}\n");
+        assert_eq!(fmt("{\"a\":1}\n\n"), "{\n  \"a\": 1\n}\n");
+        assert_eq!(fmt("{\r\n\"a\":1}\r\n"), "{\r\n  \"a\": 1\r\n}\r\n");
+        assert_eq!(fmt("{}"), "{}\n");
+        assert_eq!(fmt("{ /* e */ }"), "{ /* e */\n}\n");
+    }
+
+    #[test]
+    fn format_leaves_comments_between_key_and_value_alone() {
+        let source = "{\"a\" /* k */ : /* v */ 1 /* after */ , \"b\": 2}";
+        assert_eq!(
+            fmt(source),
+            "{\n  \"a\" /* k */ : /* v */ 1 /* after */ ,\n  \"b\": 2\n}\n"
         );
     }
 }

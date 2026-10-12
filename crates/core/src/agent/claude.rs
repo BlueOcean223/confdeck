@@ -426,6 +426,23 @@ mod tests {
         assert!(out["env"].get("ANTHROPIC_MODEL").is_none());
     }
 
+    /// 槽位留空（覆盖里是空串）：第三方时别的槽位照填，这个不写，文件里原来的值也清掉。
+    #[test]
+    fn an_empty_slot_is_left_out() {
+        let mut provider = relay();
+        provider.overrides.insert(
+            AGENT,
+            AgentOverride {
+                slots: BTreeMap::from([("opus".into(), String::new())]),
+                ..AgentOverride::default()
+            },
+        );
+        let out = apply(Some(&provider), LIVE);
+        assert!(out["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
+        assert_eq!(out["env"]["ANTHROPIC_MODEL"], json!("glm-4.6"));
+        assert_eq!(out["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], json!("glm-4.6"));
+    }
+
     #[test]
     fn default_clears_the_floor_only() {
         assert_eq!(

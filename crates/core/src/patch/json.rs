@@ -285,6 +285,32 @@ fn parse_text(path: &Path, text: &str, json5: bool) -> Result<Value, PatchError>
     })
 }
 
+/// 「原始文件」页的「格式化」：整份重新排版，缩进照文件原来的（认不出就两个空格），末尾带换行。
+/// 严格 JSON：注释本来就不允许。
+pub fn format(path: &Path, bytes: &[u8]) -> Result<Vec<u8>, PatchError> {
+    let (doc, mut style) = parse(path, Some(bytes), false)?;
+    style.trailing_newline = true;
+    Ok(serialize(&doc, &style))
+}
+
+/// JSON5 / JSONC 文件的「格式化」：注释留在原位（见 [`jsonc::format`]）。round-trip 语法树解析不了
+/// 但 json5 解析得了的（同一个键出现两次之类），退回整份重新序列化，注释会丢。
+pub fn format_json5(path: &Path, bytes: &[u8]) -> Result<Vec<u8>, PatchError> {
+    let (doc, mut style) = parse(path, Some(bytes), true)?;
+    style.trailing_newline = true;
+    let text = decode_utf8(path, bytes)?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let Some(formatted) = jsonc::format(text, &style.indent) else {
+        return Ok(serialize(&doc, &style));
+    };
+    let mut out = Vec::with_capacity(formatted.len() + 3);
+    if style.bom {
+        out.extend_from_slice("\u{feff}".as_bytes());
+    }
+    out.extend_from_slice(formatted.as_bytes());
+    Ok(out)
+}
+
 pub fn serialize(doc: &Value, style: &JsonStyle) -> Vec<u8> {
     let mut out = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(&style.indent);

@@ -138,6 +138,17 @@ pub fn check(format: Format, path: &Path, bytes: &[u8]) -> Result<(), PatchError
     }
 }
 
+/// 「原始文件」页的「格式化」：重新排版，不改内容。JSON 一个键一行、缩进照文件原来的；JSONC / JSON5
+/// 注释留在原位。TOML 没有（Codex、Grok Build 的文件本来就一行一个键），返回 `None`。
+/// 解析不了报错（带行列），不动原文。
+pub fn format(format: Format, path: &Path, bytes: &[u8]) -> Option<Result<Vec<u8>, PatchError>> {
+    match format {
+        Format::Json => Some(json::format(path, bytes)),
+        Format::Json5 => Some(json::format_json5(path, bytes)),
+        Format::Toml => None,
+    }
+}
+
 /// 整份写成这些字节：confdeck 自己的文件（Codex 的模型目录），不用保留别的内容。
 pub struct Whole(pub Vec<u8>);
 

@@ -161,7 +161,11 @@ impl MainWindow {
             cx.subscribe(&store, |this, _, notice: &Notice, cx| {
                 this.toast(notice.kind, notice.text.clone(), cx)
             }),
-            cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
+            // 系统切了深浅色：gpui-component 的主题（代码编辑框的底色、行号栏）也跟着切，不然要等下次打开配置页。
+            cx.observe_window_appearance(window, |_, window, cx| {
+                crate::theme::sync_component_theme(&Theme::window(window.appearance()), cx);
+                cx.notify();
+            }),
         ];
         Self {
             store,

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use confdeck_core::agent::{self, AgentKind, FileSetup, Mode, claude, slots};
 use confdeck_core::engine::{LiveFile, Snapshot};
-use confdeck_core::patch::Format;
+use confdeck_core::patch::{self, Format};
 use confdeck_core::provider::{AgentOverride, Model, Protocol, Provider};
 use gpui_kit::component::input::{
     Editor as CodeEditor, EditorState, Input, InputEvent, InputState,
@@ -39,7 +39,8 @@ struct OpenPicker {
 
 /// 刚改过、文件还没写完的值。文件写完重读之前，下拉框先显示它，不然会退回旧值闪一下。
 enum Pending {
-    Slot(&'static str, String),
+    /// `None` 是「留空」：不写这个槽位。
+    Slot(&'static str, Option<String>),
     Default(String),
 }
 
@@ -113,15 +114,31 @@ impl ConfigPage {
         let page = cx.entity().downgrade();
         let window_id = window.window_handle().window_id();
         subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
-            if window.window_handle().window_id() != window_id
-                || event.keystroke.modifiers.modified()
-                || event.keystroke.key != "escape"
-            {
+            if window.window_handle().window_id() != window_id {
                 return;
             }
-            if let Some(page) = page.upgrade()
-                && page.read(cx).menu.is_some()
+            let Some(page) = page.upgrade() else {
+                return;
+            };
+            let keystroke = &event.keystroke;
+            let modifiers = keystroke.modifiers;
+            // ⌥⇧F：格式化打开着的原始文件（和 VS Code 一样的键）。
+            if keystroke.key == "f"
+                && modifiers.alt
+                && modifiers.shift
+                && !modifiers.platform
+                && !modifiers.control
             {
+                if page.read(cx).raw.is_some() {
+                    page.update(cx, |page, cx| page.format_raw(window, cx));
+                    cx.stop_propagation();
+                }
+                return;
+            }
+            if modifiers.modified() || keystroke.key != "escape" {
+                return;
+            }
+            if page.read(cx).menu.is_some() {
                 page.update(cx, |page, cx| {
                     page.menu = None;
                     cx.notify();
@@ -190,19 +207,22 @@ impl ConfigPage {
     }
 
     /// 槽位选了一个模型。目录里没有的先加进目录（decisions「模型」）。
-    fn set_slot(&mut self, key: &'static str, model: String, cx: &mut Context<Self>) {
+    /// 给一个槽位选模型；`None` 是「留空」，覆盖里存空串，这个环境变量就不写（core 的 `agent::slots`）。
+    fn set_slot(&mut self, key: &'static str, model: Option<String>, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
         let (Some(kind), Some(p)) = (self.kind(store), self.single(store)) else {
             return;
         };
         let mut provider = store.providers[p].clone();
-        ensure_model(&mut provider, &model);
+        if let Some(model) = &model {
+            ensure_model(&mut provider, model);
+        }
         provider
             .overrides
             .entry(kind)
             .or_default()
             .slots
-            .insert(key.to_string(), model.clone());
+            .insert(key.to_string(), model.clone().unwrap_or_default());
         self.pending = Some(Pending::Slot(key, model));
         self.menu = None;
         self.save(provider, cx);
@@ -289,7 +309,7 @@ impl ConfigPage {
         }
         self.custom
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.set_slot(key, value, cx);
+        self.set_slot(key, Some(value), cx);
     }
 
     /// 列表卡、多选块底下回车：手填的模型加进目录，也勾上。
@@ -437,7 +457,31 @@ impl ConfigPage {
         cx.notify();
     }
 
-    /// 这个槽位显示什么：刚改的 > 文件里的 > 按目录算出来的。
+    /// 「格式化」（按钮或 ⌥⇧F）：重新排版编辑框里的内容，不写文件；解析不了把错误显示在底栏。
+    fn format_raw(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(raw) = &mut self.raw else {
+            return;
+        };
+        let text = raw.state.read(cx).value().to_string();
+        let Some(result) = patch::format(raw.file.format, &raw.file.path, text.as_bytes()) else {
+            return;
+        };
+        match result {
+            Ok(bytes) => {
+                let formatted = String::from_utf8_lossy(&bytes).into_owned();
+                raw.rows = formatted.lines().count().max(1);
+                raw.error = None;
+                if formatted != text {
+                    raw.state
+                        .update(cx, |state, cx| state.set_value(formatted, window, cx));
+                }
+            }
+            Err(err) => raw.error = Some(err.to_string().into()),
+        }
+        cx.notify();
+    }
+
+    /// 这个槽位显示什么：刚改的 > 文件里的（没有这个键就是留空）> 文件读不到时按目录算的。
     fn slot_value(
         &self,
         provider: &Provider,
@@ -447,10 +491,11 @@ impl ConfigPage {
         if let Some(Pending::Slot(pending, value)) = &self.pending
             && *pending == key
         {
-            return Some(value.clone());
+            return value.clone();
         }
-        if let Some(value) = self.setup.as_ref().and_then(|setup| setup.slots.get(key)) {
-            return Some(value.clone());
+        // 文件读得到就以文件为准：没有这个键就是留空，不拿目录算的顶上。
+        if let Some(setup) = &self.setup {
+            return setup.slots.get(key).cloned();
         }
         let all: Vec<slots::Slot> = claude::SLOTS.iter().map(|(slot, _)| *slot).collect();
         let auto = !provider.is_anthropic_official();
@@ -673,16 +718,40 @@ impl ConfigPage {
         t: &Theme,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let hover = t.sel;
+        // 第一项「留空」：不写这个环境变量，agent 用自己的默认。
         let mut list = div()
             .id("model-menu")
             .v_flex()
             .p(px(5.))
             .max_h(px(260.))
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .id("model-empty")
+                    .h_flex()
+                    .items_center()
+                    .gap(px(9.))
+                    .h(px(32.))
+                    .px(px(8.))
+                    .rounded(px(7.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_slot(key, None, cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.))
+                            .text_color(t.muted)
+                            .child(t!("config.leave_empty")),
+                    )
+                    .when(current.is_none(), |row| {
+                        row.child(ui::icon("check", 13., t.accent))
+                    }),
+            );
         for (n, model) in provider.models.iter().enumerate() {
             let id = model.id.clone();
             let on = current == Some(model.id.as_str());
-            let hover = t.sel;
             list = list.child(
                 div()
                     .id(ElementId::named_usize("model-option", n))
@@ -694,7 +763,9 @@ impl ConfigPage {
                     .rounded(px(7.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_slot(key, id.clone(), cx)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.set_slot(key, Some(id.clone()), cx)),
+                    )
                     .child(
                         div()
                             .flex_none()
@@ -1054,6 +1125,7 @@ impl ConfigPage {
         };
         let height = (raw.rows as f32 * 20. + 16.).clamp(120., 380.);
         let error = raw.error.clone();
+        let formattable = raw.file.format != Format::Toml;
         ui::list(t, false)
             .child(title)
             .child(
@@ -1080,6 +1152,16 @@ impl ConfigPage {
                     .gap(px(8.))
                     .h(px(54.))
                     .px(px(14.))
+                    .when(formattable, |row| {
+                        row.child(
+                            ui::text_button("raw-format", t)
+                                .tooltip(ui::tooltip("⌥⇧F"))
+                                .child(t!("config.format"))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.format_raw(window, cx)),
+                                ),
+                        )
+                    })
                     .child(match error {
                         Some(error) => div()
                             .flex_1()

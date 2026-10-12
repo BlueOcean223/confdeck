@@ -413,6 +413,16 @@ write:
   file_saved:
     en: "Saved %{file}"
     zh-CN: "已保存 %{file}"
+  # 设置 › 备份：恢复了一份、清理了几份。
+  file_restored:
+    en: "Restored %{file}"
+    zh-CN: "已恢复 %{file}"
+  cleaned_one:
+    en: "Removed 1 backup"
+    zh-CN: "清理了 1 份"
+  cleaned_other:
+    en: "Removed %{count} backups"
+    zh-CN: "清理了 %{count} 份"
   codex_catalog_skipped:
     en: "Codex model catalog not written (%{reason}): /model still lists GPT models and this provider's models get a 272K window"
     zh-CN: "Codex 的模型目录没写成（%{reason}）：/model 列的还是 GPT 模型，这家的模型按 272K 窗口算"
@@ -510,12 +520,20 @@ config:
   protocol:
     en: Protocol
     zh-CN: 接口
+  # 槽位下拉框的第一项：不写这个环境变量（用户 10-12：模型不是必填的）。
+  leave_empty:
+    en: None
+    zh-CN: 留空
   raw_file:
     en: Raw file
     zh-CN: 原始文件
   open:
     en: Open
     zh-CN: 打开
+  # 原始文件编辑框的「格式化」（⌥⇧F）。
+  format:
+    en: Format
+    zh-CN: 格式化
 
 # 设置页（顶栏的齿轮）：设一次就不动的开关，按 agent 分组，现在只有 Claude Code 一组（decisions「配置页」）。
 settings:
@@ -530,7 +548,57 @@ settings:
   vscode_follows:
     en: Switch the VS Code extension too
     zh-CN: VS Code 插件跟着切换
-  # settings.json 的 includeCoAuthoredBy：提交里的「Co-Authored-By: Claude」。
+  # settings.json 的 includeCoAuthoredBy：开着提交里带「Co-Authored-By: Claude」（用户 10-12：要说清是保留还是去掉）。
   attribution:
-    en: Co-authored-by in commits
-    zh-CN: 提交署名
+    en: Credit Claude in commits
+    zh-CN: 提交带 Claude 署名
+  # 设置 › 备份（decisions「备份」）。
+  backups:
+    en: Backups
+    zh-CN: 备份
+  no_backups:
+    en: No backups yet
+    zh-CN: 还没有备份
+  count_one:
+    en: 1 backup
+    zh-CN: 1 份
+  count_other:
+    en: "%{count} backups"
+    zh-CN: "%{count} 份"
+  diff:
+    en: Diff
+    zh-CN: 差异
+  restore:
+    en: Restore
+    zh-CN: 恢复
+  # 删掉原件以外的备份。
+  clean:
+    en: Clean up
+    zh-CN: 清理
+  same_as_now:
+    en: Same as now
+    zh-CN: 和现在一样
+  skipped_one:
+    en: "⋯ 1 line"
+    zh-CN: "⋯ 1 行"
+  skipped_other:
+    en: "⋯ %{count} lines"
+    zh-CN: "⋯ %{count} 行"
+
+# 备份的原因（core 的 backup::Reason，文件名里是英文词）。
+backup:
+  original:
+    en: Original
+    zh-CN: 原件
+  external:
+    en: Changed outside
+    zh-CN: 外部改过
+  before_edit:
+    en: Before editing
+    zh-CN: 手改前
+  before_restore:
+    en: Before restoring
+    zh-CN: 恢复前
+  before_save:
+    en: Before saving
+    zh-CN: 保存前

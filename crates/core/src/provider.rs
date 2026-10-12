@@ -214,7 +214,8 @@ impl Provider {
                 .iter()
                 .flatten()
                 .chain(&overrides.default_model)
-                .chain(overrides.slots.values());
+                // 槽位填成空串是「留空」（`agent::slots`），不指向模型。
+                .chain(overrides.slots.values().filter(|id| !id.is_empty()));
             for model in referenced {
                 if self.model(model).is_none() {
                     return Err(ProviderError::UnknownModel {
@@ -460,5 +461,16 @@ pub(crate) mod tests {
                 model: "gpt-5".into(),
             })
         );
+
+        // 空串是「留空」，不算模型。
+        let mut provider = relay();
+        provider.overrides.insert(
+            AgentKind::ClaudeCode,
+            AgentOverride {
+                slots: BTreeMap::from([("haiku".into(), String::new())]),
+                ..AgentOverride::default()
+            },
+        );
+        assert_eq!(provider.validate(), Ok(()));
     }
 }

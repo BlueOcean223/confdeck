@@ -1,7 +1,8 @@
 //! 槽位型 agent（Claude Code 等）怎么从目录里给每个槽位挑模型。
 //!
 //! 用户填的 > 预设推荐的 > 全填这家的默认模型（[`Provider::default_or_first`]）。
-//! 推荐的模型不在目录里了就当没推荐。
+//! 推荐的模型不在目录里了就当没推荐。用户填成空串的槽位是「留空」：不写，agent 用它自己的默认
+//! （用户 10-12 定的：槽位不是必填的）。
 
 use std::collections::BTreeMap;
 
@@ -47,6 +48,8 @@ pub fn fill<'a>(
     let mut filled = Vec::new();
     for &slot in slots {
         let model = match chosen.get(slot.key) {
+            // 留空：不写这个槽位。
+            Some(id) if id.is_empty() => continue,
             Some(id) => provider.model(id).ok_or_else(|| AdaptError::UnknownModel {
                 provider: provider.name.clone(),
                 model: id.clone(),
@@ -133,6 +136,22 @@ mod tests {
             fill(&provider, AgentKind::ClaudeCode, SLOTS, true),
             Err(AdaptError::UnknownSlot { .. })
         ));
+    }
+
+    #[test]
+    fn an_empty_choice_leaves_the_slot_out() {
+        let mut provider = relay();
+        provider.overrides.insert(
+            AgentKind::ClaudeCode,
+            AgentOverride {
+                slots: BTreeMap::from([("haiku".into(), String::new())]),
+                ..AgentOverride::default()
+            },
+        );
+        let filled = fill(&provider, AgentKind::ClaudeCode, SLOTS, true).unwrap();
+        assert_eq!(ids(&filled), [("main", "glm-4.6".into())]);
+        let filled = fill(&provider, AgentKind::ClaudeCode, SLOTS, false).unwrap();
+        assert!(filled.is_empty());
     }
 
     #[test]
