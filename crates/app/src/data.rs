@@ -1013,8 +1013,8 @@ impl Store {
                 // 官方登录写成一家供应商（「Anthropic 官方」，厂商的图标）；存过几个官方账号时写现在登的是哪个。
                 _ => {
                     let logo = crate::official::logo(self, index);
-                    match self.live_email(index) {
-                        Some(email) => (vec![logo], email.into()),
+                    match self.live_label(index) {
+                        Some(label) => (vec![logo], label.into()),
                         None => (vec![logo], crate::official::name(agent.kind)),
                     }
                 }

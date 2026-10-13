@@ -16,7 +16,6 @@
 
 use std::time::Duration;
 
-use confdeck_core::account::{self, Live};
 use confdeck_core::agent::{Connection, Credential, Mode};
 use confdeck_core::current::Current;
 use confdeck_core::provider::Provider;
@@ -80,6 +79,8 @@ enum Pick {
 struct Choice {
     /// 存下的账号的 ID；登录文件里还没存的账号是 `None`（选它就是「默认」）。
     id: Option<String>,
+    /// 用户起的名字；没起是 `None`，只写邮箱。
+    name: Option<SharedString>,
     email: SharedString,
     plan: Option<SharedString>,
     /// 登录文件现在是它。
@@ -256,38 +257,31 @@ impl Picker {
         picker
     }
 
-    /// 存过官方账号时，「默认」展开成存下的账号，加上登录文件里还没存的那个。
+    /// 存过官方账号时，「默认」展开成存下的账号，加上登录文件里还没存的那个（和供应商页官方那一组一样）。
     fn accounts(store: &Store, agent: usize) -> Vec<Choice> {
         let kind = store.agents[agent].kind;
-        let stored = store.accounts_of(kind);
-        if stored.is_empty() || !account::supported(kind) || store.account_blocked(kind) {
+        if store.accounts_of(kind).is_empty() {
             return Vec::new();
         }
-        let live = store.live_account(kind);
-        let plan =
-            |plan: Option<&String>| plan.map(|plan| SharedString::from(ui::capitalize(plan)));
-        let mut choices: Vec<Choice> = stored
-            .iter()
-            .map(|account| Choice {
-                id: Some(account.id.clone()),
-                email: account
+        store
+            .official_entries(agent)
+            .into_iter()
+            .map(|entry| Choice {
+                id: if entry.stored { entry.id.clone() } else { None },
+                name: entry.name.clone().map(SharedString::from),
+                email: entry
                     .email
                     .clone()
-                    .unwrap_or_else(|| account.id.clone())
+                    .or_else(|| entry.id.clone())
+                    .unwrap_or_default()
                     .into(),
-                plan: plan(account.plan.as_ref()),
-                live: matches!(live, Some(Live::Known(id)) if *id == account.id),
+                plan: entry
+                    .plan
+                    .as_deref()
+                    .map(|plan| SharedString::from(ui::capitalize(plan))),
+                live: entry.live,
             })
-            .collect();
-        if let Some(Live::Unknown(identity)) = live {
-            choices.push(Choice {
-                id: None,
-                email: identity.email.clone().unwrap_or_default().into(),
-                plan: plan(identity.plan.as_ref()),
-                live: true,
-            });
-        }
-        choices
+            .collect()
     }
 
     /// 「现在」那组：文件连的不是 confdeck 列表里的哪家时才有。
@@ -378,7 +372,12 @@ impl Picker {
                 .collect()
         } else {
             (0..self.accounts.len())
-                .filter(|&i| default_keywords || matches(&self.accounts[i].email))
+                .filter(|&i| {
+                    let choice = &self.accounts[i];
+                    default_keywords
+                        || matches(&choice.email)
+                        || choice.name.as_deref().is_some_and(&matches)
+                })
                 .map(Row::Account)
                 .collect()
         };
@@ -667,8 +666,17 @@ impl Picker {
                             .min_w_0()
                             .truncate()
                             .text_size(px(12.5))
-                            .child(choice.email.clone()),
+                            .child(choice.name.clone().unwrap_or_else(|| choice.email.clone())),
                     )
+                    // 起了名字时邮箱写在后面的小字里。
+                    .children(choice.name.as_ref().map(|_| {
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(t.muted)
+                            .child(choice.email.clone())
+                    }))
                     .children(choice.plan.clone().map(|plan| {
                         div()
                             .flex_none()

@@ -3,7 +3,8 @@
 //!
 //! - 每次 `Store::reload` 都 `sync` 一遍：登录文件是存过的账号，就把 agent 新换的令牌存回去。
 //! - 加账号：在后台跑 agent 自己的 `login` 命令（家目录指到临时目录），它自己开浏览器；登录完存下来。
-//! - 选择器或官方卡片里选一个账号：这个 agent 不在「默认」就先切回默认，再换登录文件。
+//! - 选择器或供应商页上选一个账号：这个 agent 不在「默认」就先切回默认，再换登录文件。
+//! - 账号的名字和备注（提案 13）只存在 confdeck 的 `accounts.json`。
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -103,22 +104,42 @@ impl Store {
         self.accounts.logins.get(&kind)
     }
 
-    /// 胶囊上写的账号：这个 agent 用着官方登录、存过账号时，写登录文件里的邮箱。
-    pub fn live_email(&self, agent: usize) -> Option<String> {
+    /// 胶囊上写的账号：这个 agent 用着官方登录、存过账号时，写登录文件里那个账号的名字，没起名字写邮箱。
+    pub fn live_label(&self, agent: usize) -> Option<String> {
         let kind = self.agents[agent].kind;
         if self.accounts_of(kind).is_empty() {
             return None;
         }
         match self.live_account(kind)? {
-            Live::Known(id) => self
-                .accounts
-                .list
-                .iter()
-                .find(|account| account.agent == kind && &account.id == id)?
-                .email
-                .clone(),
+            Live::Known(id) => {
+                let account = self
+                    .accounts
+                    .list
+                    .iter()
+                    .find(|account| account.agent == kind && &account.id == id)?;
+                account.name.clone().or_else(|| account.email.clone())
+            }
             Live::Unknown(identity) => identity.email.clone(),
             Live::LoggedOut => None,
+        }
+    }
+
+    /// 给账号起名字、写备注（空的就是去掉）。登录文件里还没存的那个先存下。
+    pub fn label_account(
+        &mut self,
+        kind: AgentKind,
+        id: &str,
+        name: &str,
+        note: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let result = account::label(&self.engine, &self.home, kind, id, name, note);
+        self.reload();
+        if let Err(err) = result {
+            let notice = Notice::err(describe(&err));
+            self.announce(&[notice], cx);
+        } else {
+            cx.notify();
         }
     }
 
@@ -243,7 +264,7 @@ impl Store {
             .list
             .iter()
             .find(|account| account.agent == kind && account.id == id)
-            .and_then(|account| account.email.clone())
+            .and_then(|account| account.name.clone().or_else(|| account.email.clone()))
             .unwrap_or_else(|| id.clone());
         let unchanged = !to_default
             && matches!(self.live_account(kind), Some(Live::Known(live)) if *live == id);

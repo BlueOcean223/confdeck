@@ -14,7 +14,7 @@ use crate::config_page::{self, ConfigEvent, ConfigPage};
 use crate::data::{self, Notice, NoticeKind, Store};
 use crate::editor::{Editor, EditorEvent};
 use crate::net;
-use crate::official::{self, OfficialCard, OfficialEvent};
+use crate::official::{self, Officials};
 use crate::picker::{Picker, PickerEvent};
 use crate::quota_view;
 use crate::sessions_page::SessionsPage;
@@ -140,12 +140,8 @@ struct OpenConfig {
     _subscription: Subscription,
 }
 
-/// 盖在页面上的弹层：添加供应商的卡片表、一家供应商的编辑器，或一张官方卡片。
+/// 盖在页面上的弹层：添加供应商的卡片表，或一家供应商的编辑器。
 enum Overlay {
-    Official {
-        card: Entity<OfficialCard>,
-        _subscription: Subscription,
-    },
     Add {
         sheet: Entity<AddProvider>,
         _subscription: Subscription,
@@ -176,6 +172,8 @@ pub struct MainWindow {
     usage: Option<Entity<UsagePage>>,
     sessions: Option<Entity<SessionsPage>>,
     overlay: Option<Overlay>,
+    /// 供应商页最上面官方那一组（账号摊在里面）。
+    officials: Entity<Officials>,
     toasts: Vec<Toast>,
     toast_seq: u64,
     /// 刚被「点外面」关掉的选择器。点的正好是它的下拉框时，不要立刻再打开。
@@ -204,6 +202,7 @@ impl MainWindow {
                 cx.notify();
             }),
         ];
+        let officials = cx.new(|cx| Officials::new(store.clone(), window, cx));
         Self {
             store,
             tab: Tab::Agents,
@@ -213,6 +212,7 @@ impl MainWindow {
             usage: None,
             sessions: None,
             overlay: None,
+            officials,
             toasts: Vec::new(),
             toast_seq: 0,
             just_closed: None,
@@ -700,12 +700,7 @@ impl MainWindow {
                 .any(|p| store.provider_reading(p).is_some());
 
         if !officials.is_empty() {
-            let mut list = ui::list(t, false);
-            for (n, &agent) in officials.iter().enumerate() {
-                list =
-                    list.child(self.official_row(agent, n, officials.len(), store, t, window, cx));
-            }
-            page = page.child(list);
+            page = page.child(self.officials.clone());
         }
 
         if store.providers.is_empty() {
@@ -782,7 +777,7 @@ impl MainWindow {
                     }))
                     .child(ui::logo(data::logo(provider), 22., t, window, cx))
                     .child(
-                        name_column(meters)
+                        official::name_column(meters)
                             .child(
                                 div()
                                     .font_weight(FontWeight::MEDIUM)
@@ -821,7 +816,7 @@ impl MainWindow {
                                         Some(model) => format!("{} · {model}", agent.name),
                                         None => agent.name.to_string(),
                                     };
-                                    user_chip(
+                                    official::user_chip(
                                         t,
                                         format!("user-{i}-{a}"),
                                         agent.logo,
@@ -841,110 +836,6 @@ impl MainWindow {
         page.child(list)
     }
 
-    /// 供应商页上的一张官方卡片：厂商的图标、「Anthropic 官方」，下面是哪个 agent 和登着的账号；额度；在用就画 agent 的小图标；
-    /// 套餐。点开是账号和各自的额度（[`OfficialCard`]）。
-    #[allow(clippy::too_many_arguments)]
-    fn official_row(
-        &self,
-        agent: usize,
-        n: usize,
-        count: usize,
-        store: &Store,
-        t: &Theme,
-        window: &Window,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        let row = &store.agents[agent];
-        let reading = store.official_reading(row.kind);
-        let signed_out = matches!(
-            reading,
-            Some(quota_view::Reading::QuotaFailed(
-                confdeck_core::quota::QuotaError::NotLoggedIn
-            ))
-        );
-        let account = match store.official_email(agent) {
-            Some(email) => Some(email),
-            None if signed_out => Some(t!("quota.signed_out").to_string()),
-            None => None,
-        };
-        let sub: SharedString = match account {
-            Some(account) => format!("{} · {account}", row.name).into(),
-            None => row.name.into(),
-        };
-        let hover_bg = t.card_2;
-        ui::row(t, false, n == 0)
-            .id(ElementId::named_usize("official", agent))
-            .when(n == 0, |r| r.rounded_t(px(11.)))
-            .when(n + 1 == count, |r| r.rounded_b(px(11.)))
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover_bg))
-            .on_click(cx.listener(move |this, _, _, cx| this.open_official(agent, cx)))
-            .child(ui::logo(official::logo(store, agent), 22., t, window, cx))
-            .child(
-                name_column(true)
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(official::name(row.kind)),
-                    )
-                    .child(
-                        div()
-                            .mt(px(1.))
-                            .text_size(px(11.5))
-                            .text_color(t.muted)
-                            .truncate()
-                            .child(sub),
-                    ),
-            )
-            .child(match &reading {
-                Some(reading) => quota_view::cells(t, &format!("official-{agent}"), reading),
-                None => quota_view::blank(),
-            })
-            .child(div().flex_1())
-            .when(store.uses_official(agent), |r| {
-                r.child(div().mr(px(6.)).child(user_chip(
-                    t,
-                    format!("official-user-{agent}"),
-                    row.logo,
-                    row.name.to_string(),
-                    window,
-                    cx,
-                )))
-            })
-            .children(store.official_plan(agent).map(|plan| {
-                div()
-                    .flex_none()
-                    .h(px(22.))
-                    .px(px(8.))
-                    .rounded(px(6.))
-                    .flex()
-                    .items_center()
-                    .text_size(px(11.5))
-                    .text_color(t.fg_2)
-                    .bg(t.pill)
-                    .child(ui::capitalize(&plan))
-            }))
-            .child(ui::icon("chevron-right", 13., t.faint).ml(px(4.)))
-    }
-
-    /// 点了供应商页上的一张官方卡片：盖上它的账号和额度。
-    fn open_official(&mut self, agent: usize, cx: &mut Context<Self>) {
-        let store = self.store.clone();
-        let card = cx.new(|cx| OfficialCard::new(store, agent, cx));
-        let _subscription = cx.subscribe(&card, |this, _, event: &OfficialEvent, cx| match event {
-            OfficialEvent::Closed => {
-                this.overlay = None;
-                cx.notify();
-            }
-        });
-        self.overlay = Some(Overlay::Official {
-            card,
-            _subscription,
-        });
-        cx.notify();
-    }
-
     fn open_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.clone();
         let sheet = cx.new(|cx| AddProvider::new(store, window, cx));
@@ -958,8 +849,12 @@ impl MainWindow {
                     let editor = cx.new(|cx| Editor::create(store, preset, window, cx));
                     this.show_editor(editor, None, cx);
                 }
-                // 账号登录：换成这个 agent 的官方卡片。不起登录，账号跟着 agent 自己的登录走。
-                AddEvent::Official(agent) => this.open_official(*agent, cx),
+                // 账号登录：关掉卡片表，回到页面最上面官方那一组。不起登录，账号跟着 agent 自己的登录走。
+                AddEvent::Official => {
+                    this.overlay = None;
+                    this.page_scroll.set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                }
                 AddEvent::Closed => {
                     this.overlay = None;
                     cx.notify();
@@ -1100,9 +995,6 @@ impl MainWindow {
     /// 点弹层外面：编辑器有改动会先问，卡片表直接关。
     fn close_overlay(&mut self, cx: &mut Context<Self>) {
         match &self.overlay {
-            Some(Overlay::Official { card, .. }) => {
-                card.update(cx, |card, cx| card.request_close(cx));
-            }
             Some(Overlay::Edit { editor, .. }) => {
                 editor.update(cx, |editor, cx| editor.request_close(cx));
             }
@@ -1116,7 +1008,6 @@ impl MainWindow {
 
     fn overlay_layer(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let content: AnyElement = match self.overlay.as_ref()? {
-            Overlay::Official { card, .. } => card.clone().into_any_element(),
             Overlay::Add { sheet, .. } => sheet.clone().into_any_element(),
             Overlay::Edit { editor, .. } => editor.clone().into_any_element(),
         };
@@ -1235,40 +1126,6 @@ impl MainWindow {
                 .child(div().text_color(t.muted).child(t!("placeholder.not_built"))),
         )
     }
-}
-
-/// 供应商页一行的名字那一列：有额度一列时定宽（窄窗口里可以收），没有时占满。
-fn name_column(meters: bool) -> Div {
-    let column = div().v_flex().min_w_0();
-    if meters {
-        column.w(px(220.)).flex_shrink(1.)
-    } else {
-        column.flex_1()
-    }
-}
-
-/// 在用这家的 agent：一个带边框的小图标，悬停说是谁。
-fn user_chip(
-    t: &Theme,
-    id: String,
-    logo: data::Logo,
-    tip: String,
-    window: &Window,
-    cx: &App,
-) -> Stateful<Div> {
-    div()
-        .id(ElementId::Name(id.into()))
-        .flex_none()
-        .size(px(20.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(5.))
-        .bg(t.card_2)
-        .border_1()
-        .border_color(t.line_2)
-        .tooltip(ui::tooltip(tip))
-        .child(ui::logo(logo, 13., t, window, cx))
 }
 
 impl Render for MainWindow {

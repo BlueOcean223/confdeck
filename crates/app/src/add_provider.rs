@@ -1,6 +1,6 @@
 //! 添加供应商的预设卡片表（提案 10 第三节）：最上面一张「自定义」，下面分账号登录 / 模型厂商 / 第三方平台，带搜索。
 //! 加过的打勾，再点是「再加一家」（同一家的另一个 Key）。选一张预设就交给编辑器，只要填 Key；
-//! 选账号登录就打开那个 agent 的官方卡片，不起登录（10-13 用户定的顺序和做法）。
+//! 选账号登录就关掉卡片表、回到供应商页最上面官方那一组，不起登录（10-13 用户定的顺序和做法）。
 
 use confdeck_core::preset::{self, Preset};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -17,8 +17,8 @@ use crate::ui;
 pub enum AddEvent {
     /// 选了一张预设卡；`None` 是自定义。
     Chosen(Option<&'static Preset>),
-    /// 打开这个 agent 的官方卡片。
-    Official(usize),
+    /// 选了账号登录的一张：回到官方那一组。
+    Official,
     Closed,
 }
 
@@ -244,7 +244,7 @@ impl AddProvider {
         Some(grid(cards))
     }
 
-    /// 账号登录：装了的、有官方登录的 agent（Claude Code、Codex、Grok Build）各一张。点了打开它的官方卡片，
+    /// 账号登录：装了的、有官方登录的 agent（Claude Code、Codex、Grok Build）各一张。点了回到供应商页官方那一组，
     /// 不起登录：账号跟着 agent 自己的登录走（10-13 用户说的：在官方应用里登录才放心）。
     fn logins(
         &self,
@@ -290,7 +290,7 @@ impl AddProvider {
                     window,
                     cx,
                 )
-                .on_click(cx.listener(move |_, _, _, cx| cx.emit(AddEvent::Official(agent))))
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(AddEvent::Official)))
             })
             .collect();
         Some(grid(cards))
@@ -313,12 +313,7 @@ fn part(title: SharedString, t: &Theme, body: Div) -> Div {
     div()
         .v_flex()
         .gap(px(6.))
-        .child(
-            div()
-                .text_size(px(10.5))
-                .text_color(t.faint)
-                .child(title),
-        )
+        .child(div().text_size(px(10.5)).text_color(t.faint).child(title))
         .child(body)
 }
 

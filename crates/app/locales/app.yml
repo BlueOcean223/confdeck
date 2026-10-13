@@ -1119,8 +1119,23 @@ accounts:
   add:
     en: Add account
     zh-CN: 添加账号
+  # 供应商页官方那一组的小标题：「Grok Build · 2 个账号」。
+  count:
+    en: "%{count} accounts"
+    zh-CN: "%{count} 个账号"
+  # 「⋯」菜单里：改名字和备注。
+  edit:
+    en: Edit
+    zh-CN: 编辑
+  # 名字输入框的占位（没有邮箱时）。
+  name_hint:
+    en: Name
+    zh-CN: 名字
+  note_hint:
+    en: Note
+    zh-CN: 备注
   logging_in:
-    en: Sign in in your browser…
+    en: Waiting for browser sign-in…
     zh-CN: 在浏览器里登录…
   open_login:
     en: Open sign-in page

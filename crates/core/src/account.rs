@@ -9,6 +9,7 @@
 //! - **认账号**（[`identify`]）：Codex 看 `id_token` 里的用户和工作区（同一个人的个人、团队工作区算两个），
 //!   Grok 看 `user_id` 和 `team_id`。账号 ID 是这两样的 hash。
 //! - **不换令牌**：confdeck 不用刷新令牌（同「订阅额度」）。存着不用的账号放久了令牌可能失效，到时候重新登录。
+//! - **名字和备注**（[`label`]，10-13 提案 13）：用户自己起的，只存在 `accounts.json`，不碰登录文件。
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
@@ -47,7 +48,18 @@ pub struct Account {
     pub plan: Option<String>,
     /// 第一次存下的时间（毫秒）。
     pub added: i64,
+    /// 用户起的名字（「工作号」），界面上替换邮箱。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 一段备注，悬停看。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
+
+/// 名字最长几个字。
+pub const NAME_MAX: usize = 24;
+/// 备注最长几个字。
+pub const NOTE_MAX: usize = 200;
 
 /// 一个登录文件是谁的。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +354,8 @@ fn keep(
                 email: identity.email.clone(),
                 plan: identity.plan.clone(),
                 added: chrono::Utc::now().timestamp_millis(),
+                name: None,
+                note: None,
             });
             changed = true;
         }
@@ -458,6 +472,50 @@ pub fn add(
         .into_iter()
         .find(|account| account.agent == kind && account.id == identity.id)
         .ok_or(AccountError::Missing)
+}
+
+/// 给账号起名字、写备注；空的就是去掉。登录文件里还没存的那个先存下（名字要有地方放）。
+pub fn label(
+    engine: &Engine,
+    home: &Path,
+    kind: AgentKind,
+    id: &str,
+    name: &str,
+    note: &str,
+) -> Result<Account, AccountError> {
+    let data = engine.data();
+    let _lock = engine.lock()?;
+    let mut book = load(data)?;
+    if !book
+        .accounts
+        .iter()
+        .any(|account| account.agent == kind && account.id == id)
+    {
+        let file = login_file(home, kind).ok_or(AccountError::Unsupported)?;
+        let bytes = fsx::read_optional(&file.path)
+            .map_err(io_error(&file.path))?
+            .ok_or(AccountError::Missing)?;
+        let identity = identify(kind, &bytes).ok_or(AccountError::Missing)?;
+        if identity.id != id {
+            return Err(AccountError::Missing);
+        }
+        keep(data, kind, &identity, &bytes, Keep::Any)?;
+        book = load(data)?;
+    }
+    let account = book
+        .accounts
+        .iter_mut()
+        .find(|account| account.agent == kind && account.id == id)
+        .ok_or(AccountError::Missing)?;
+    let clip = |text: &str, max: usize| {
+        let text: String = text.trim().chars().take(max).collect();
+        (!text.is_empty()).then_some(text)
+    };
+    account.name = clip(name, NAME_MAX);
+    account.note = clip(note, NOTE_MAX);
+    let account = account.clone();
+    save(data, &book)?;
+    Ok(account)
 }
 
 /// 删掉一个存下的账号。agent 的登录文件不动：正在用的账号删了也还登着。
@@ -857,6 +915,47 @@ mod tests {
         ));
         assert!(matches!(
             switch(&s.engine, &s.home, AgentKind::Codex, "nope"),
+            Err(AccountError::Missing)
+        ));
+    }
+
+    #[test]
+    fn labels_stay_in_the_book() {
+        let s = setup();
+        let alice = codex_auth("alice", "ws", 0);
+        let id = id_of(&alice);
+        // 登着、还没存的账号：起名字时先存下。
+        s.set_auth(&alice);
+        let named = label(
+            &s.engine,
+            &s.home,
+            AgentKind::Codex,
+            &id,
+            " 工作号 ",
+            "11 月到期",
+        )
+        .unwrap();
+        assert_eq!(named.name.as_deref(), Some("工作号"));
+        assert_eq!(named.note.as_deref(), Some("11 月到期"));
+        assert_eq!(s.stored(&id), alice);
+        assert_eq!(s.auth().unwrap(), alice);
+        // 再登录一次、换令牌，名字不丢。
+        add(
+            &s.engine,
+            &s.home,
+            AgentKind::Codex,
+            &codex_auth("alice", "ws", 1),
+        )
+        .unwrap();
+        let book = list(s.engine.data()).unwrap();
+        assert_eq!(book[0].name.as_deref(), Some("工作号"));
+        // 清空就是去掉；太长的截断。
+        let long = "名".repeat(NAME_MAX + 5);
+        let cleared = label(&s.engine, &s.home, AgentKind::Codex, &id, &long, "  ").unwrap();
+        assert_eq!(cleared.name.unwrap().chars().count(), NAME_MAX);
+        assert_eq!(cleared.note, None);
+        assert!(matches!(
+            label(&s.engine, &s.home, AgentKind::Codex, "nope", "x", ""),
             Err(AccountError::Missing)
         ));
     }
