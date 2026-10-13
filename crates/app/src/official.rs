@@ -574,11 +574,10 @@ impl Officials {
             .child(t!("accounts.use"))
             .on_click(cx.listener(move |this, _, _, cx| {
                 // 没存的就是登录文件里那个：切到官方登录就是用它。
-                let write = match use_id.clone() {
+                match use_id.clone() {
                     Some(id) => this.store.update(cx, |s, cx| s.use_account(agent, id, cx)),
                     None => this.store.update(cx, |s, cx| s.switch(agent, None, cx)),
                 };
-                write.detach();
             }))
             .into_any_element()
         };

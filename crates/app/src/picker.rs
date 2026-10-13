@@ -14,6 +14,7 @@
 //! 打开就能直接打字过滤；上下键移动高亮、回车选定（多选时是勾 / 取消）、Esc 关闭；鼠标悬停也会移动高亮。
 //! 多选时过滤框是空的，空格也能勾 / 取消；有过滤词时空格照常输入（供应商名里有空格）。
 
+use std::rc::Rc;
 use std::time::Duration;
 
 use confdeck_core::agent::{Connection, Credential, Mode};
@@ -25,26 +26,21 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::{self, Logo, Store, Unusable};
+use crate::data::{self, Logo, Notice, Store, Unusable};
 use crate::theme::Theme;
 use crate::ui;
+use crate::write::Written;
 
+/// 选了一项就写（调 Store 的写操作），写的事不用开着它的窗口管；多选 agent 勾一下写一次，浮层不关。
 pub enum PickerEvent {
-    /// 单选 agent 选了一项：`None` 是「默认」，交还给 agent 自带的登录。
-    Picked(Option<usize>),
-    /// 多选 agent 勾上或取消了一家，浮层不关。
-    Toggled(usize),
-    /// 「Key 不一致」：把配置文件里的 Key 存进这家（供应商下标）。
-    AdoptKey {
-        provider: usize,
-        key: String,
-    },
     /// 「自定义」：把配置文件里的连接存成一家新供应商，打开预先填好的新建表单。
     SaveAs(Provider),
-    /// 选了一个存下的官方账号（账号 ID）。
-    Account(String),
-    Dismissed,
+    /// 选好了（已经开始写）或者 Esc：关掉。
+    Closed,
 }
+
+/// 写完以后拿到头一句提示的（[`Picker::report_to`]）。
+type OnReport = dyn Fn(Option<Notice>, &mut App);
 
 /// 「现在」那组里的动作行。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -151,6 +147,8 @@ pub struct Picker {
     /// 高亮的是 `rows()` 里第几行，只会落在选得了的行上。
     highlighted: usize,
     scroll: ScrollHandle,
+    /// 写完把头一句交给谁（面板写在底栏）。主窗口不用：它订阅了 Store 的提示。
+    on_report: Option<Rc<OnReport>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -233,6 +231,7 @@ impl Picker {
             input,
             highlighted: 0,
             scroll: ScrollHandle::new(),
+            on_report: None,
             _subscriptions,
         };
         // 单选时高亮现在用的那家；没有在用的（默认、自定义、多选）高亮第一个选得了的行。
@@ -475,29 +474,63 @@ impl Picker {
         from
     }
 
+    /// 写完把头一句交给 `on_report`（面板写在底栏）。
+    pub fn report_to(mut self, on_report: impl Fn(Option<Notice>, &mut App) + 'static) -> Self {
+        self.on_report = Some(Rc::new(on_report));
+        self
+    }
+
     fn activate(&mut self, pick: Pick, cx: &mut Context<Self>) {
+        let agent = self.agent;
         match pick {
             Pick::Option(option) => match (self.multi, option) {
-                (true, Some(p)) => cx.emit(PickerEvent::Toggled(p)),
-                (true, None) => {}
-                (false, option) => cx.emit(PickerEvent::Picked(option)),
-            },
-            Pick::Account(i) => match &self.accounts[i].id {
-                Some(id) => cx.emit(PickerEvent::Account(id.clone())),
-                None => cx.emit(PickerEvent::Picked(None)),
-            },
-            Pick::Action(Action::Rewrite(p)) => cx.emit(PickerEvent::Picked(Some(p))),
-            Pick::Action(Action::AdoptKey(provider)) => {
-                if let Some(key) = self.now.as_ref().and_then(|now| now.key.clone()) {
-                    cx.emit(PickerEvent::AdoptKey { provider, key });
+                (true, Some(p)) => {
+                    self.write(cx, |s, cx| s.toggle(agent, p, cx));
+                    return;
                 }
+                (true, None) => return,
+                (false, option) => self.write(cx, |s, cx| s.switch(agent, option, cx)),
+            },
+            Pick::Account(i) => match self.accounts[i].id.clone() {
+                Some(id) => self.write(cx, |s, cx| s.use_account(agent, id, cx)),
+                None => self.write(cx, |s, cx| s.switch(agent, None, cx)),
+            },
+            Pick::Action(Action::Rewrite(p)) => {
+                self.write(cx, |s, cx| s.switch(agent, Some(p), cx))
+            }
+            Pick::Action(Action::AdoptKey(provider)) => {
+                let Some(key) = self.now.as_ref().and_then(|now| now.key.clone()) else {
+                    return;
+                };
+                self.write(cx, |s, cx| s.adopt_key(agent, provider, key, cx));
             }
             Pick::Action(Action::SaveAs) => {
                 if let Some(draft) = self.now.as_ref().and_then(|now| now.draft.clone()) {
                     cx.emit(PickerEvent::SaveAs(draft));
                 }
+                return;
             }
         }
+        cx.emit(PickerEvent::Closed);
+    }
+
+    fn write(
+        &self,
+        cx: &mut Context<Self>,
+        op: impl FnOnce(&mut Store, &mut Context<Store>) -> Written,
+    ) {
+        let written = self.store.update(cx, op);
+        let Some(on_report) = self.on_report.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            let first = written
+                .report()
+                .await
+                .and_then(|report| report.notices().into_iter().next());
+            cx.update(|cx| on_report(first, cx));
+        })
+        .detach();
     }
 
     fn handle_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
@@ -518,7 +551,7 @@ impl Picker {
                 return true;
             }
             "escape" => {
-                cx.emit(PickerEvent::Dismissed);
+                cx.emit(PickerEvent::Closed);
                 return true;
             }
             _ => return false,

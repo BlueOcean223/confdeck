@@ -8,14 +8,15 @@
 //! - 「接口」右边「测速」：按表单里现在的地址测（还没存也行），结果写在「协议」那行每个协议后面，展开时在每个地址框的右边。
 //! - 「模型目录」右边「拉取」：从这家的接口拉模型列表，弹一层勾要加的（目录里已有的勾着、灰着），补好参数加进目录；
 //!   「补全」：按预设和 models.dev 补目录里空着的上下文、输出上限、图像、推理档位、价格（只补空的）。
-//! - 保存走 `Store::save_provider`（core 的 `apply::save_provider`），结果交给主窗口提示。
+//! - 保存走 `Store::save_provider`（core 的 `apply::save_provider`），在后台写：按钮变淡，写完再关；
+//!   写成了的提示由 Store 发给主窗口，没写成的原因留在底栏。
 //! - 删除先列出在用的 agent（`apply::used_by`）确认。有没保存的改动时关掉先问。
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
 use confdeck_core::agent::Mode;
-use confdeck_core::apply::{Synced, UsedBy};
+use confdeck_core::apply::UsedBy;
 use confdeck_core::preset::Preset;
 use confdeck_core::provider::{
     Cost, Modality, Model, Protocol, Provider, ProviderError, normalize_url,
@@ -30,16 +31,13 @@ use crate::data::{self, Store};
 use crate::net::{self, Reach};
 use crate::theme::Theme;
 use crate::ui::{self, Button};
+use crate::write::Written;
 
 pub enum EditorEvent {
-    /// 保存好了：ID、名字，和写进了哪些 agent（写失败的也在里面）。
-    Saved {
-        id: String,
-        name: String,
-        synced: Vec<Synced>,
-    },
-    /// 删掉了：名字，和从哪些多选 agent 里移掉了。
-    Deleted { name: String, synced: Vec<Synced> },
+    /// 存好了（ID），快照已经换上。
+    Saved { id: String },
+    /// 删掉了。
+    Deleted,
     /// 取消、Esc、点外面。
     Closed,
 }
@@ -148,6 +146,8 @@ pub struct Editor {
     /// 底栏左边的一句结果（「补全了 3 个模型」），下一次改动就换回提示。
     notice: Option<SharedString>,
     confirm: Option<Confirm>,
+    /// 正在保存或删除（在后台写）：按钮变淡、点了不管，也关不掉。写完再关，或者把原因显示在底栏。
+    saving: Option<Task<()>>,
     /// 正在拉模型列表 / 正在补全。
     fetching: bool,
     filling: bool,
@@ -361,6 +361,7 @@ impl Editor {
             error: None,
             notice: None,
             confirm: None,
+            saving: None,
             fetching: false,
             filling: false,
             picker: None,
@@ -497,6 +498,9 @@ impl Editor {
 
     /// 取消、Esc、点外面：有改动先问。
     pub fn request_close(&mut self, cx: &mut Context<Self>) {
+        if self.saving.is_some() {
+            return;
+        }
         if self.picker.is_some() {
             self.picker = None;
         } else if self.confirm.is_some() {
@@ -510,7 +514,10 @@ impl Editor {
         cx.notify();
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) {
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving.is_some() {
+            return;
+        }
         let mut provider = self.draft(cx);
         provider.normalize();
         if self.is_new
@@ -531,43 +538,61 @@ impl Editor {
             return;
         }
         let id = provider.id.clone();
-        let name = provider.name.clone();
-        let saved = self.store.update(cx, |store, cx| {
-            let result = store.save_provider(&provider, cx);
+        // 存的是这一刻的表单：写完之前再打的字会丢，光标先拿走（点表单也不理，见 `render`）。
+        window.blur(cx);
+        let write = self
+            .store
+            .update(cx, |store, cx| store.save_provider(provider, cx));
+        self.wait(write, EditorEvent::Saved { id }, cx);
+    }
+
+    /// 确认框的「取消」、点框外面。删着的时候不关。
+    fn dismiss_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.saving.is_none() {
+            self.confirm = None;
             cx.notify();
-            result
-        });
-        match saved {
-            Ok(synced) => cx.emit(EditorEvent::Saved { id, name, synced }),
-            Err(err) => {
-                self.error = Some(err.to_string().into());
-                cx.notify();
-            }
         }
     }
 
     pub(crate) fn ask_delete(&mut self, cx: &mut Context<Self>) {
+        if self.saving.is_some() {
+            return;
+        }
         let used_by = self.store.read(cx).used_by(&self.initial.id);
         self.confirm = Some(Confirm::Delete(used_by));
         cx.notify();
     }
 
     fn delete(&mut self, cx: &mut Context<Self>) {
-        let id = self.initial.id.clone();
-        let name = self.initial.name.clone();
-        let deleted = self.store.update(cx, |store, cx| {
-            let result = store.delete_provider(&id, cx);
-            cx.notify();
-            result
-        });
-        match deleted {
-            Ok(synced) => cx.emit(EditorEvent::Deleted { name, synced }),
-            Err(err) => {
-                self.confirm = None;
-                self.error = Some(err.to_string().into());
-                cx.notify();
-            }
+        if self.saving.is_some() {
+            return;
         }
+        let (id, name) = (self.initial.id.clone(), self.initial.name.clone());
+        let write = self
+            .store
+            .update(cx, |store, cx| store.delete_provider(id, name, cx));
+        self.wait(write, EditorEvent::Deleted, cx);
+    }
+
+    /// 等保存、删除写完：写成了发 `done`（主窗口关掉弹层），没写成把原因显示在底栏。
+    fn wait(&mut self, write: Written, done: EditorEvent, cx: &mut Context<Self>) {
+        self.error = None;
+        self.saving = Some(cx.spawn(async move |this, cx| {
+            let report = write.report().await;
+            this.update(cx, |editor, cx| {
+                editor.saving = None;
+                match report.and_then(|report| report.failed) {
+                    Some(error) => {
+                        editor.confirm = None;
+                        editor.error = Some(error.into());
+                        cx.notify();
+                    }
+                    None => cx.emit(done),
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// 目录末尾加一行，返回它的下标。
@@ -1692,8 +1717,9 @@ impl Editor {
             )
             .child(
                 ui::button("save", t, Button::Primary)
+                    .when(self.saving.is_some(), |b| b.opacity(0.6))
                     .child(t!("common.save"))
-                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
             )
     }
 
@@ -1935,6 +1961,7 @@ impl Editor {
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(text)
         };
+        let saving = self.saving.is_some();
         let buttons = |cancel: SharedString, ok: SharedString, on_ok: OnClick| {
             div()
                 .h_flex()
@@ -1944,14 +1971,12 @@ impl Editor {
                 .child(
                     ui::button("confirm-cancel", t, Button::Secondary)
                         .child(cancel)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.confirm = None;
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(|this, _, _, cx| this.dismiss_confirm(cx))),
                 )
                 .child(
                     ui::button("confirm-ok", t, Button::Danger)
                         .bg(t.danger.opacity(0.12))
+                        .when(saving, |b| b.opacity(0.6))
                         .child(ok)
                         .on_click(on_ok),
                 )
@@ -2053,10 +2078,7 @@ impl Editor {
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.confirm = None;
-                        cx.notify();
-                    }),
+                    cx.listener(|this, _, _, cx| this.dismiss_confirm(cx)),
                 )
                 .child(card),
         )
@@ -2076,6 +2098,12 @@ impl Render for Editor {
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.menu_just_closed = false),
             )
+            // 保存、删除写着的时候点哪都不理：不然改了的表单、弹出的确认框会跟着写完一起关掉。
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                if this.saving.is_some() {
+                    cx.stop_propagation();
+                }
+            }))
             .bg(t.card)
             .rounded(px(14.))
             .border_1()

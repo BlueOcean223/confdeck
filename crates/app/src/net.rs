@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use confdeck_core::apply::{self, Synced};
+use confdeck_core::apply;
 use confdeck_core::data::DataDir;
 use confdeck_core::fsx::{self, Mode};
 use confdeck_core::models_dev::{self, ModelsDev};
@@ -27,6 +27,7 @@ use rust_i18n::t;
 use crate::data::{Notice, Store};
 use crate::theme::Theme;
 use crate::ui;
+use crate::write::{Done, Report};
 
 #[derive(Default)]
 pub struct NetState {
@@ -294,50 +295,20 @@ impl Store {
     /// 导入：存一次列表，换掉的那几家写进在用它们的 agent（后台写，Codex 可能要重写模型目录）。
     pub fn import(&mut self, incoming: Vec<Provider>, cx: &mut Context<Self>) {
         let count = transfer::plan(&self.providers, &incoming).changes();
-        let engine = self.engine.clone();
-        let home = self.home.clone();
-        let providers = self.providers.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { apply::import(&engine, &home, &providers, &incoming) });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |store, cx| {
-                store.reload(cx);
-                let notices = describe_import(count, result);
-                store.announce(&notices, cx);
-            })
-            .ok();
-        })
-        .detach();
+        // 列表先换上（后面排着的写拿的是内存里的）；`import` 要拿改之前的列表认出在用换掉那几家的 agent。
+        let before = self.providers.clone();
+        self.providers = transfer::merge(&self.providers, &incoming);
+        self.run(
+            move |engine, home| {
+                let report = Report::new(Done::Imported { count });
+                match apply::import(engine, home, &before, &incoming) {
+                    Ok(synced) => report.synced(synced),
+                    Err(err) => report.fail(describe_store(&err)),
+                }
+            },
+            cx,
+        );
     }
-}
-
-fn describe_import(count: usize, result: Result<Vec<Synced>, StoreError>) -> Vec<Notice> {
-    let synced = match result {
-        Ok(synced) => synced,
-        Err(err) => {
-            return vec![Notice::err(t!(
-                "transfer.import_failed",
-                error = describe_store(&err)
-            ))];
-        }
-    };
-    let mut notices = vec![Notice::ok(if count == 1 {
-        t!("transfer.imported_one")
-    } else {
-        t!("transfer.imported_other", count = count)
-    })];
-    for failed in synced.iter().filter(|s| s.result.is_err()) {
-        if let Err(err) = &failed.result {
-            notices.push(Notice::err(t!(
-                "toast.sync_failed",
-                agent = failed.agent.to_string(),
-                error = err.to_string()
-            )));
-        }
-    }
-    notices
 }
 
 fn describe_store(err: &StoreError) -> String {

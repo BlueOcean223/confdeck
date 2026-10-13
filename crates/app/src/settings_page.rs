@@ -356,11 +356,14 @@ impl SettingsPage {
         }
     }
 
-    fn flip(&mut self, toggle: ClaudeToggle, cx: &mut Context<Self>) {
-        let on = self.store.read(cx).claude_toggle(toggle);
+    /// 点了一个开关：先显示成点过的样子，写完（快照换上）再按文件重读。
+    fn flip(&mut self, n: usize, cx: &mut Context<Self>) {
+        let toggle = CLAUDE_TOGGLES[n];
+        // 按显示的翻：上一次点的还没写完时文件里还是旧的。
+        let on = self.claude_toggles[n];
         self.store
             .update(cx, |store, cx| store.set_claude_toggle(toggle, !on, cx));
-        self.claude_toggles = read_toggles(&self.store, cx);
+        self.claude_toggles[n] = !on;
         cx.notify();
     }
 
@@ -428,10 +431,9 @@ impl SettingsPage {
             return;
         };
         let (live, chosen) = (entry.file.clone(), chosen.clone());
+        // 写完快照换上时重列备份、重读开关（恢复的可能就是开关所在的文件）。
         self.store
             .update(cx, |store, cx| store.restore(&live, &chosen, cx));
-        // 恢复的可能就是开关所在的文件（`toggles::extra_files`）。
-        self.claude_toggles = read_toggles(&self.store, cx);
     }
 
     fn clean(&mut self, file: usize, cx: &mut Context<Self>) {
@@ -795,7 +797,7 @@ impl SettingsPage {
                     .border_color(t.line_2)
                     .cursor_pointer()
                     .hover(move |row| row.bg(hover))
-                    .on_click(cx.listener(move |this, _, _, cx| this.flip(toggle, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.flip(n, cx)))
                     .child(
                         div()
                             .v_flex()

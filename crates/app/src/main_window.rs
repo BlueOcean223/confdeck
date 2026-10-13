@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-use confdeck_core::apply::Synced;
 use confdeck_core::provider::Provider;
 use confdeck_core::quota::CheckKey;
 use gpui_kit::component::*;
@@ -422,42 +421,13 @@ impl MainWindow {
     fn open_picker(&mut self, agent: usize, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.clone();
         let picker = cx.new(|cx| Picker::new(store, agent, false, window, cx));
+        // 选了就写是选择器自己的事（结果从 Store 的 Notice 事件来），这里只管「存成供应商」和关掉。
         let _subscription = cx.subscribe_in(
             &picker,
             window,
             move |this, _, event: &PickerEvent, window, cx| {
-                match event {
-                    // 选了就写；结果从 Store 的 Notice 事件来，不用等这里。
-                    PickerEvent::Picked(option) => {
-                        let option = *option;
-                        this.store
-                            .update(cx, |s, cx| s.switch(agent, option, cx))
-                            .detach();
-                    }
-                    PickerEvent::Account(id) => {
-                        let id = id.clone();
-                        this.store
-                            .update(cx, |s, cx| s.use_account(agent, id, cx))
-                            .detach();
-                    }
-                    // 勾一下写一次，浮层不关（提案 01）。
-                    PickerEvent::Toggled(provider) => {
-                        let provider = *provider;
-                        this.store
-                            .update(cx, |s, cx| s.toggle(agent, provider, cx))
-                            .detach();
-                        return;
-                    }
-                    PickerEvent::AdoptKey { provider, key } => {
-                        let (provider, key) = (*provider, key.clone());
-                        this.store
-                            .update(cx, |s, cx| s.adopt_key(agent, provider, key, cx))
-                            .detach();
-                    }
-                    PickerEvent::SaveAs(draft) => {
-                        this.open_draft(agent, draft.clone(), window, cx);
-                    }
-                    PickerEvent::Dismissed => {}
+                if let PickerEvent::SaveAs(draft) = event {
+                    this.open_draft(agent, draft.clone(), window, cx);
                 }
                 this.picker = None;
                 cx.notify();
@@ -925,26 +895,19 @@ impl MainWindow {
         then_switch: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        // 存好、删掉的提示从 Store 的 Notice 事件来。
         let _subscription = cx.subscribe(&editor, move |this, _, event: &EditorEvent, cx| {
-            match event {
-                EditorEvent::Saved { id, name, synced } => {
-                    this.report("toast.saved", "toast.saved_synced", name, synced, cx);
-                    let saved = this
-                        .store
-                        .read(cx)
-                        .providers
-                        .iter()
-                        .position(|p| &p.id == id);
-                    if let (Some(agent), Some(provider)) = (then_switch, saved) {
-                        this.store
-                            .update(cx, |s, cx| s.switch(agent, Some(provider), cx))
-                            .detach();
-                    }
+            if let EditorEvent::Saved { id } = event {
+                let saved = this
+                    .store
+                    .read(cx)
+                    .providers
+                    .iter()
+                    .position(|p| &p.id == id);
+                if let (Some(agent), Some(provider)) = (then_switch, saved) {
+                    this.store
+                        .update(cx, |s, cx| s.switch(agent, Some(provider), cx));
                 }
-                EditorEvent::Deleted { name, synced } => {
-                    this.report("toast.deleted", "toast.deleted_synced", name, synced, cx);
-                }
-                EditorEvent::Closed => {}
             }
             this.overlay = None;
             cx.notify();
@@ -954,49 +917,6 @@ impl MainWindow {
             _subscription,
         });
         cx.notify();
-    }
-
-    /// 保存、删除以后的提示：写了哪些 agent 一条，写失败的每个一条、不自动消失（提案 10 第四节）。
-    fn report(
-        &mut self,
-        plain: &str,
-        with_agents: &str,
-        name: &str,
-        synced: &[Synced],
-        cx: &mut Context<Self>,
-    ) {
-        let written: Vec<String> = synced
-            .iter()
-            .filter(|s| s.result.as_ref().is_ok_and(|outcome| outcome.changed))
-            .map(|s| s.agent.to_string())
-            .collect();
-        let text = if written.is_empty() {
-            t!(plain, name = name)
-        } else {
-            t!(
-                with_agents,
-                agents = written.join(&t!("common.list_separator"))
-            )
-        };
-        self.toast(NoticeKind::Success, text.into(), cx);
-        for failed in synced.iter().filter(|s| s.result.is_err()) {
-            let error = failed
-                .result
-                .as_ref()
-                .err()
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            self.toast(
-                NoticeKind::Error,
-                t!(
-                    "toast.sync_failed",
-                    agent = failed.agent.to_string(),
-                    error = error
-                )
-                .into(),
-                cx,
-            );
-        }
     }
 
     fn toast(&mut self, kind: NoticeKind, text: SharedString, cx: &mut Context<Self>) {

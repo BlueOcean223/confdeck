@@ -19,6 +19,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{Notice, Store};
+use crate::write::{Done, Report, Written};
 
 #[derive(Default)]
 pub(crate) struct AccountState {
@@ -248,12 +249,7 @@ impl Store {
     }
 
     /// 选择器里选了一个存下的账号：不在「默认」就先切回默认，再换登录文件。胶囊先改过来，不等写完。
-    pub fn use_account(
-        &mut self,
-        agent: usize,
-        id: String,
-        cx: &mut Context<Self>,
-    ) -> Task<Vec<Notice>> {
+    pub fn use_account(&mut self, agent: usize, id: String, cx: &mut Context<Self>) -> Written {
         let kind = self.agents[agent].kind;
         let to_default = self.agents[agent].status != AgentStatus::Official;
         let email = self
@@ -266,47 +262,31 @@ impl Store {
         let unchanged = !to_default
             && matches!(self.live_account(kind), Some(Live::Known(live)) if *live == id);
         if unchanged {
-            return Task::ready(Vec::new());
+            return Written::nothing();
         }
         self.agents[agent].status = AgentStatus::Official;
         self.accounts.live.insert(kind, Live::Known(id.clone()));
-        self.touch();
-        cx.notify();
-
-        let engine = self.engine.clone();
-        let home = self.home.clone();
-        let write = cx.background_executor().spawn(async move {
-            if to_default {
-                apply::switch(&engine, &home, kind, None).map_err(|err| err.to_string())?;
-            }
-            account::switch(&engine, &home, kind, &id)
-                .map(|_| ())
-                .map_err(|err| describe(&err))
+        // 额度跟着账号走（Grok 联网查的是登录文件里的账号）：按换上的快照查。
+        self.after_snapshot(move |store, cx| {
+            let live = store.live_target(kind);
+            store.check_one(&live, cx);
         });
-        cx.spawn(async move |this, cx| {
-            let result = write.await;
-            this.update(cx, |store, cx| {
-                store.reload(cx);
-                let notices = match result {
-                    Ok(()) => vec![Notice::ok(t!(
-                        "write.switched",
-                        agent = kind.to_string(),
-                        provider = email
-                    ))],
-                    Err(error) => vec![Notice::err(t!(
-                        "toast.sync_failed",
-                        agent = kind.to_string(),
-                        error = error
-                    ))],
-                };
-                store.announce(&notices, cx);
-                // 额度跟着账号走（Grok 联网查的是登录文件里的账号）。
-                let live = store.live_target(kind);
-                store.check_one(&live, cx);
-                notices
-            })
-            .unwrap_or_default()
-        })
+        self.run(
+            move |engine, home| {
+                let report = Report::new(Done::Switched {
+                    agent: kind,
+                    to: Some(email),
+                });
+                if to_default && let Err(err) = apply::switch(engine, home, kind, None) {
+                    return report.fail(err.to_string());
+                }
+                match account::switch(engine, home, kind, &id) {
+                    Ok(_) => report,
+                    Err(err) => report.fail(describe(&err)),
+                }
+            },
+            cx,
+        )
     }
 
     /// 删掉一个存下的账号。登录文件不动。

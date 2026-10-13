@@ -316,49 +316,30 @@ impl Panel {
     ) {
         trace!("picker: open {agent}");
         let store = self.store.clone();
-        let picker = cx.new(|cx| Picker::new(store, agent, true, window, cx));
+        // 写完的那句话放到底栏；主窗口开着的话它自己也会收到。
+        let panel = cx.entity().downgrade();
+        let picker = cx.new(|cx| {
+            Picker::new(store, agent, true, window, cx).report_to(move |notice, cx| {
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.status = notice;
+                        cx.notify();
+                    })
+                    .ok();
+            })
+        });
         let _subscriptions = vec![
             cx.subscribe_in(
                 &picker,
                 window,
-                move |this, _, event: &PickerEvent, window, cx| {
-                    match event {
-                        // 选了就写。写完的那句话放到底栏；主窗口开着的话它自己也会收到。
-                        PickerEvent::Picked(option) => {
-                            let option = *option;
-                            let write = this.store.update(cx, |s, cx| s.switch(agent, option, cx));
-                            this.show_result(write, cx);
-                        }
-                        PickerEvent::Account(id) => {
-                            let id = id.clone();
-                            let write = this.store.update(cx, |s, cx| s.use_account(agent, id, cx));
-                            this.show_result(write, cx);
-                        }
-                        PickerEvent::AdoptKey { provider, key } => {
-                            let (provider, key) = (*provider, key.clone());
-                            let write = this
-                                .store
-                                .update(cx, |s, cx| s.adopt_key(agent, provider, key, cx));
-                            this.show_result(write, cx);
-                        }
-                        // 表单在主窗口里：关掉面板，打开主窗口盖上预先填好的表单。
-                        PickerEvent::SaveAs(draft) => {
-                            let draft = draft.clone();
-                            close_for_main(window, cx);
-                            main_window::show_draft(this.store.clone(), agent, draft, cx);
-                            return;
-                        }
-                        // 多选 agent 勾一下写一次，浮层不关（和主窗口一样）。
-                        PickerEvent::Toggled(provider) => {
-                            let provider = *provider;
-                            let write =
-                                this.store.update(cx, |s, cx| s.toggle(agent, provider, cx));
-                            this.show_result(write, cx);
-                            return;
-                        }
-                        PickerEvent::Dismissed => {}
+                move |this, _, event: &PickerEvent, window, cx| match event {
+                    // 表单在主窗口里：关掉面板，打开主窗口盖上预先填好的表单。
+                    PickerEvent::SaveAs(draft) => {
+                        let draft = draft.clone();
+                        close_for_main(window, cx);
+                        main_window::show_draft(this.store.clone(), agent, draft, cx);
                     }
-                    this.close_picker(window, cx);
+                    PickerEvent::Closed => this.close_picker(window, cx),
                 },
             ),
             // 过滤后选项变少，窗口跟着缩短。
@@ -375,19 +356,6 @@ impl Panel {
         });
         self.fit_height(window, cx);
         cx.notify();
-    }
-
-    /// 写完把第一句话放到底栏。
-    fn show_result(&mut self, write: Task<Vec<Notice>>, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let notices = write.await;
-            this.update(cx, |panel, cx| {
-                panel.status = notices.into_iter().next();
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -31,6 +31,7 @@ use crate::data::{self, Store};
 use crate::picker::{Picker, PickerEvent};
 use crate::theme::Theme;
 use crate::ui::{self, Button};
+use crate::write::Written;
 
 pub enum ConfigEvent {
     /// 面包屑「‹ Agent」。
@@ -501,7 +502,7 @@ impl ConfigPage {
         // 同一次保存已经说过「Claude Code 已更新」，整份写进去时就不再说「已保存 settings.json」。
         let announce = drafts.is_empty();
         let agent = self.agent;
-        let writes: Vec<Task<()>> = drafts
+        let writes: Vec<Written> = drafts
             .into_iter()
             .map(|provider| {
                 self.store
@@ -511,7 +512,7 @@ impl ConfigPage {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             for write in writes {
-                write.await;
+                write.report().await;
             }
             this.update_in(cx, |this, window, cx| {
                 this.saving = false;
@@ -753,43 +754,13 @@ impl ConfigPage {
         let store = self.store.clone();
         let agent = self.agent;
         let picker = cx.new(|cx| Picker::new(store, agent, false, window, cx));
-        let _subscription = cx.subscribe_in(
-            &picker,
-            window,
-            move |this, _, event: &PickerEvent, _, cx| {
-                match event {
-                    PickerEvent::Account(id) => {
-                        let id = id.clone();
-                        this.store
-                            .update(cx, |s, cx| s.use_account(agent, id, cx))
-                            .detach();
-                    }
-                    PickerEvent::Picked(option) => {
-                        let option = *option;
-                        this.store
-                            .update(cx, |s, cx| s.switch(agent, option, cx))
-                            .detach();
-                    }
-                    PickerEvent::Toggled(provider) => {
-                        let provider = *provider;
-                        this.store
-                            .update(cx, |s, cx| s.toggle(agent, provider, cx))
-                            .detach();
-                        return;
-                    }
-                    PickerEvent::AdoptKey { provider, key } => {
-                        let (provider, key) = (*provider, key.clone());
-                        this.store
-                            .update(cx, |s, cx| s.adopt_key(agent, provider, key, cx))
-                            .detach();
-                    }
-                    PickerEvent::SaveAs(draft) => cx.emit(ConfigEvent::SaveAs(draft.clone())),
-                    PickerEvent::Dismissed => {}
-                }
-                this.picker = None;
-                cx.notify();
-            },
-        );
+        let _subscription = cx.subscribe(&picker, |this, _, event: &PickerEvent, cx| {
+            if let PickerEvent::SaveAs(draft) = event {
+                cx.emit(ConfigEvent::SaveAs(draft.clone()));
+            }
+            this.picker = None;
+            cx.notify();
+        });
         self.picker = Some(OpenPicker {
             picker,
             _subscription,

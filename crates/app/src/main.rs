@@ -25,6 +25,7 @@ mod tray;
 mod ui;
 mod usage;
 mod usage_page;
+mod write;
 
 use std::path::PathBuf;
 

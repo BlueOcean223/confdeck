@@ -1,18 +1,21 @@
 //! 界面的数据层。供应商、每个 agent 现在连的是谁、本机设置、官方账号都来自 core 的一份快照（`status::snapshot`）：
 //! 启动时在界面线程读第一份（免得窗口先空着闪一下），之后每次 `reload` 都在后台读，读完换上。
+//! 读和写排在同一队里（`enqueue`），一个跑完才开始下一个。
 //! agent 的清单在这里写死：core 里有适配器的五个能选供应商。
 //!
-//! 选了一家就写文件（`switch` / `toggle`）：内存里先改胶囊，写在后台线程，写完再读一份快照，
-//! 文件里的实际状态盖掉先改的；先改的时候还在读的快照丢掉（读的是改之前的）。
-//! 写了什么、有没有备份、失败的原因做成 [`Notice`] 事件发出去，主窗口做成提示条，面板写在底栏。
+//! 用户点出来的写操作（选一家、存供应商、开关……，列表见 app.md「写」）走 `write.rs` 的 `Store::run`：内存里先改，写在后台线程，
+//! 写完再读一份快照，文件里的实际状态盖掉先改的。写了什么、失败的原因做成 [`Notice`] 事件发出去，主窗口做成提示条。
+//! 不走 `run` 的：`state.json` 里当场写的几样（代理、额度查询设置，[`Store::set_local`]）、原始文件（`replace_file`）、
+//! 清理备份、官方账号的改名、删除、登录（`accounts.rs`）；启动时重写 Codex 模型目录也排进同一队。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use confdeck_core::account;
 use confdeck_core::agent::codex::catalog::Skipped;
 use confdeck_core::agent::{self, AgentKind, FileSetup, Mode};
-use confdeck_core::apply::{self, ApplyError, Switched, Synced, UsedBy};
+use confdeck_core::apply::{self, ApplyError, UsedBy};
 use confdeck_core::backup::{self, Backup, Reason};
 use confdeck_core::current;
 use confdeck_core::data::DataDir;
@@ -20,7 +23,7 @@ use confdeck_core::engine::{Engine, EngineError, LiveFile, Local, Outcome, Place
 use confdeck_core::preset;
 use confdeck_core::provider::{self, Protocol, Provider};
 use confdeck_core::status::{self, AgentStatus};
-use confdeck_core::store::{self, StoreError};
+use confdeck_core::store;
 use confdeck_core::toggles::{self, ClaudeToggle};
 use gpui_kit::*;
 use rust_i18n::t;
@@ -178,7 +181,7 @@ fn settled(disk: Option<&AgentStatus>, now: &AgentStatus) -> bool {
 }
 
 /// 快照换上以后要做的（[`Store::reload_then`]）。
-type AfterReload = Box<dyn FnOnce(&mut Store, &mut Context<Store>)>;
+type AfterSnapshot = Box<dyn FnOnce(&mut Store, &mut Context<Store>)>;
 
 /// 某个 agent 为什么用不了某家供应商。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -245,6 +248,43 @@ impl Notice {
     }
 }
 
+/// 读写盘排成一队：一次写（连着它后面那份快照）、一次重读，跑完一个才开始下一个。
+/// 快照读不到写了一半的，两份快照也不会同时跑（快照里会记切换记录、存回令牌，同时跑会记重）。
+#[derive(Default)]
+struct Queue {
+    /// 排进来过几个。
+    queued: u64,
+    /// 最后一次排的重读开始了没有：没开始的话再要重读不用再排，它开始时读得到现在的样子。
+    waiting: Option<Arc<AtomicBool>>,
+    /// 最后排进来的那个的后台任务，下一个等它跑完。
+    tail: Option<Task<()>>,
+}
+
+impl Queue {
+    /// 排一个，返回它的号。
+    fn push(&mut self) -> u64 {
+        self.queued += 1;
+        self.queued
+    }
+
+    /// 第 `n` 个回来时后面没有再排的：只有它的快照换上。
+    fn is_latest(&self, n: u64) -> bool {
+        n == self.queued
+    }
+
+    /// 要重读一次：已经排着一次还没开始的，不用再排（`None`）；不然返回新排的这次开始时要设上的标记。
+    fn reload(&mut self) -> Option<Arc<AtomicBool>> {
+        if let Some(begun) = &self.waiting
+            && !begun.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let begun = Arc::new(AtomicBool::new(false));
+        self.waiting = Some(begun.clone());
+        Some(begun)
+    }
+}
+
 pub struct Store {
     /// 写文件在后台线程，和界面线程共用一个引擎（进程内的锁才管用）。
     pub(crate) engine: Arc<Engine>,
@@ -255,16 +295,16 @@ pub struct Store {
     pub load_error: Option<String>,
     /// `state.json` 里本机的设置（藏起哪些 agent、出站代理、额度查询），跟着快照读，改了换成改完的样子。
     pub(crate) local: Local,
-    /// 在界面线程上改过几次 `state.json`（[`Self::set_local`]）。快照是改之前开始读的，就不用它读到的那份。
-    local_edits: u64,
+    /// 在界面线程上改过几次 `state.json`（[`Self::set_local`]）。后台读快照之前先看一眼：读的时候之后又改过，就不用它读到的那份。
+    local_edits: Arc<AtomicU64>,
     /// 最近一份快照里各 agent 的样子（文件里的），和 `agents` 一一对应。先改了内存、还没写完时两边不一样。
     disk: Vec<AgentStatus>,
     /// 换上过几份快照。配置页看它变了才重读文件。
     generation: u64,
-    /// 在后台读着的快照。再读一份、先改了内存时丢掉：读到的已经旧了。
-    reading: Option<Task<()>>,
-    /// 下一份快照换上以后要做的（[`Self::reload_then`]）。在读的那份被丢掉也留着，等下一份。
-    after_reload: Vec<AfterReload>,
+    /// 读写盘的队（[`Self::enqueue`]）。
+    queue: Queue,
+    /// 下一份快照换上以后要做的（[`Self::reload_then`]）。排在后面的快照才换上时，等换上的那份。
+    after_snapshot: Vec<AfterSnapshot>,
     /// 联网的那几样（测连通、models.dev）的状态，见 `net.rs`。
     pub(crate) net: crate::net::NetState,
     /// 用量的汇总，见 `usage.rs`。
@@ -290,11 +330,11 @@ impl Store {
             agents: Vec::new(),
             load_error: None,
             local: Local::default(),
-            local_edits: 0,
+            local_edits: Default::default(),
             disk: Vec::new(),
             generation: 0,
-            reading: None,
-            after_reload: Vec::new(),
+            queue: Default::default(),
+            after_snapshot: Vec::new(),
             net: Default::default(),
             usage: Default::default(),
             accounts: Default::default(),
@@ -308,24 +348,56 @@ impl Store {
     }
 
     /// 在后台重读供应商、每个 agent 现在连的是谁、本机设置和官方账号，读完换上、通知。
+    /// 排在前面的写跑完才读；已经排着一次还没开始的重读，就不再排。
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        let Some(begun) = self.queue.reload() else {
+            return;
+        };
+        self.enqueue(
+            move |_, _| begun.store(true, Ordering::Release),
+            |_, (), _| {},
+            cx,
+        );
+    }
+
+    /// 排一个读写盘的活：前面的跑完，`job` 在后台线程跑，接着读一份快照；回到界面线程，后面没有再排的那个
+    /// （只有它的快照读得到前面所有的改动）换上快照，再把 `job` 的结果交给 `then`。见 `write.rs` 开头。
+    /// `job` panic 时进程直接退出（gpui 的后台线程不能 unwind），这里不管。
+    pub(crate) fn enqueue<R: Send + 'static>(
+        &mut self,
+        job: impl FnOnce(&Engine, &Path) -> R + Send + 'static,
+        then: impl FnOnce(&mut Self, R, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let n = self.queue.push();
         let engine = self.engine.clone();
         let home = self.home.clone();
-        let edits = self.local_edits;
-        let read = cx
-            .background_executor()
-            .spawn(async move { status::snapshot(&engine, &home) });
-        self.reading = Some(cx.spawn(async move |this, cx| {
-            let snapshot = read.await;
+        let edits = self.local_edits.clone();
+        let before = self.queue.tail.take();
+        let (finish, finished) = async_channel::bounded(1);
+        self.queue.tail = Some(cx.background_executor().spawn(async move {
+            if let Some(before) = before {
+                before.await;
+            }
+            let result = job(&engine, &home);
+            // 先看当场改过几次再读：读到的一定有这几次（`set_local` 写完才加一）。
+            let edits = edits.load(Ordering::Acquire);
+            let snapshot = status::snapshot(&engine, &home);
+            finish.try_send((result, snapshot, edits)).ok();
+        }));
+        cx.spawn(async move |this, cx| {
+            let Ok((result, snapshot, edits)) = finished.recv().await else {
+                return;
+            };
             this.update(cx, |store, cx| {
-                store.apply_snapshot(snapshot, edits);
-                for then in std::mem::take(&mut store.after_reload) {
-                    then(store, cx);
+                if store.queue.is_latest(n) {
+                    store.settle(snapshot, edits, cx);
                 }
-                cx.notify();
+                then(store, result, cx);
             })
             .ok();
-        }));
+        })
+        .detach();
     }
 
     /// [`Self::reload`]，读完换上以后再做 `then`（要按新读到的账号、供应商做的事）。
@@ -334,23 +406,23 @@ impl Store {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
     ) {
-        self.after_reload.push(Box::new(then));
+        self.after_snapshot(then);
         self.reload(cx);
     }
 
-    /// 内存里先改了（还没写）：在读的快照是改之前的，丢掉，免得把先改的又盖回去。调的人写完要再 `reload`。
-    pub(crate) fn touch(&mut self) {
-        self.reading = None;
+    /// 下一份快照换上以后做 `then`（不管是 `reload` 读的还是写完读的）。
+    pub(crate) fn after_snapshot(
+        &mut self,
+        then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
+        self.after_snapshot.push(Box::new(then));
     }
 
-    /// 改完 `state.json` 拿回来的样子换上（core 的 `set_hidden` 这类返回的）。
+    /// 改完 `state.json` 拿回来的样子换上（core 的 `set_proxy`、`set_check` 返回的）。各 agent 藏没藏不跟着它改：
+    /// 藏起是排队写的，还没写进去时这份里没有，内存里的才对；快照换上时再按文件来。
     pub(crate) fn set_local(&mut self, local: Local) {
-        for agent in &mut self.agents {
-            agent.hidden_on_page = hidden(&local, Place::Page, agent.kind);
-            agent.hidden_in_panel = hidden(&local, Place::Panel, agent.kind);
-        }
         self.local = local;
-        self.local_edits += 1;
+        self.local_edits.fetch_add(1, Ordering::Release);
     }
 
     /// 换上过几份快照：变了才说明文件可能变了。
@@ -358,9 +430,18 @@ impl Store {
         self.generation
     }
 
+    /// 换上读好的快照，做排着等它的事（[`Self::reload_then`]），通知。
+    fn settle(&mut self, snapshot: status::Snapshot, edits: u64, cx: &mut Context<Self>) {
+        self.apply_snapshot(snapshot, edits);
+        for then in std::mem::take(&mut self.after_snapshot) {
+            then(self, cx);
+        }
+        cx.notify();
+    }
+
     /// 换上一份快照。`edits` 是开始读时的 `local_edits`：之后又改过 `state.json`，留着改完的那份。
     fn apply_snapshot(&mut self, snapshot: status::Snapshot, edits: u64) {
-        if edits == self.local_edits {
+        if edits == self.local_edits.load(Ordering::Acquire) {
             self.local = snapshot.local.clone();
         }
         let local = &self.local;
@@ -394,29 +475,6 @@ impl Store {
                 .collect(),
             _ => Vec::new(),
         }
-    }
-
-    /// 设置页「显示哪些 agent」：在 Agent 页或菜单栏面板里显示 / 藏起一个 agent。记在 `state.json`，当场写完。
-    pub fn set_agent_hidden(
-        &mut self,
-        agent: usize,
-        place: Place,
-        hidden: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let kind = self.agents[agent].kind;
-        let notice = match self.engine.set_hidden(place, kind.id(), hidden) {
-            Ok(local) => {
-                self.set_local(local);
-                None
-            }
-            Err(err) => Some(Notice::err(t!(
-                "toast.sync_failed",
-                agent = kind.to_string(),
-                error = err.to_string()
-            ))),
-        };
-        self.announce(notice.as_slice(), cx);
     }
 
     /// 单选 agent 的配置文件连的就是选中的那家。刚选了别家、文件还没写完时不是，
@@ -477,40 +535,6 @@ impl Store {
         Ok(outcome)
     }
 
-    /// 「配置 ›」页改了一项（槽位、列表、默认模型、接口）：`provider` 是改好覆盖的那家。
-    /// 内存里先换掉，界面立刻显示新值；文件在后台写（Codex 要重写模型目录，不能卡住界面），
-    /// 写完按文件重读。写了这个 agent 就说一句「Claude Code 已更新」，没写成的单独报。
-    pub fn save_override(
-        &mut self,
-        agent: usize,
-        provider: Provider,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
-        let kind = self.agents[agent].kind;
-        // `save_provider` 要拿改之前的列表认出在用这家的 agent。
-        let before = self.providers.clone();
-        if let Some(slot) = self.providers.iter_mut().find(|p| p.id == provider.id) {
-            *slot = provider.clone();
-        }
-        self.touch();
-        cx.notify();
-
-        let engine = self.engine.clone();
-        let home = self.home.clone();
-        let write = cx
-            .background_executor()
-            .spawn(async move { apply::save_provider(&engine, &home, &before, &provider) });
-        cx.spawn(async move |this, cx| {
-            let result = write.await;
-            this.update(cx, |store, cx| {
-                store.reload(cx);
-                let notices = store.describe_update(kind, result);
-                store.announce(&notices, cx);
-            })
-            .ok();
-        })
-    }
-
     /// 设置页 › Claude Code 的一个开关现在是开是关。文件不存在、键不在算关；文件读不了也先显示成关，
     /// 点的时候才报错。
     pub fn claude_toggle(&self, toggle: ClaudeToggle) -> bool {
@@ -520,22 +544,6 @@ impl Store {
     /// 开关写的是哪个文件，`~/…` 的写法（行里的小字）。
     pub fn claude_toggle_path(&self, toggle: ClaudeToggle) -> String {
         self.tilde(&toggle.file(&self.home).path)
-    }
-
-    /// 设置页点了一个开关：写那个文件（就改一个键，当场写完），写了说一句「Claude Code 已更新」，没写成报错。
-    pub fn set_claude_toggle(&mut self, toggle: ClaudeToggle, on: bool, cx: &mut Context<Self>) {
-        let agent = AgentKind::ClaudeCode.to_string();
-        let notice = match toggle.set(&self.engine, &self.home, on) {
-            Ok(outcome) if outcome.changed => Some(Notice::ok(t!("write.updated", agent = agent))),
-            Ok(_) => None,
-            Err(err) => Some(Notice::err(t!(
-                "toast.sync_failed",
-                agent = agent,
-                error = err.to_string()
-            ))),
-        };
-        self.reload(cx);
-        self.announce(notice.as_slice(), cx);
     }
 
     /// 设置 › 备份的下拉框：接上的 agent（按标签的顺序）和 confdeck 自己。
@@ -598,16 +606,6 @@ impl Store {
             .unwrap_or_default()
     }
 
-    /// 用一份备份替换文件（core 先把现在的内容备份成「恢复前」）。写了重读，说一句「已恢复 settings.json」。
-    pub fn restore(&mut self, file: &LiveFile, backup: &Backup, cx: &mut Context<Self>) {
-        let notice = match self.engine.restore(file, backup) {
-            Ok(_) => Notice::ok(t!("write.file_restored", file = file_name(file))),
-            Err(err) => Notice::err(err.to_string()),
-        };
-        self.reload(cx);
-        self.announce(&[notice], cx);
-    }
-
     /// 「清理」：删掉这个文件原件以外的备份，说一句清理了几份。
     pub fn clean(&mut self, file: &LiveFile, cx: &mut Context<Self>) {
         let shelf = file.shelf();
@@ -640,38 +638,6 @@ impl Store {
         self.agents.iter().position(|agent| agent.kind == kind)
     }
 
-    /// 保存一家（新建或替换同 ID 的），写进在用它的 agent，然后重新读一遍。
-    /// 存好了列表先换上（调用的人马上要按 ID 找它），不等快照。
-    pub fn save_provider(
-        &mut self,
-        provider: &Provider,
-        cx: &mut Context<Self>,
-    ) -> Result<Vec<Synced>, StoreError> {
-        let synced = apply::save_provider(&self.engine, &self.home, &self.providers, provider);
-        if synced.is_ok() {
-            match self.providers.iter_mut().find(|p| p.id == provider.id) {
-                Some(slot) => *slot = provider.clone(),
-                None => self.providers.push(provider.clone()),
-            }
-        }
-        self.reload(cx);
-        synced
-    }
-
-    /// 删掉一家，多选 agent 里的那一项一起删，然后重新读一遍。删好了列表先拿掉它。
-    pub fn delete_provider(
-        &mut self,
-        id: &str,
-        cx: &mut Context<Self>,
-    ) -> Result<Vec<Synced>, StoreError> {
-        let synced = apply::delete_provider(&self.engine, &self.home, &self.providers, id);
-        if synced.is_ok() {
-            self.providers.retain(|p| p.id != id);
-        }
-        self.reload(cx);
-        synced
-    }
-
     /// 哪些 agent 在用这家（按配置文件认，删除前确认用）。
     pub fn used_by(&self, id: &str) -> UsedBy {
         apply::used_by(&self.engine, &self.home, &self.providers, id)
@@ -696,153 +662,14 @@ impl Store {
             .any(|p| p.preset.as_deref() == Some(preset_id))
     }
 
-    /// 单选 agent 换一家（`None` 是「默认」）：在后台写文件，写完按文件重读一遍，提示发给订阅者，也返回给调用的窗口。
-    /// 胶囊先改过来，不等写完；写失败了重读会把它退回文件里的实际状态。
-    pub fn switch(
-        &mut self,
-        agent: usize,
-        provider: Option<usize>,
-        cx: &mut Context<Self>,
-    ) -> Task<Vec<Notice>> {
-        let kind = self.agents[agent].kind;
-        // 选的就是现在这家、文件是 confdeck 写的样子、state.json 也记着它：没什么可写，也不提示「已切到」。
-        // 文件认出来是这家但 state 里没记（比如刚把文件里的连接存成供应商）还是要走一遍，把选择记下来。
-        let picked = provider.map(|p| self.providers[p].clone());
-        let status = match &picked {
-            Some(p) => AgentStatus::Provider { id: p.id.clone() },
-            None => AgentStatus::Official,
-        };
-        let picked_id = picked.as_ref().map(|p| p.id.as_str());
-        let unchanged =
-            self.local.selection(kind) == Some(picked_id) && self.agents[agent].status == status;
-        if unchanged {
-            return Task::ready(Vec::new());
-        }
-        let name = picked.as_ref().map(|p| p.name.clone());
-        self.agents[agent].status = status;
-        self.touch();
-        cx.notify();
-
-        let engine = self.engine.clone();
-        let home = self.home.clone();
-        let write = cx
-            .background_executor()
-            .spawn(async move { apply::switch(&engine, &home, kind, picked.as_ref()) });
-        cx.spawn(async move |this, cx| {
-            let result = write.await;
-            this.update(cx, |store, cx| {
-                store.reload(cx);
-                let notices = store.describe_switch(kind, name, result);
-                store.announce(&notices, cx);
-                notices
-            })
-            .unwrap_or_default()
-        })
-    }
-
-    /// 多选 agent 勾上或取消一家：和 [`Self::switch`] 一样，勾选框先改、后台写、写完重读。
-    pub fn toggle(
-        &mut self,
-        agent: usize,
-        provider: usize,
-        cx: &mut Context<Self>,
-    ) -> Task<Vec<Notice>> {
-        let kind = self.agents[agent].kind;
-        if self.agents[agent].mode != Mode::Coexist {
-            return Task::ready(Vec::new());
-        }
-        let picked = self.providers[provider].clone();
-        // 文件读不了时当成一家都没勾：照样去写，写的时候报哪一行坏了。
-        let mut ids = match &self.agents[agent].status {
-            AgentStatus::Multi { ids } => ids.clone(),
-            _ => Vec::new(),
-        };
-        let enabling = !ids.contains(&picked.id);
-        if enabling {
-            ids.push(picked.id.clone());
-        } else {
-            ids.retain(|id| *id != picked.id);
-        }
-        self.agents[agent].status = AgentStatus::Multi { ids };
-        self.touch();
-        cx.notify();
-
-        let name = picked.name.clone();
-        let engine = self.engine.clone();
-        let home = self.home.clone();
-        let write = cx.background_executor().spawn(async move {
-            if enabling {
-                apply::enable(&engine, &home, kind, &picked)
-            } else {
-                apply::disable(&engine, &home, kind, &picked.id)
-            }
-        });
-        cx.spawn(async move |this, cx| {
-            let result = write.await;
-            this.update(cx, |store, cx| {
-                store.reload(cx);
-                let notices = store.describe_toggle(kind, name, enabling, result);
-                store.announce(&notices, cx);
-                notices
-            })
-            .unwrap_or_default()
-        })
-    }
-
-    /// 「Key 不一致」的第二个选项：把这个 agent 配置文件里的 Key 存进那家供应商。
-    /// 这个 agent 的文件本来就是这个 Key，不用写，只记下它选的是这家；别的在用这家的 agent
-    /// 由 core 的 `save_provider` 跟着换成新 Key（core.md「改了供应商以后」）。
-    pub fn adopt_key(
-        &mut self,
-        agent: usize,
-        provider: usize,
-        key: String,
-        cx: &mut Context<Self>,
-    ) -> Task<Vec<Notice>> {
-        let kind = self.agents[agent].kind;
-        let mut picked = self.providers[provider].clone();
-        picked.key = key;
-        let name = picked.name.clone();
-        self.agents[agent].status = AgentStatus::Provider {
-            id: picked.id.clone(),
-        };
-        self.touch();
-        cx.notify();
-
-        let engine = self.engine.clone();
-        let home = self.home.clone();
-        let providers = self.providers.clone();
-        let write = cx.background_executor().spawn(async move {
-            let synced = apply::save_provider(&engine, &home, &providers, &picked)?;
-            engine
-                .set_selection(kind.id(), Some(&picked.id))
-                .map_err(StoreError::Lock)?;
-            Ok::<_, StoreError>(synced)
-        });
-        cx.spawn(async move |this, cx| {
-            let result = write.await;
-            this.update(cx, |store, cx| {
-                store.reload(cx);
-                let notices = store.describe_adopt(kind, name, result);
-                store.announce(&notices, cx);
-                notices
-            })
-            .unwrap_or_default()
-        })
-    }
-
     /// 启动时在后台按本机的 Codex 重写模型目录（core 的 `refresh_codex_catalog`）：
     /// 重写了、没写成说一声；不用写、或者本机根本没有 codex 就不吭声（旧目录照样能用，没必要每次启动都报）。
-    pub fn refresh_codex_catalog(&self, cx: &mut Context<Self>) {
-        let engine = self.engine.clone();
-        let home = self.home.clone();
+    pub fn refresh_codex_catalog(&mut self, cx: &mut Context<Self>) {
         let providers = self.providers.clone();
-        let refresh = cx
-            .background_executor()
-            .spawn(async move { apply::refresh_codex_catalog(&engine, &home, &providers) });
-        cx.spawn(async move |this, cx| {
-            let result = refresh.await;
-            this.update(cx, |store, cx| {
+        // 排进写的队：和用户刚点的 Codex 切换不同时写。
+        self.enqueue(
+            move |engine, home| apply::refresh_codex_catalog(engine, home, &providers),
+            |store, result, cx| {
                 let notice = match result {
                     Ok(Some(Ok(outcome))) if outcome.changed => {
                         let file = apply::live_files(&store.home, AgentKind::Codex)
@@ -854,7 +681,7 @@ impl Store {
                     Ok(Some(Err(Skipped::NotFound))) => None,
                     Ok(Some(Err(skipped))) => Some(Notice::err(t!(
                         "write.codex_catalog_refresh_failed",
-                        reason = describe_skipped(skipped)
+                        reason = crate::write::describe_skipped(skipped)
                     ))),
                     Err(err) => Some(Notice::err(t!(
                         "write.codex_catalog_refresh_failed",
@@ -865,150 +692,9 @@ impl Store {
                 if let Some(notice) = notice {
                     store.announce(&[notice], cx);
                 }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn describe_switch(
-        &self,
-        kind: AgentKind,
-        name: Option<String>,
-        result: Result<Switched, ApplyError>,
-    ) -> Vec<Notice> {
-        let agent = kind.to_string();
-        let switched = match result {
-            Ok(switched) => switched,
-            Err(err) => {
-                return vec![Notice::err(t!(
-                    "toast.sync_failed",
-                    agent = agent,
-                    error = err.to_string()
-                ))];
-            }
-        };
-        let headline = match name {
-            Some(name) => t!("write.switched", agent = agent, provider = name),
-            None => t!("write.restored", agent = agent),
-        };
-        let mut notices = vec![Notice::ok(headline)];
-        // Codex 的模型目录没写成：config.toml 已经切过去了，但 `/model` 列的还是 GPT 模型，要说一声。
-        if let Some(Err(skipped)) = switched.catalog {
-            notices.push(Notice::err(t!(
-                "write.codex_catalog_skipped",
-                reason = describe_skipped(skipped)
-            )));
-        }
-        notices
-    }
-
-    fn describe_toggle(
-        &self,
-        kind: AgentKind,
-        name: String,
-        enabling: bool,
-        result: Result<Outcome, ApplyError>,
-    ) -> Vec<Notice> {
-        let agent = kind.to_string();
-        match result {
-            Ok(_) => {
-                let headline = if enabling {
-                    t!("write.enabled", agent = agent, provider = name)
-                } else {
-                    t!("write.disabled", agent = agent, provider = name)
-                };
-                vec![Notice::ok(headline)]
-            }
-            Err(err) => vec![Notice::err(t!(
-                "toast.sync_failed",
-                agent = agent,
-                error = err.to_string()
-            ))],
-        }
-    }
-
-    fn describe_adopt(
-        &self,
-        kind: AgentKind,
-        name: String,
-        result: Result<Vec<Synced>, StoreError>,
-    ) -> Vec<Notice> {
-        let agent = kind.to_string();
-        let synced = match result {
-            Ok(synced) => synced,
-            Err(err) => {
-                return vec![Notice::err(t!(
-                    "write.key_adopt_failed",
-                    provider = name,
-                    error = err.to_string()
-                ))];
-            }
-        };
-        let written: Vec<String> = synced
-            .iter()
-            .filter(|s| s.result.as_ref().is_ok_and(|outcome| outcome.changed))
-            .map(|s| s.agent.to_string())
-            .collect();
-        let headline = if written.is_empty() {
-            t!("write.key_adopted", provider = name, agent = agent)
-        } else {
-            let agents = written.join(&t!("common.list_separator"));
-            t!(
-                "write.key_adopted_synced",
-                provider = name,
-                agent = agent,
-                agents = agents
-            )
-        };
-        let mut notices = vec![Notice::ok(headline)];
-        for failed in synced.iter().filter(|s| s.result.is_err()) {
-            let error = failed
-                .result
-                .as_ref()
-                .err()
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            notices.push(Notice::err(t!(
-                "toast.sync_failed",
-                agent = failed.agent.to_string(),
-                error = error
-            )));
-        }
-        notices
-    }
-
-    fn describe_update(
-        &self,
-        kind: AgentKind,
-        result: Result<Vec<Synced>, StoreError>,
-    ) -> Vec<Notice> {
-        let synced = match result {
-            Ok(synced) => synced,
-            Err(err) => {
-                return vec![Notice::err(t!(
-                    "toast.sync_failed",
-                    agent = kind.to_string(),
-                    error = err.to_string()
-                ))];
-            }
-        };
-        let mut notices = Vec::new();
-        for entry in &synced {
-            match &entry.result {
-                // 只有改的这个 agent 的文件会变；别的在用这家的 agent 覆盖没动，`changed` 为假。
-                Ok(outcome) if outcome.changed && entry.agent == kind => {
-                    notices.push(Notice::ok(t!("write.updated", agent = kind.to_string())));
-                }
-                Ok(_) => {}
-                Err(err) => notices.push(Notice::err(t!(
-                    "toast.sync_failed",
-                    agent = entry.agent.to_string(),
-                    error = err.to_string()
-                ))),
-            }
-        }
-        notices
+            },
+            cx,
+        );
     }
 
     pub(crate) fn announce(&self, notices: &[Notice], cx: &mut Context<Self>) {
@@ -1123,21 +809,12 @@ impl Store {
     }
 }
 
-/// Codex 模型目录没生成出来的原因，按界面语言说（core 的 `Skipped` 只有中文）。
 /// 提示条里只说文件名（`settings.json`），路径太长。
-fn file_name(file: &LiveFile) -> String {
+pub(crate) fn file_name(file: &LiveFile) -> String {
     file.path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
-}
-
-fn describe_skipped(skipped: Skipped) -> std::borrow::Cow<'static, str> {
-    match skipped {
-        Skipped::NotFound => t!("codex.not_found"),
-        Skipped::Failed => t!("codex.failed"),
-        Skipped::NoTemplate => t!("codex.no_template"),
-    }
 }
 
 /// 供应商的图标：预设有图标的用预设的；认不出预设、也不是 Anthropic 官方，就用名字的第一个字。
@@ -1224,10 +901,12 @@ mod tests {
     // 不能 `use super::*`：gpui 也导出一个 `test` 属性宏，会把 `#[test]` 抢走。
     use std::path::Path;
 
+    use std::sync::atomic::Ordering;
+
     use confdeck_core::status::AgentStatus;
     use confdeck_core::{apply, preset};
 
-    use super::{AGENTS, key_tail, logo, settled};
+    use super::{AGENTS, Queue, key_tail, logo, settled};
 
     #[test]
     fn settled_means_the_file_is_what_is_shown() {
@@ -1241,6 +920,27 @@ mod tests {
             Some(&AgentStatus::Unreadable),
             &AgentStatus::Unreadable
         ));
+    }
+
+    #[test]
+    fn only_the_last_queued_is_latest() {
+        let mut queue = Queue::default();
+        let first = queue.push();
+        let second = queue.push();
+        assert!(!queue.is_latest(first));
+        assert!(queue.is_latest(second));
+    }
+
+    #[test]
+    fn a_reload_that_has_not_begun_covers_the_next_one() {
+        let mut queue = Queue::default();
+        let begun = queue.reload().expect("the first reload is queued");
+        assert!(queue.reload().is_none(), "one is waiting already");
+        // 后面又排了一个写：再要重读还是不排。写完读的那份更晚，最后换上的是它。
+        queue.push();
+        assert!(queue.reload().is_none());
+        begun.store(true, Ordering::Release);
+        assert!(queue.reload().is_some(), "it began before this change");
     }
 
     /// 写死的配置文件路径要和 core 适配器写的文件一致，不然「配置文件存在」和实际写的不是同一个文件。
