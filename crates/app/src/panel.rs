@@ -253,6 +253,10 @@ impl Panel {
                 cx.notify();
             }),
             cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
+            // 系统什么时候算面板「看得见」：GPUI 的 display link 从这时才跑。
+            cx.observe_window_visibility(window, |_, _visibility, _, _| {
+                trace!("visibility={_visibility:?}");
+            }),
             // 失焦就关。跑 drive 脚本时应用不在前台（`crate::quiet`），焦点怎么变都和面板无关，只按脚本关。
             cx.observe_window_activation(window, |_, window, cx| {
                 trace!("active={}", window.is_window_active());
@@ -310,6 +314,7 @@ impl Panel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        trace!("picker: open {agent}");
         let store = self.store.clone();
         let picker = cx.new(|cx| Picker::new(store, agent, true, window, cx));
         let _subscriptions = vec![
@@ -565,6 +570,9 @@ impl Render for Panel {
         // 不用 `anchored`：窗口比选择器矮时它会把选择器往上挪；这里固定位置，矮了就先截掉下面一截。
         let tall_enough = window.viewport_size().height >= px(self.height - 0.5);
         if let Some(open) = self.picker.as_mut() {
+            if !open.drawn && tall_enough {
+                trace!("picker: drawn");
+            }
             open.drawn |= tall_enough;
         }
         let picker = self.picker.as_ref().filter(|open| open.drawn).map(|open| {

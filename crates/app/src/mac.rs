@@ -410,10 +410,14 @@ pub fn set_height_keep_top(window: &Window, height: f64, cx: &App) {
             let mut next = frame;
             next.size.height = new_height;
             next.origin.y = top - new_height;
+            #[cfg(debug_assertions)]
+            eprintln!("panel: {} resize to {height}", crate::panel::ms());
             ns_window.setFrame_display(next, true);
             view.setNeedsDisplay(true);
             view.displayIfNeeded();
             ns_window.invalidateShadow();
+            #[cfg(debug_assertions)]
+            eprintln!("panel: {} resized", crate::panel::ms());
         })
         .detach();
 }
