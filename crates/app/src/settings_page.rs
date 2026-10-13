@@ -6,6 +6,7 @@
 //!   记在 `state.json`；「测试」连一次 models.dev。confdeck 自己联网（测连通、拉模型列表、models.dev）都走它。
 //! - Claude Code：跳过首次确认、VS Code 插件跟着切换、隐藏 AI 署名（decisions「配置页」：一次性的设置放设置页，
 //!   署名先做成全局开关）。点一下写一次（`Store::set_claude_toggle`），不攒着等保存。行里的小字是文件和键名，查问题时用。
+//!   开关的状态打开设置页、点了开关以后各读一次文件，画的时候只看读好的（悬停、动画都会重画）。
 //! - 数据 › 导入导出：供应商导出成 `providers.json` 格式的文件（可以不带 Key），从这样的文件导入（先列出新增、覆盖哪几家再确认）。
 //! - 数据 › 备份（decisions「备份」）：右上角的下拉框选文件归谁（默认 Claude Code），只列这一家有备份的文件，
 //!   一个文件一行（几份、多大、最近一次），点开列每一份的时间和原因，可以看和现在的差异、恢复、「清理」（删原件以外的）。
@@ -75,6 +76,8 @@ pub struct SettingsPage {
     proxy_error: Option<SharedString>,
     /// 输入框里上一次的内容：回车时输入框会再发一次「改了」，内容没变，不能把刚报的错清掉。
     proxy_seen: String,
+    /// Claude Code 的三个开关（和 `CLAUDE_TOGGLES` 一一对应）。打开设置页、点了开关以后各读一次，画的时候不读文件。
+    claude_toggles: Vec<bool>,
     /// 导出带不带 Key。
     export_keys: bool,
     import: Option<PendingImport>,
@@ -125,6 +128,7 @@ impl SettingsPage {
         );
         let files = store.read(cx).backups();
         let owners = store.read(cx).backup_owners();
+        let claude_toggles = read_toggles(&store, cx);
         // 默认看 Claude Code 的（用户 10-12）。
         let owner = owners
             .iter()
@@ -142,6 +146,7 @@ impl SettingsPage {
             proxy_test: None,
             proxy_error: None,
             proxy_seen,
+            claude_toggles,
             export_keys: true,
             import: None,
             files,
@@ -345,6 +350,8 @@ impl SettingsPage {
         let on = self.store.read(cx).claude_toggle(toggle);
         self.store
             .update(cx, |store, cx| store.set_claude_toggle(toggle, !on, cx));
+        self.claude_toggles = read_toggles(&self.store, cx);
+        cx.notify();
     }
 
     fn toggle_menu(&mut self, cx: &mut Context<Self>) {
@@ -413,6 +420,8 @@ impl SettingsPage {
         let (live, chosen) = (entry.file.clone(), chosen.clone());
         self.store
             .update(cx, |store, cx| store.restore(&live, &chosen, cx));
+        // 恢复的可能就是开关所在的文件（`toggles::extra_files`）。
+        self.claude_toggles = read_toggles(&self.store, cx);
     }
 
     fn clean(&mut self, file: usize, cx: &mut Context<Self>) {
@@ -761,7 +770,7 @@ impl SettingsPage {
                 .child("Claude Code"),
         );
         for (n, &toggle) in CLAUDE_TOGGLES.iter().enumerate() {
-            let on = store.claude_toggle(toggle);
+            let on = self.claude_toggles[n];
             let hover = t.card_2;
             card = card.child(
                 div()
@@ -1152,6 +1161,15 @@ impl Render for SettingsPage {
                     .child(self.backups_card(&t, window, cx)),
             })
     }
+}
+
+/// 三个开关现在是开是关（读文件）。
+fn read_toggles(store: &Entity<Store>, cx: &App) -> Vec<bool> {
+    let store = store.read(cx);
+    CLAUDE_TOGGLES
+        .iter()
+        .map(|&toggle| store.claude_toggle(toggle))
+        .collect()
 }
 
 fn label(toggle: ClaudeToggle) -> SharedString {

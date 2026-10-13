@@ -21,7 +21,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -32,6 +32,7 @@ use crate::engine::{Engine, EngineError, LiveFile, Outcome};
 use crate::fsx::{self, Digest, Mode};
 use crate::keychain::Keychain;
 use crate::patch::Format;
+use crate::quota::{self, Check};
 
 /// 能存多个官方账号的 agent。
 pub const SUPPORTED: [AgentKind; 3] = [
@@ -107,6 +108,9 @@ pub enum AccountError {
     /// 登录命令没登录成功就退出了（或者被取消了），带它最后输出的几行。
     #[error("登录没有完成：{0}")]
     Login(String),
+    /// 等了 15 分钟还没登录完（[`Login::wait`]），停掉了。
+    #[error("登录超时，已停止")]
+    LoginTimedOut,
 }
 
 pub(crate) fn io_error(path: &Path) -> impl FnOnce(io::Error) -> EngineError + '_ {
@@ -620,23 +624,29 @@ pub fn label(
 /// 删掉一个存下的账号。agent 的登录文件不动：正在用的账号删了也还登着。
 pub fn remove(engine: &Engine, home: &Path, kind: AgentKind, id: &str) -> Result<(), AccountError> {
     let data = engine.data();
-    let _lock = engine.lock()?;
-    let mut book = load(data)?;
-    let before = book.accounts.len();
-    book.accounts
-        .retain(|account| !(account.agent == kind && account.id == id));
-    if book.accounts.len() == before {
-        return Err(AccountError::Missing);
-    }
-    save(data, &book)?;
-    let path = login_path(data, kind, id);
-    if kind == AgentKind::ClaudeCode {
-        return Ok(claude::delete_stored(&Keychain::for_home(home), id).map_err(io_error(&path))?);
-    }
-    match fs::remove_file(&path) {
-        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(io_error(&path)(err).into()),
-        _ => Ok(()),
-    }
+    let removed = {
+        let _lock = engine.lock()?;
+        let mut book = load(data)?;
+        let before = book.accounts.len();
+        book.accounts
+            .retain(|account| !(account.agent == kind && account.id == id));
+        if book.accounts.len() == before {
+            return Err(AccountError::Missing);
+        }
+        save(data, &book)?;
+        let path = login_path(data, kind, id);
+        if kind == AgentKind::ClaudeCode {
+            claude::delete_stored(&Keychain::for_home(home), id).map_err(io_error(&path))
+        } else {
+            match fs::remove_file(&path) {
+                Err(err) if err.kind() != io::ErrorKind::NotFound => Err(io_error(&path)(err)),
+                _ => Ok(()),
+            }
+        }
+    };
+    // 这个账号的额度查询设置不留（同 `apply::delete_provider`）。`set_check` 自己拿锁，放在锁外面。
+    let _ = engine.set_check(&quota::account_check_key(kind, id), Check::default());
+    Ok(removed?)
 }
 
 /// agent 的命令行程序。
@@ -653,14 +663,16 @@ pub fn program(home: &Path, kind: AgentKind) -> Result<PathBuf, AccountError> {
 /// 输出最多留多少字。
 const OUTPUT_LIMIT: usize = 16 * 1024;
 
+/// 登录最多等多久。浏览器那边放着不管，登录命令会一直等下去；过了这么久就停掉它。
+const LOGIN_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
 /// 一次在跑的登录：agent 的 `login` 命令，家目录指到 confdeck 数据目录下的一个临时目录。
 /// 命令自己打开浏览器；打不开时它会把登录地址打出来（[`LoginHandle::url`]）。
+///
+/// 临时目录（和 Claude Code 存在钥匙串里的那条临时令牌）谁来收拾：登录完、取消、出错时 `Login` 丢掉时收拾；
+/// 应用退出时等不到登录命令退出，调 [`LoginHandle::abandon`]；应用被强退、崩了的，下次启动时 [`clean_stale_logins`] 收拾。
 pub struct Login {
-    kind: AgentKind,
-    dir: PathBuf,
     handle: LoginHandle,
-    /// Claude Code 登录时存令牌的钥匙串（见 [`claude`]）。
-    keychain: Keychain,
     /// Claude Code 的登录命令也等标准输入（贴授权码），开着别关。
     _stdin: Option<ChildStdin>,
 }
@@ -670,6 +682,92 @@ pub struct Login {
 pub struct LoginHandle {
     child: Arc<Mutex<Child>>,
     output: Arc<Mutex<String>>,
+    scratch: Arc<Scratch>,
+}
+
+/// 登录用的临时家目录。
+struct Scratch {
+    kind: AgentKind,
+    dir: PathBuf,
+    /// Claude Code 登录时存令牌的钥匙串（见 [`claude`]）。
+    keychain: Keychain,
+}
+
+impl Scratch {
+    /// 登录命令存令牌用的钥匙串：目录里有 `.keychain` 的是假的（测试用的登录命令写在那），没有的是系统钥匙串
+    /// （真的 `claude`，只在 macOS）。用假的时 [`Login::start`] 先建好 `.keychain`，启动时收拾残留
+    /// （[`clean_stale_logins`]）按同一条规则就知道当初用的是哪个。
+    fn keychain(dir: &Path) -> Keychain {
+        let fake = dir.join(".keychain");
+        if cfg!(target_os = "macos") && !fake.exists() {
+            Keychain::System
+        } else {
+            Keychain::Fake(fake)
+        }
+    }
+
+    /// 删掉临时目录；Claude Code 的连同登录命令可能已经存下的那条临时令牌。
+    fn clean(&self) {
+        if self.kind == AgentKind::ClaudeCode {
+            claude::forget_login(&self.dir, &self.keychain);
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// 临时目录的名字：`.login-<agent>-<进程号>-<第几次>`。进程号用来认出哪些是已经不在的进程留下的（[`clean_stale_logins`]）。
+fn scratch_name(kind: AgentKind, pid: u32, run: usize) -> String {
+    format!(".login-{}-{pid}-{run}", kind.id())
+}
+
+/// [`scratch_name`] 反过来：哪个 agent、哪个进程的。
+fn parse_scratch_name(name: &str) -> Option<(AgentKind, u32)> {
+    let (rest, run) = name.strip_prefix(".login-")?.rsplit_once('-')?;
+    run.parse::<usize>().ok()?;
+    let (kind, pid) = rest.rsplit_once('-')?;
+    let kind = AgentKind::ALL.into_iter().find(|k| k.id() == kind)?;
+    Some((kind, pid.parse().ok()?))
+}
+
+/// 启动时收拾上次没收拾完的登录（应用被强退、崩了）：跑登录的那个进程已经不在的临时目录删掉，
+/// Claude Code 的连同它可能存下的那条临时令牌。别的 confdeck 进程正在跑的登录不动。
+pub fn clean_stale_logins(data: &DataDir) {
+    let logins = data.account_logins();
+    let Ok(entries) = fs::read_dir(&logins) else {
+        return;
+    };
+    // 登录时用的是解开链接的路径（Claude Code 按它算钥匙串的服务名）。只解开上一层：
+    // 临时目录本身是链接的不跟过去（删的会是链接指着的地方），也不是 confdeck 建的，不管。
+    let logins = fs::canonicalize(&logins).unwrap_or(logins);
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some((kind, pid)) = entry.file_name().to_str().and_then(parse_scratch_name) else {
+            continue;
+        };
+        if pid == std::process::id() || process_alive(pid) {
+            continue;
+        }
+        let dir = logins.join(entry.file_name());
+        Scratch {
+            kind,
+            keychain: Scratch::keychain(&dir),
+            dir,
+        }
+        .clean();
+    }
+}
+
+/// 这个进程号还有进程在（`kill -0`，不发信号）。`kill` 起不来时当它还在：宁可留着目录，也不删别人正在用的。
+fn process_alive(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_or(true, |status| status.success())
 }
 
 impl Login {
@@ -677,24 +775,21 @@ impl Login {
     pub fn start(program: &Path, data: &DataDir, kind: AgentKind) -> Result<Self, AccountError> {
         static RUNS: AtomicUsize = AtomicUsize::new(0);
         let run = RUNS.fetch_add(1, Ordering::Relaxed);
-        let dir = data.account_logins().join(format!(
-            ".login-{}-{}-{run}",
-            kind.id(),
-            std::process::id()
-        ));
+        let dir = data
+            .account_logins()
+            .join(scratch_name(kind, std::process::id(), run));
         let _ = fs::remove_dir_all(&dir);
         private_dir(&data.account_logins())?;
         private_dir(&dir)?;
         // Claude Code 按目录的写法算钥匙串的服务名，用解开链接的路径，两边算的一样。
         let dir = fs::canonicalize(&dir).unwrap_or(dir);
-        // 真的 `claude` 把令牌存进系统钥匙串（临时的一条，读完就删）；测试用的假命令写文件。
-        let keychain = if cfg!(target_os = "macos")
-            && program.file_name().is_some_and(|name| name == "claude")
-        {
-            Keychain::System
-        } else {
-            Keychain::Fake(dir.join(".keychain"))
-        };
+        // 真的 `claude` 把令牌存进系统钥匙串（临时的一条，读完就删）；测试用的假命令写文件，先建好它的位置。
+        let real =
+            cfg!(target_os = "macos") && program.file_name().is_some_and(|name| name == "claude");
+        if !real {
+            private_dir(&dir.join(".keychain"))?;
+        }
+        let keychain = Scratch::keychain(&dir);
         let mut command = Command::new(program);
         let mut stdin = Stdio::null();
         match kind {
@@ -746,13 +841,15 @@ impl Login {
             });
         }
         Ok(Self {
-            kind,
-            dir,
             handle: LoginHandle {
                 child: Arc::new(Mutex::new(child)),
                 output,
+                scratch: Arc::new(Scratch {
+                    kind,
+                    dir,
+                    keychain,
+                }),
             },
-            keychain,
             _stdin: input,
         })
     }
@@ -761,8 +858,14 @@ impl Login {
         self.handle.clone()
     }
 
-    /// 等命令退出（会一直等到登录完或者被取消，放后台线程），读出临时目录里的登录文件，删掉临时目录。
+    /// 等命令退出（会一直等到登录完、被取消，最多 15 分钟，放后台线程），读出临时目录里的登录文件，删掉临时目录。
     pub fn wait(self) -> Result<Vec<u8>, AccountError> {
+        self.wait_for(LOGIN_DEADLINE)
+    }
+
+    fn wait_for(self, deadline: Duration) -> Result<Vec<u8>, AccountError> {
+        let started = Instant::now();
+        let scratch = &self.handle.scratch;
         let status = loop {
             let done = self
                 .handle
@@ -770,20 +873,24 @@ impl Login {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .try_wait()
-                .map_err(io_error(&self.dir))?;
+                .map_err(io_error(&scratch.dir))?;
             if let Some(status) = done {
                 break status;
+            }
+            if started.elapsed() >= deadline {
+                self.handle.cancel();
+                return Err(AccountError::LoginTimedOut);
             }
             thread::sleep(Duration::from_millis(200));
         };
         // 读输出的线程可能还差最后几行。
         thread::sleep(Duration::from_millis(50));
-        let auth = if self.kind == AgentKind::ClaudeCode {
-            claude::read_login(&self.dir, &self.keychain)
+        let auth = if scratch.kind == AgentKind::ClaudeCode {
+            claude::read_login(&scratch.dir, &scratch.keychain)
         } else {
-            fs::read(self.dir.join("auth.json")).ok()
+            fs::read(scratch.dir.join("auth.json")).ok()
         };
-        match auth.filter(|bytes| identify(self.kind, bytes).is_some()) {
+        match auth.filter(|bytes| identify(scratch.kind, bytes).is_some()) {
             Some(bytes) => Ok(bytes),
             None => {
                 let tail = self.handle.tail(4);
@@ -800,10 +907,7 @@ impl Login {
 impl Drop for Login {
     fn drop(&mut self) {
         self.handle.cancel();
-        if self.kind == AgentKind::ClaudeCode {
-            claude::forget_login(&self.dir, &self.keychain);
-        }
-        let _ = fs::remove_dir_all(&self.dir);
+        self.handle.scratch.clean();
     }
 }
 
@@ -826,6 +930,12 @@ impl LoginHandle {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    /// 应用要退出了：停掉登录命令，当场删掉临时目录（等 [`Login::wait`] 那边收拾就来不及了）。
+    pub fn abandon(&self) {
+        self.cancel();
+        self.scratch.clean();
     }
 
     /// 输出的最后几行。
@@ -1043,8 +1153,16 @@ mod tests {
         let s = setup();
         let alice = codex_auth("alice", "ws", 0);
         add(&s.engine, &s.home, AgentKind::Codex, &alice).unwrap();
+        let key = quota::account_check_key(AgentKind::Codex, &id_of(&alice));
+        let off = Check {
+            off: true,
+            ..Default::default()
+        };
+        s.engine.set_check(&key, off).unwrap();
         remove(&s.engine, &s.home, AgentKind::Codex, &id_of(&alice)).unwrap();
         assert!(list(s.engine.data()).unwrap().is_empty());
+        // 额度查询的设置跟着删掉。
+        assert!(s.engine.checks().is_empty());
         assert_eq!(s.auth().unwrap(), alice);
         assert!(matches!(
             remove(&s.engine, &s.home, AgentKind::Codex, &id_of(&alice)),
@@ -1136,7 +1254,7 @@ mod tests {
 
         let login = Login::start(&script, s.engine.data(), AgentKind::Codex).unwrap();
         let handle = login.handle();
-        let dir = login.dir.clone();
+        let dir = login.handle.scratch.dir.clone();
         let bytes = login.wait().unwrap();
         assert_eq!(id_of(&bytes), id_of(auth.as_bytes()));
         assert_eq!(
@@ -1155,6 +1273,61 @@ mod tests {
         let login = Login::start(&script, s.engine.data(), AgentKind::Codex).unwrap();
         login.handle().cancel();
         assert!(matches!(login.wait(), Err(AccountError::Login(_))));
+
+        // 等太久：停掉命令，报超时。
+        let login = Login::start(&script, s.engine.data(), AgentKind::Codex).unwrap();
+        let handle = login.handle();
+        assert!(matches!(
+            login.wait_for(Duration::from_millis(300)),
+            Err(AccountError::LoginTimedOut)
+        ));
+        assert!(!matches!(handle.child.lock().unwrap().try_wait(), Ok(None)));
+        assert!(!handle.scratch.dir.exists());
+
+        // 应用退出：命令停掉，临时目录当场删掉（`wait` 那边还没轮到）。
+        let login = Login::start(&script, s.engine.data(), AgentKind::Codex).unwrap();
+        let handle = login.handle();
+        handle.abandon();
+        assert!(!matches!(handle.child.lock().unwrap().try_wait(), Ok(None)));
+        assert!(!handle.scratch.dir.exists());
+        drop(login);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_logins_are_cleaned_at_startup() {
+        let s = setup();
+        let logins = s.engine.data().account_logins();
+        // 一个已经退出的进程号。
+        let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
+        gone.wait().unwrap();
+        // 一个还在跑的。
+        let mut running = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let dirs = [
+            scratch_name(AgentKind::Codex, gone.id(), 0),
+            scratch_name(AgentKind::ClaudeCode, gone.id(), 1),
+            scratch_name(AgentKind::GrokBuild, running.id(), 0),
+            scratch_name(AgentKind::Codex, std::process::id(), 0),
+            "codex".to_string(),
+        ];
+        for dir in &dirs {
+            fs::create_dir_all(logins.join(dir).join(".keychain")).unwrap();
+        }
+        // 名字像临时目录的链接：不跟过去删它指着的目录。
+        let elsewhere = s.home.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let link = logins.join(scratch_name(AgentKind::Codex, gone.id(), 9));
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert_eq!(
+            parse_scratch_name(&dirs[1]),
+            Some((AgentKind::ClaudeCode, gone.id()))
+        );
+        clean_stale_logins(s.engine.data());
+        let left: Vec<bool> = dirs.iter().map(|dir| logins.join(dir).exists()).collect();
+        assert_eq!(left, [false, false, true, true, true]);
+        assert!(elsewhere.exists() && link.exists());
+        running.kill().unwrap();
+        running.wait().unwrap();
     }
 
     #[test]
@@ -1370,7 +1543,7 @@ mod tests {
 
         let login = Login::start(&script, s.engine.data(), AgentKind::ClaudeCode).unwrap();
         let handle = login.handle();
-        let dir = login.dir.clone();
+        let dir = login.handle.scratch.dir.clone();
         let bytes = login.wait().unwrap();
         assert_eq!(bytes, claude::bundle(&alice, &alice_token).unwrap());
         assert_eq!(

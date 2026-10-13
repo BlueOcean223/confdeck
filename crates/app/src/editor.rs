@@ -81,6 +81,8 @@ struct ModelRow {
     input: Vec<Modality>,
     /// 价格（美元 / 百万 token）：输入、输出、缓存读、缓存写。前两个都填了才算有价格。
     price: [Entity<InputState>; 4],
+    /// 这一行的输入框改了就清掉错误和提示。跟着这一行走，删掉这行时一起丢掉。
+    _subscriptions: Vec<Subscription>,
 }
 
 /// 「拉取」拉回来的列表，勾要加进目录的。
@@ -91,6 +93,8 @@ struct ModelPicker {
     /// 打开时目录里已有的。
     existing: BTreeSet<String>,
     filter: Entity<InputState>,
+    /// 过滤框改了就重画。跟着这一层走：关掉、重新拉取时一起丢掉，不攒在编辑器上。
+    _filter_changed: Subscription,
     scroll: UniformListScrollHandle,
 }
 
@@ -230,13 +234,7 @@ impl Editor {
                     .placeholder(placeholder)
                     .default_value(value.to_string())
             });
-            subscriptions.push(cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
-                if let InputEvent::Change = event {
-                    this.error = None;
-                    this.notice = None;
-                    cx.notify();
-                }
-            }));
+            subscriptions.push(cx.subscribe(&state, Self::input_changed));
             state
         };
 
@@ -272,7 +270,7 @@ impl Editor {
         let models = provider
             .models
             .iter()
-            .map(|model| Self::model_row(model, &mut input, cx))
+            .map(|model| Self::model_row(model, window, cx))
             .collect();
         let default_row = provider
             .default_model
@@ -372,13 +370,29 @@ impl Editor {
         }
     }
 
-    fn model_row(
-        model: &Model,
-        input: &mut impl FnMut(SharedString, &str, &mut Context<Self>) -> Entity<InputState>,
-        cx: &mut Context<Self>,
-    ) -> ModelRow {
+    /// 输入框改了：清掉错误和提示。
+    fn input_changed(&mut self, _: Entity<InputState>, event: &InputEvent, cx: &mut Context<Self>) {
+        if let InputEvent::Change = event {
+            self.error = None;
+            self.notice = None;
+            cx.notify();
+        }
+    }
+
+    /// 目录里的一行。
+    fn model_row(model: &Model, window: &mut Window, cx: &mut Context<Self>) -> ModelRow {
+        let mut subscriptions = Vec::new();
+        let mut input = |placeholder: SharedString, value: &str, cx: &mut Context<Self>| {
+            let state = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .default_value(value.to_string())
+            });
+            subscriptions.push(cx.subscribe(&state, Self::input_changed));
+            state
+        };
         let number = |n: Option<u64>| n.map(|n| n.to_string()).unwrap_or_default();
-        ModelRow {
+        let row = ModelRow {
             id: input(t!("editor.model_id").into(), &model.id, cx),
             name: input(
                 t!("editor.model_name").into(),
@@ -401,6 +415,11 @@ impl Editor {
                     input("".into(), &price(cost.and_then(|c| c.cache_write)), cx),
                 ]
             },
+            _subscriptions: Vec::new(),
+        };
+        ModelRow {
+            _subscriptions: subscriptions,
+            ..row
         }
     }
 
@@ -553,24 +572,7 @@ impl Editor {
 
     /// 目录末尾加一行，返回它的下标。
     fn push_row(&mut self, model: &Model, window: &mut Window, cx: &mut Context<Self>) -> usize {
-        let mut subscriptions = Vec::new();
-        let mut input = |placeholder: SharedString, value: &str, cx: &mut Context<Self>| {
-            let state = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(placeholder)
-                    .default_value(value.to_string())
-            });
-            subscriptions.push(cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
-                if let InputEvent::Change = event {
-                    this.error = None;
-                    this.notice = None;
-                    cx.notify();
-                }
-            }));
-            state
-        };
-        let row = Self::model_row(model, &mut input, cx);
-        self._subscriptions.extend(subscriptions);
+        let row = Self::model_row(model, window, cx);
         self.models.push(row);
         self.models.len() - 1
     }
@@ -675,18 +677,18 @@ impl Editor {
             .map(|row| row.id.read(cx).value().trim().to_string())
             .collect();
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder(t!("editor.pick_filter")));
-        self._subscriptions
-            .push(cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
-                if let InputEvent::Change = event {
-                    cx.notify();
-                }
-            }));
+        let filter_changed = cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                cx.notify();
+            }
+        });
         filter.update(cx, |input, cx| input.focus(window, cx));
         self.picker = Some(ModelPicker {
             models,
             chosen: BTreeSet::new(),
             existing,
             filter,
+            _filter_changed: filter_changed,
             scroll: UniformListScrollHandle::new(),
         });
     }

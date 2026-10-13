@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use confdeck_core::account;
 use confdeck_core::agent::codex::catalog::Skipped;
 use confdeck_core::agent::{self, AgentKind, Connection, FileSetup, Mode};
 use confdeck_core::apply::{self, ApplyError, Switched, Synced, UsedBy};
@@ -234,13 +235,15 @@ pub struct Store {
     pub(crate) usage: crate::usage::UsageState,
     /// 官方账号，见 `accounts.rs`。
     pub(crate) accounts: crate::accounts::AccountState,
+    _quit: Subscription,
 }
 
 impl EventEmitter<Notice> for Store {}
 
 impl Store {
-    /// 读数据目录和各 agent 的配置文件。
-    pub fn load(data: DataDir, home: PathBuf) -> Self {
+    /// 读数据目录和各 agent 的配置文件。上次没收拾完的登录（强退、崩了）这时收拾掉，退出时停掉在跑的登录。
+    pub fn load(data: DataDir, home: PathBuf, cx: &mut Context<Self>) -> Self {
+        account::clean_stale_logins(&data);
         let mut store = Self {
             engine: Arc::new(Engine::new(data)),
             home,
@@ -250,6 +253,10 @@ impl Store {
             net: Default::default(),
             usage: Default::default(),
             accounts: Default::default(),
+            _quit: cx.on_app_quit(|store, _| {
+                store.abandon_logins();
+                async {}
+            }),
         };
         store.reload();
         store

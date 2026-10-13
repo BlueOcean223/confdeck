@@ -19,7 +19,6 @@ use confdeck_core::account::{self, Live};
 use confdeck_core::agent::AgentKind;
 use confdeck_core::balance::{self, Balance, BalanceError};
 use confdeck_core::current::Current;
-use confdeck_core::fsx;
 use confdeck_core::models_dev::{self, ModelsDev};
 use confdeck_core::net::Http;
 use confdeck_core::provider::Provider;
@@ -71,8 +70,8 @@ impl CheckOf {
     /// `state.json` 里 `checks` 的键。
     pub fn key(&self) -> String {
         match self {
-            CheckOf::Provider(id) => format!("provider:{id}"),
-            CheckOf::Account(kind, id) => format!("account:{}:{id}", kind.id()),
+            CheckOf::Provider(id) => quota::provider_check_key(id),
+            CheckOf::Account(kind, id) => quota::account_check_key(*kind, id),
             CheckOf::Login(kind) => format!("login:{}", kind.id()),
         }
     }
@@ -131,12 +130,12 @@ impl Store {
         let data = self.engine.data().clone();
         let home = self.home.clone();
         let providers = self.providers.clone();
-        let cached = self.net.models_dev.clone();
+        let cached = self.net.models_dev();
         let task = cx.background_executor().spawn(async move {
-            let dev = cached.or_else(|| {
-                let bytes = fsx::read_optional(&models_dev::cache_path(&data)).ok()??;
-                ModelsDev::parse(&bytes).ok().map(Arc::new)
+            let (dev, fresh) = crate::net::models_dev_or_load(cached, &data, || {
+                ModelsDev::read(&models_dev::cache_path(&data))
             });
+            let dev = dev.ok();
             let mut db = Db::open(&data.usage_db())?;
             confdeck_core::usage::scan(&home, &mut db);
             let requests = db.requests(None)?;
@@ -169,7 +168,7 @@ impl Store {
                     names,
                     sessions,
                 },
-                dev,
+                fresh,
             ))
         });
         cx.spawn(async move |this, cx| {
@@ -177,12 +176,10 @@ impl Store {
             this.update(cx, |store, cx| {
                 store.usage.scanning = false;
                 match result {
-                    Ok((loaded, dev)) => {
+                    Ok((loaded, fresh)) => {
                         store.usage.loaded = Some(Arc::new(loaded));
                         store.usage.error = None;
-                        if store.net.models_dev.is_none() {
-                            store.net.models_dev = dev;
-                        }
+                        store.net.keep_models_dev(fresh);
                     }
                     Err(err) => store.usage.error = Some(err.to_string()),
                 }

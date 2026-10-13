@@ -13,6 +13,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 
@@ -105,11 +106,14 @@ const MAX_TEXT: usize = 4000;
 const MAX_MESSAGES: usize = 400;
 
 /// 读出一个会话的对话：提问、回答的文字和调用了什么工具。太长的只留最后 [`MAX_MESSAGES`] 条，每条最多 [`MAX_TEXT`] 个字。
-/// 文件可能很大（几十 MB），放后台线程里读。
-pub fn messages(session: &Session) -> std::io::Result<Vec<Message>> {
+/// 文件可能很大（几十 MB），放后台线程里读；`stop` 变成真（不看这个会话了）就不读了，返回 `Interrupted`。
+pub fn messages(session: &Session, stop: &AtomicBool) -> std::io::Result<Vec<Message>> {
     let file = std::fs::File::open(&session.path)?;
     let mut out = Vec::new();
     for line in BufReader::new(file).lines() {
+        if stop.load(Ordering::Relaxed) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
         let Ok(line) = line else {
             continue;
         };
@@ -323,10 +327,11 @@ fn grok(value: &Value, out: &mut Vec<Message>) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
 
     use serde_json::json;
 
-    use super::{Message, Role, Session, claude, codex, grok, pi, quote};
+    use super::{Message, Role, Session, claude, codex, grok, messages, pi, quote};
     use crate::agent::AgentKind;
 
     fn session(agent: AgentKind, cwd: Option<&str>) -> Session {
@@ -371,6 +376,25 @@ mod tests {
         let mut s = session(AgentKind::ClaudeCode, Some("/w/app"));
         s.prompt = None;
         assert_eq!(s.label(), "app");
+    }
+
+    #[test]
+    fn reading_stops_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\": \"user\", \"message\": {\"content\": \"hi\"}}\n",
+        )
+        .unwrap();
+        let session = Session {
+            path,
+            ..session(AgentKind::ClaudeCode, None)
+        };
+        let read = messages(&session, &AtomicBool::new(false)).unwrap();
+        assert_eq!(read[0].text, "hi");
+        let stopped = messages(&session, &AtomicBool::new(true)).unwrap_err();
+        assert_eq!(stopped.kind(), std::io::ErrorKind::Interrupted);
     }
 
     #[test]

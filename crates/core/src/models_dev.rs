@@ -10,9 +10,11 @@
 //! - **只补空着的字段**（[`fill`]），用户填过的不动。
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::data::DataDir;
@@ -34,16 +36,12 @@ pub fn cache_path(data: &DataDir) -> PathBuf {
 /// 拿 models.dev 的数据：缓存不到一天就用缓存，否则重下（下不下来用旧缓存）。
 pub fn load(data: &DataDir, http: &Http) -> Result<ModelsDev, NetError> {
     let path = cache_path(data);
-    let cached = fsx::read_optional(&path).ok().flatten();
     let fresh = std::fs::metadata(&path)
         .and_then(|meta| meta.modified())
         .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .is_some_and(|age| age < MAX_AGE);
-    if fresh
-        && let Some(bytes) = &cached
-        && let Ok(index) = ModelsDev::parse(bytes)
-    {
+    if fresh && let Ok(index) = ModelsDev::read(&path) {
         return Ok(index);
     }
     match http.get(URL, &[], TIMEOUT, &[]) {
@@ -54,21 +52,45 @@ pub fn load(data: &DataDir, http: &Http) -> Result<ModelsDev, NetError> {
             fsx::write_atomic(&path, &bytes, Mode::Keep).ok();
             Ok(index)
         }
-        Err(err) => cached
-            .and_then(|bytes| ModelsDev::parse(&bytes).ok())
-            .ok_or(err),
+        Err(err) => ModelsDev::read(&path).map_err(|_| err),
     }
 }
 
 /// 解析好、建好索引的 models.dev。
+///
+/// 常驻内存要小（10-13 arch-perf R0）：文件 5 MB 多，整份解析成 `Value` 树要 60 MB，drop 以后进程的常驻内存也不降
+/// （macOS 的分配器不还页）；8 千多个模型各存一个 [`Model`]、再建几张以字符串为键的表，也要 6、7 MB。所以：
+/// - 边读边取（[`Builder`]），每个模型只读用得到的几个键，描述这类长字段读过去就丢；
+/// - 模型的 ID、名字、`canonical_model_id` 首尾相接存在 `text` 里，条目只记位置（[`Span`]）；推理档位只有几种写法，记下标；
+/// - 按 ID 找用排好序的下标数组二分查找，不另存一份字符串当键。
 #[derive(Debug, Default)]
 pub struct ModelsDev {
     providers: Vec<DevProvider>,
-    by_id: HashMap<String, usize>,
-    /// 规范化的模型 ID → 各家名下的同名条目（供应商下标、条目在那一家的 ID）。原厂兜底用。
-    by_normalized: HashMap<String, Vec<(usize, String)>>,
+    /// 供应商 ID → 下标。
+    by_id: HashMap<String, u32>,
+    models: Vec<DevModel>,
+    text: String,
+    /// 推理档位的写法（`low`、`high`……）。
+    levels: Vec<String>,
+    /// 各模型的推理档位（`levels` 的下标），条目里记位置。
+    level_refs: Vec<u8>,
+    /// 规范化 ID 的 hash 和模型下标，按这两样排好（原厂兜底、按规范化的 ID 找用）。hash 撞了用条目的 ID 再核一遍。
+    by_normalized: Vec<(u64, u32)>,
     /// 被 `canonical_model_id` 指过的供应商，就是原厂。
     vendors: HashSet<String>,
+}
+
+/// `text` 或 `level_refs` 里的一段；长度 0 是没有。
+#[derive(Debug, Clone, Copy, Default)]
+struct Span {
+    start: u32,
+    len: u32,
+}
+
+impl Span {
+    fn range(self) -> std::ops::Range<usize> {
+        self.start as usize..(self.start + self.len) as usize
+    }
 }
 
 #[derive(Debug)]
@@ -76,7 +98,24 @@ struct DevProvider {
     id: String,
     /// 地址的比较用写法（[`endpoint_key`]）。
     endpoint: Option<String>,
-    models: HashMap<String, Value>,
+    /// 这家的模型下标，按 ID 排好；同一个 ID 有几条时文件里靠前的在前。
+    by_id: Vec<u32>,
+    /// 同上，按小写的 ID 排。
+    by_lower: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct DevModel {
+    provider: u32,
+    id: Span,
+    name: Span,
+    canonical: Span,
+    /// 上下文、输出上限；0 是没有（models.dev 写 0 或不写，都当没有）。
+    context: u64,
+    output: u64,
+    image: bool,
+    levels: Span,
+    cost: Option<Cost>,
 }
 
 /// models.dev 不给官方三家写 `api`（用的是 SDK 的默认地址），这里补上。
@@ -88,103 +127,483 @@ const OFFICIAL: &[(&str, &str)] = &[
 
 impl ModelsDev {
     pub fn parse(bytes: &[u8]) -> Result<Self, NetError> {
-        let value: Value = serde_json::from_slice(bytes).map_err(|err| NetError::Parse {
+        Self::build(&mut serde_json::Deserializer::from_slice(bytes))
+    }
+
+    /// 从文件读（缓存）：边读边解析，不先把 5 MB 读进内存。
+    pub fn read(path: &Path) -> Result<Self, NetError> {
+        let file = std::fs::File::open(path).map_err(|err| NetError::Parse {
             detail: err.to_string(),
         })?;
-        let Value::Object(entries) = value else {
-            return Err(NetError::Parse {
-                detail: "不是 JSON 对象".into(),
-            });
+        Self::build(&mut serde_json::Deserializer::from_reader(
+            std::io::BufReader::new(file),
+        ))
+    }
+
+    fn build<'de, R: serde_json::de::Read<'de>>(
+        de: &mut serde_json::Deserializer<R>,
+    ) -> Result<Self, NetError> {
+        let parse_error = |err: serde_json::Error| NetError::Parse {
+            detail: err.to_string(),
         };
-        let mut index = Self::default();
-        for (provider_id, provider) in entries {
-            let Value::Object(mut provider) = provider else {
-                continue;
-            };
-            let api = provider
-                .get("api")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| {
-                    OFFICIAL
-                        .iter()
-                        .find(|(id, _)| *id == provider_id)
-                        .map(|(_, url)| url.to_string())
-                });
-            let models: HashMap<String, Value> = match provider.remove("models") {
-                Some(Value::Object(models)) => models
-                    .into_iter()
-                    .filter(|(_, model)| model.is_object())
-                    .collect(),
-                _ => HashMap::new(),
-            };
-            let n = index.providers.len();
-            for (model_id, model) in &models {
-                index
-                    .by_normalized
-                    .entry(normalize_id(model_id))
-                    .or_default()
-                    .push((n, model_id.clone()));
-                if let Some(canonical) = model.get("canonical_model_id").and_then(Value::as_str)
-                    && let Some((vendor, _)) = canonical.split_once('/')
-                {
-                    index.vendors.insert(vendor.to_string());
-                }
-            }
-            index.by_id.insert(provider_id.clone(), n);
-            index.providers.push(DevProvider {
-                id: provider_id,
-                endpoint: api.as_deref().and_then(endpoint_key),
-                models,
-            });
+        let mut dev = Self::default();
+        de.deserialize_map(Builder(&mut dev)).map_err(parse_error)?;
+        de.end().map_err(parse_error)?;
+        dev.index();
+        Ok(dev)
+    }
+
+    /// 读完以后建索引。
+    fn index(&mut self) {
+        let mut by_provider: Vec<Vec<u32>> = vec![Vec::new(); self.providers.len()];
+        for (m, model) in self.models.iter().enumerate() {
+            by_provider[model.provider as usize].push(m as u32);
         }
-        Ok(index)
+        let sorted: Vec<(Vec<u32>, Vec<u32>)> = by_provider
+            .into_iter()
+            .map(|models| {
+                // 都从文件里的顺序稳定排序：同一个 ID（同一个小写写法）文件里靠前的在前。
+                let mut exact = models.clone();
+                exact.sort_by(|&a, &b| self.id_of(a).cmp(self.id_of(b)));
+                let mut lower = models;
+                lower.sort_by(|&a, &b| cmp_lower(self.id_of(a), self.id_of(b)));
+                (exact, lower)
+            })
+            .collect();
+        for (provider, (by_id, by_lower)) in self.providers.iter_mut().zip(sorted) {
+            provider.by_id = by_id;
+            provider.by_lower = by_lower;
+        }
+        let mut by_normalized: Vec<(u64, u32)> = (0..self.models.len() as u32)
+            .map(|m| (hash(&normalize_id(self.id_of(m))), m))
+            .collect();
+        by_normalized.sort_unstable();
+        self.by_normalized = by_normalized;
+    }
+
+    fn text(&self, span: Span) -> &str {
+        &self.text[span.range()]
+    }
+
+    /// 模型 `m` 的 ID。
+    fn id_of(&self, m: u32) -> &str {
+        self.text(self.models[m as usize].id)
     }
 
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
 
+    /// 规范化以后是 `normalized` 的模型（按文件里的顺序）。
+    fn normalized(&self, normalized: &str) -> impl Iterator<Item = u32> + '_ {
+        let key = hash(normalized);
+        let from = self.by_normalized.partition_point(|&(h, _)| h < key);
+        let normalized = normalized.to_string();
+        self.by_normalized[from..]
+            .iter()
+            .take_while(move |&&(h, _)| h == key)
+            .map(|&(_, m)| m)
+            .filter(move |&m| normalize_id(self.id_of(m)) == normalized)
+    }
+
+    /// 在这一家里按 ID 找：原样、不分大小写、规范化以后（去掉 `vendor/` 前缀、`:变体`、`[1m]`）。
+    fn find(&self, n: u32, id: &str) -> Option<u32> {
+        if let Some(m) = self.find_exact(n, id) {
+            return Some(m);
+        }
+        let provider = &self.providers[n as usize];
+        let lower = provider
+            .by_lower
+            .partition_point(|&m| cmp_lower(self.id_of(m), id).is_lt());
+        if let Some(&m) = provider.by_lower.get(lower)
+            && self.id_of(m).eq_ignore_ascii_case(id)
+        {
+            return Some(m);
+        }
+        self.normalized(&normalize_id(id))
+            .find(|&m| self.models[m as usize].provider == n)
+    }
+
     /// 地址是这几个之一的那家 models.dev 供应商名下的这个模型（带价格）。
     fn by_endpoint(&self, urls: &[&str], id: &str) -> Option<Model> {
         let keys: Vec<String> = urls.iter().filter_map(|url| endpoint_key(url)).collect();
-        self.providers
-            .iter()
-            .filter(|provider| provider.endpoint.as_ref().is_some_and(|e| keys.contains(e)))
-            .find_map(|provider| find_in(&provider.models, id))
-            .map(|value| to_model(id, value, true))
+        (0..self.providers.len() as u32)
+            .filter(|&n| {
+                self.providers[n as usize]
+                    .endpoint
+                    .as_ref()
+                    .is_some_and(|e| keys.contains(e))
+            })
+            .find_map(|n| self.find(n, id))
+            .map(|m| self.model(m, id, true))
     }
 
     /// 原厂兜底：同名条目指回的原厂条目；没人指回时才用原厂自己名下的同名条目。
     /// 指向不止一家原厂时说不清是哪个模型，不猜。不带价格。
     fn by_vendor(&self, id: &str) -> Option<Model> {
-        let normalized = normalize_id(id);
-        let mut pointed: HashMap<String, &Value> = HashMap::new();
-        let mut owned: HashMap<String, &Value> = HashMap::new();
-        for (n, model_id) in self.by_normalized.get(&normalized).into_iter().flatten() {
-            let provider = &self.providers[*n];
-            let Some(model) = provider.models.get(model_id) else {
-                continue;
-            };
-            if let Some(canonical) = model.get("canonical_model_id").and_then(Value::as_str)
-                && let Some((vendor, rest)) = canonical.split_once('/')
-                && let Some(vendor_model) = self
-                    .by_id
-                    .get(vendor)
-                    .and_then(|&v| self.providers[v].models.get(rest))
+        let mut pointed: HashMap<&str, u32> = HashMap::new();
+        let mut owned: HashMap<(u32, &str), u32> = HashMap::new();
+        for m in self.normalized(&normalize_id(id)) {
+            let model = &self.models[m as usize];
+            let canonical = self.text(model.canonical);
+            if let Some((vendor, rest)) = canonical.split_once('/')
+                && let Some(&v) = self.by_id.get(vendor)
+                && let Some(found) = self.find_exact(v, rest)
             {
-                pointed.insert(canonical.to_string(), vendor_model);
+                pointed.insert(canonical, found);
                 continue;
             }
-            if self.vendors.contains(&provider.id) {
-                owned.insert(format!("{}/{model_id}", provider.id), model);
+            if self
+                .vendors
+                .contains(&self.providers[model.provider as usize].id)
+            {
+                // 同一家里同一个 ID 写了两次：和 `find_exact` 一样取文件里靠前的。
+                owned
+                    .entry((model.provider, self.text(model.id)))
+                    .or_insert(m);
             }
         }
-        let found = if pointed.is_empty() { owned } else { pointed };
-        (found.len() == 1)
-            .then(|| found.into_values().next())
+        let found: Vec<u32> = if pointed.is_empty() {
+            owned.into_values().collect()
+        } else {
+            pointed.into_values().collect()
+        };
+        match found[..] {
+            [only] => Some(self.model(only, id, false)),
+            _ => None,
+        }
+    }
+
+    /// 这一家里 ID 原样是 `id` 的那条。
+    fn find_exact(&self, n: u32, id: &str) -> Option<u32> {
+        let provider = &self.providers[n as usize];
+        let at = provider.by_id.partition_point(|&m| self.id_of(m) < id);
+        provider
+            .by_id
+            .get(at)
+            .copied()
+            .filter(|&m| self.id_of(m) == id)
+    }
+
+    /// 查 `id` 查到了模型 `m`：换成目录里的写法，ID 写查的那个，`with_cost` 为假时不带价格。
+    fn model(&self, m: u32, id: &str, with_cost: bool) -> Model {
+        let model = &self.models[m as usize];
+        let positive = |n: u64| (n > 0).then_some(n);
+        Model {
+            id: id.to_string(),
+            name: (model.name.len > 0).then(|| self.text(model.name).to_string()),
+            context: positive(model.context),
+            output: positive(model.output),
+            input: if model.image {
+                vec![Modality::Text, Modality::Image]
+            } else {
+                Vec::new()
+            },
+            reasoning: self.level_refs[model.levels.range()]
+                .iter()
+                .map(|&level| self.levels[level as usize].clone())
+                .collect(),
+            cost: model.cost.filter(|_| with_cost),
+        }
+    }
+
+    /// 读到一家（`api` 可能在 `models` 后面，所以先记下来，读完这家再填地址）。
+    fn push_provider(&mut self, id: String) -> u32 {
+        let n = self.providers.len() as u32;
+        self.by_id.insert(id.clone(), n);
+        self.providers.push(DevProvider {
+            id,
+            endpoint: None,
+            by_id: Vec::new(),
+            by_lower: Vec::new(),
+        });
+        n
+    }
+
+    /// 读到一个模型：用得到的几个键在 `entry` 里。
+    fn push_model(&mut self, provider: u32, id: &str, entry: &serde_json::Map<String, Value>) {
+        let positive = |value: Option<&Value>| {
+            value
+                .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|n| n as u64)))
+                .unwrap_or(0)
+        };
+        let strings = |value: Option<&Value>| -> Vec<String> {
+            value
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let limit = entry.get("limit");
+        let image = strings(entry.get("modalities").and_then(|m| m.get("input")))
+            .iter()
+            .any(|m| m == "image");
+        let levels_start = self.level_refs.len() as u32;
+        for option in entry
+            .get("reasoning_options")
+            .and_then(Value::as_array)
+            .into_iter()
             .flatten()
-            .map(|value| to_model(id, value, false))
+        {
+            if option.get("type").and_then(Value::as_str) != Some("effort") {
+                continue;
+            }
+            for level in strings(option.get("values")) {
+                // 下标是 u8，最多记 256 种写法（实际只有几种）；再多的不记。
+                let index = match self.levels.iter().position(|l| *l == level) {
+                    Some(index) => index,
+                    None if self.levels.len() <= usize::from(u8::MAX) => {
+                        self.levels.push(level);
+                        self.levels.len() - 1
+                    }
+                    None => continue,
+                };
+                let index = index as u8;
+                if !self.level_refs[levels_start as usize..].contains(&index) {
+                    self.level_refs.push(index);
+                }
+            }
+        }
+        let cost = entry.get("cost").and_then(|cost| {
+            let price = |key: &str| cost.get(key).and_then(Value::as_f64).filter(|n| *n >= 0.0);
+            Some(Cost {
+                input: price("input")?,
+                output: price("output")?,
+                cache_read: price("cache_read"),
+                cache_write: price("cache_write"),
+            })
+        });
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let canonical = entry
+            .get("canonical_model_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Some((vendor, _)) = canonical.split_once('/') {
+            self.vendors.insert(vendor.to_string());
+        }
+        let model = DevModel {
+            provider,
+            id: self.push_text(id),
+            name: self.push_text(name),
+            canonical: self.push_text(canonical),
+            context: positive(limit.and_then(|l| l.get("context"))),
+            output: positive(limit.and_then(|l| l.get("output"))),
+            image,
+            levels: Span {
+                start: levels_start,
+                len: self.level_refs.len() as u32 - levels_start,
+            },
+            cost,
+        };
+        self.models.push(model);
+    }
+
+    fn push_text(&mut self, text: &str) -> Span {
+        let start = self.text.len() as u32;
+        self.text.push_str(text);
+        Span {
+            start,
+            len: text.len() as u32,
+        }
+    }
+}
+
+/// 不分大小写比（ASCII）。
+fn cmp_lower(a: &str, b: &str) -> std::cmp::Ordering {
+    a.bytes()
+        .map(|b| b.to_ascii_lowercase())
+        .cmp(b.bytes().map(|b| b.to_ascii_lowercase()))
+}
+
+fn hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+// 下面几个 visitor 边读边往 [`ModelsDev`] 里放：只认用到的键，别的键和不是对象的条目读过去就丢，不建整份的 `Value` 树。
+// 和原来按 `Value` 取一样宽松：哪一家、哪个模型的形状不对，跳过那一项，整份照样能用。
+
+/// 不是对象的值（字符串、数字、数组、`null`）：读过去，什么都不做。
+macro_rules! skip_non_objects {
+    () => {
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Default::default())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(Default::default())
+        }
+    };
+}
+
+/// 顶层：供应商 ID → 一家。
+struct Builder<'a>(&'a mut ModelsDev);
+
+impl<'de> Visitor<'de> for Builder<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(id) = map.next_key::<String>()? {
+            map.next_value_seed(ProviderSeed {
+                dev: &mut *self.0,
+                id,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// 一家。
+struct ProviderSeed<'a> {
+    dev: &'a mut ModelsDev,
+    id: String,
+}
+
+impl<'de> de::DeserializeSeed<'de> for ProviderSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ProviderSeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any value")
+    }
+
+    skip_non_objects!();
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let n = self.dev.push_provider(self.id);
+        let mut api = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "api" => api = map.next_value::<Value>()?.as_str().map(str::to_string),
+                "models" => map.next_value_seed(ModelsSeed {
+                    dev: &mut *self.dev,
+                    provider: n,
+                })?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let provider = &mut self.dev.providers[n as usize];
+        let api = api.or_else(|| {
+            OFFICIAL
+                .iter()
+                .find(|(id, _)| *id == provider.id)
+                .map(|(_, url)| url.to_string())
+        });
+        provider.endpoint = api.as_deref().and_then(endpoint_key);
+        Ok(())
+    }
+}
+
+/// 一家名下的模型。
+struct ModelsSeed<'a> {
+    dev: &'a mut ModelsDev,
+    provider: u32,
+}
+
+impl<'de> de::DeserializeSeed<'de> for ModelsSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ModelsSeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any value")
+    }
+
+    skip_non_objects!();
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(id) = map.next_key::<String>()? {
+            if let Some(entry) = map.next_value::<RawModel>()?.0 {
+                self.dev.push_model(self.provider, &id, &entry);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 一个模型条目里用得到的几个键（各自很小，读成 `Value`）；描述这类长字段读过去就丢。不是对象的条目是 `None`。
+struct RawModel(Option<serde_json::Map<String, Value>>);
+
+/// [`ModelsDev::push_model`] 要的键。
+const MODEL_KEYS: [&str; 6] = [
+    "name",
+    "limit",
+    "modalities",
+    "reasoning_options",
+    "cost",
+    "canonical_model_id",
+];
+
+impl<'de> Deserialize<'de> for RawModel {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ModelVisitor).map(RawModel)
+    }
+}
+
+struct ModelVisitor;
+
+impl<'de> Visitor<'de> for ModelVisitor {
+    type Value = Option<serde_json::Map<String, Value>>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any value")
+    }
+
+    skip_non_objects!();
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut kept = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if MODEL_KEYS.contains(&key.as_str()) {
+                kept.insert(key, map.next_value::<Value>()?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(Some(kept))
     }
 }
 
@@ -260,89 +679,6 @@ pub fn fill(target: &mut Model, known: &Model) -> bool {
         changed = true;
     }
     changed
-}
-
-/// 一条 models.dev 的模型条目换成目录里的写法。
-fn to_model(id: &str, value: &Value, with_cost: bool) -> Model {
-    let positive = |value: Option<&Value>| {
-        value
-            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|n| n as u64)))
-            .filter(|&n| n > 0)
-    };
-    let strings = |value: Option<&Value>| -> Vec<String> {
-        value
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
-    let limit = value.get("limit");
-    let image = strings(value.get("modalities").and_then(|m| m.get("input")))
-        .iter()
-        .any(|m| m == "image");
-    let mut reasoning: Vec<String> = Vec::new();
-    for option in value
-        .get("reasoning_options")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if option.get("type").and_then(Value::as_str) == Some("effort") {
-            for level in strings(option.get("values")) {
-                if !reasoning.contains(&level) {
-                    reasoning.push(level);
-                }
-            }
-        }
-    }
-    let cost = value.get("cost").filter(|_| with_cost).and_then(|cost| {
-        let price = |key: &str| cost.get(key).and_then(Value::as_f64).filter(|n| *n >= 0.0);
-        Some(Cost {
-            input: price("input")?,
-            output: price("output")?,
-            cache_read: price("cache_read"),
-            cache_write: price("cache_write"),
-        })
-    });
-    Model {
-        id: id.to_string(),
-        name: value
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(String::from),
-        context: positive(limit.and_then(|l| l.get("context"))),
-        output: positive(limit.and_then(|l| l.get("output"))),
-        input: if image {
-            vec![Modality::Text, Modality::Image]
-        } else {
-            Vec::new()
-        },
-        reasoning,
-        cost,
-    }
-}
-
-/// 按 ID 找：原样、不分大小写、规范化以后（去掉 `vendor/` 前缀、`:变体`、`[1m]`）。
-fn find_in<'a>(models: &'a HashMap<String, Value>, id: &str) -> Option<&'a Value> {
-    if let Some(found) = models.get(id) {
-        return Some(found);
-    }
-    let normalized = normalize_id(id);
-    let mut by_normalized = None;
-    for (model_id, value) in models {
-        if model_id.eq_ignore_ascii_case(id) {
-            return Some(value);
-        }
-        if by_normalized.is_none() && normalize_id(model_id) == normalized {
-            by_normalized = Some(value);
-        }
-    }
-    by_normalized
 }
 
 /// 同一个模型在各家的写法落到同一个 ID 上：去掉命名空间（`vendor/`）、`:变体`、`[1m]`，`@` 换成 `-`，小写。
@@ -446,7 +782,13 @@ mod tests {
             "claude-sonnet-4-5": {"name": "Claude Sonnet 4.5", "limit": {"context": 1000000, "output": 64000},
                 "cost": {"input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75}}
         }},
-        "broken": "not an object"
+        "broken": "not an object",
+        "odd": {"api": "https://odd.example/v1", "models": {"GLM-Odd": {"name": "Odd", "limit": {"context": 1000}},
+            "bad": [1, 2], "skip": null}},
+        "twins": {"models": {"Foo": {"limit": {"context": 1}}, "foo": {"limit": {"context": 2}},
+            "x/foo": {"limit": {"context": 3}}, "FOO": {"limit": {"context": 4}},
+            "dup": {"limit": {"context": 5}}, "dup": {"limit": {"context": 6}}},
+            "api": "https://twins.example/v1"}
     }"#;
 
     fn dev() -> ModelsDev {
@@ -526,6 +868,58 @@ mod tests {
         let found = super::known(&anthropic, "claude-sonnet-4-5", Some(&dev)).unwrap();
         assert_eq!(found.cost.unwrap().cache_write, Some(3.75));
         assert_eq!(super::known(&relay, "no-such-model", Some(&dev)), None);
+    }
+
+    #[test]
+    fn ids_match_ignoring_case_and_prefixes() {
+        let dev = dev();
+        let odd = at(&[(Protocol::OpenaiChat, "https://odd.example/v1")]);
+        for id in ["GLM-Odd", "glm-odd", "vendor/GLM-ODD:free", "glm-odd[1m]"] {
+            let found = super::known(&odd, id, Some(&dev)).unwrap();
+            assert_eq!(found.id, id);
+            assert_eq!(found.context, Some(1000), "{id}");
+        }
+        // 不是对象的模型条目跳过，同一家别的照样能用。
+        assert_eq!(super::known(&odd, "bad", Some(&dev)), None);
+    }
+
+    #[test]
+    fn ties_go_to_the_entry_earlier_in_the_file() {
+        let dev = dev();
+        // `api` 写在 `models` 后面也认得出这家。
+        let twins = at(&[(Protocol::OpenaiChat, "https://twins.example/v1")]);
+        let context = |id: &str| super::known(&twins, id, Some(&dev)).and_then(|m| m.context);
+        // 原样对得上的先用。
+        assert_eq!(context("Foo"), Some(1));
+        assert_eq!(context("foo"), Some(2));
+        assert_eq!(context("FOO"), Some(4));
+        // 只差大小写、规范化以后一样的，取文件里靠前的。
+        assert_eq!(context("fOo"), Some(1));
+        assert_eq!(context("y/foo"), Some(1));
+        // 同一个 ID 写了两遍：取前面那条。
+        assert_eq!(context("dup"), Some(5));
+    }
+
+    #[test]
+    fn reading_the_file_is_the_same_as_parsing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.json");
+        std::fs::write(&path, SAMPLE).unwrap();
+        let read = ModelsDev::read(&path).unwrap();
+        let relay = at(&[(Protocol::OpenaiChat, "https://relay.example/v1")]);
+        let paas = at(&[(Protocol::OpenaiChat, "https://open.bigmodel.cn/api/paas/v4")]);
+        for (provider, id) in [
+            (&relay, "z-ai/glm-5.2"),
+            (&paas, "glm-5.2"),
+            (&relay, "deepseek-v4-pro"),
+        ] {
+            assert_eq!(
+                super::known(provider, id, Some(&read)),
+                super::known(provider, id, Some(&dev()))
+            );
+        }
+        assert!(ModelsDev::read(&dir.path().join("missing.json")).is_err());
+        assert!(ModelsDev::parse(b"[1, 2]").is_err());
     }
 
     #[test]

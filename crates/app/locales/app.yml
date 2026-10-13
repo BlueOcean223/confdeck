@@ -1250,6 +1250,9 @@ accounts:
   login_failed:
     en: "Sign-in didn't finish: %{error}"
     zh-CN: "登录没有完成：%{error}"
+  login_timed_out:
+    en: Sign-in timed out
+    zh-CN: 登录超时
   unrecognized:
     en: The sign-in has no account in it
     zh-CN: 登录文件里没有认得出的账号

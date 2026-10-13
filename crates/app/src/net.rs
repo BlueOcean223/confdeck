@@ -2,15 +2,17 @@
 //! core 里都是阻塞调用，这里放到后台线程，结果回到 `Store` 再通知界面。
 //!
 //! - **测连通**的结果按地址记（[`NetState::reach`]），供应商列表和编辑器共用：编辑器里改了地址，新地址自然没有结果。
-//! - **models.dev** 下过一次就留在进程里（磁盘上还有一天的缓存，见 core 的 `models_dev`）。
+//! - **models.dev** 下过、读过一次就留在进程里，留到内容满一天（同磁盘缓存的期限，按缓存文件的修改时间算，见 core 的 `models_dev`），
+//!   过了下次用时重读（缓存也过期了就重下）。
 //! - 每次联网现建一个客户端（core 的 `Http::new`），代理设置改了下一次就生效。
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use confdeck_core::apply::{self, Synced};
+use confdeck_core::data::DataDir;
 use confdeck_core::fsx::{self, Mode};
 use confdeck_core::models_dev::{self, ModelsDev};
 use confdeck_core::net::{Http, NetError, Proxy, Unreachable};
@@ -30,8 +32,55 @@ use crate::ui;
 pub struct NetState {
     /// 地址 → 测连通的结果。
     reach: HashMap<String, Reach>,
-    /// 用量页也用（只读磁盘上的缓存，不联网）。
-    pub(crate) models_dev: Option<Arc<ModelsDev>>,
+    /// 读进来的 models.dev 和它的内容是什么时候的（磁盘缓存的修改时间）。用量页也用（只读磁盘上的缓存，不联网）。
+    models_dev: Option<Fresh>,
+}
+
+/// 新读进来的一份 models.dev 和它的内容是什么时候的。
+pub(crate) struct Fresh(Arc<ModelsDev>, Instant);
+
+impl NetState {
+    /// 读进来不到一天的 models.dev。
+    pub(crate) fn models_dev(&self) -> Option<Arc<ModelsDev>> {
+        self.models_dev
+            .as_ref()
+            .filter(|Fresh(_, at)| at.elapsed() < models_dev::MAX_AGE)
+            .map(|Fresh(dev, _)| dev.clone())
+    }
+
+    /// 留下刚读进来的一份（`None` 是这次没读，留着原来的）。
+    pub(crate) fn keep_models_dev(&mut self, loaded: Option<Fresh>) {
+        if loaded.is_some() {
+            self.models_dev = loaded;
+        }
+    }
+}
+
+/// 后台线程里拿 models.dev 用：进程里留着的（`cached`），没有就用 `load` 读一份（联网下，或者只读磁盘缓存）。
+/// 返回用的那份和新读的那份；新读的回界面线程交给 [`NetState::keep_models_dev`] 留下，
+/// 它有多旧按磁盘缓存的修改时间算（用量页只读缓存，读到的可能已经放了大半天）。
+pub(crate) fn models_dev_or_load<E>(
+    cached: Option<Arc<ModelsDev>>,
+    data: &DataDir,
+    load: impl FnOnce() -> Result<ModelsDev, E>,
+) -> (Result<Arc<ModelsDev>, E>, Option<Fresh>) {
+    if let Some(dev) = cached {
+        return (Ok(dev), None);
+    }
+    match load() {
+        Ok(dev) => {
+            let dev = Arc::new(dev);
+            let age = std::fs::metadata(models_dev::cache_path(data))
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+            let at = age
+                .and_then(|age| Instant::now().checked_sub(age))
+                .unwrap_or_else(Instant::now);
+            (Ok(dev.clone()), Some(Fresh(dev, at)))
+        }
+        Err(err) => (Err(err), None),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -167,25 +216,24 @@ impl Store {
     ) -> Task<Result<Vec<Model>, NetError>> {
         let proxy = self.proxy();
         let data = self.engine.data().clone();
-        let cached = self.net.models_dev.clone();
+        let cached = self.net.models_dev();
         let task = cx.background_executor().spawn(async move {
             let http = Http::new(&proxy)?;
             let mut models = remote::list_models(&http, &provider)?;
             // models.dev 下不下来也不要紧，列表照样给。
-            let dev = cached.or_else(|| models_dev::load(&data, &http).ok().map(Arc::new));
+            let (dev, fresh) = models_dev_or_load(cached, &data, || models_dev::load(&data, &http));
+            let dev = dev.ok();
             for model in &mut models {
                 if let Some(known) = models_dev::known(&provider, &model.id, dev.as_deref()) {
                     models_dev::fill(model, &known);
                 }
             }
-            Ok::<_, NetError>((models, dev))
+            Ok::<_, NetError>((models, fresh))
         });
         cx.spawn(async move |this, cx| {
-            let (models, dev) = task.await?;
-            this.update(cx, |store, _| {
-                store.net.models_dev = dev.or(store.net.models_dev.take())
-            })
-            .ok();
+            let (models, fresh) = task.await?;
+            this.update(cx, |store, _| store.net.keep_models_dev(fresh))
+                .ok();
             Ok(models)
         })
     }
@@ -198,12 +246,12 @@ impl Store {
     ) -> Task<Result<(Vec<Model>, usize), NetError>> {
         let proxy = self.proxy();
         let data = self.engine.data().clone();
-        let cached = self.net.models_dev.clone();
+        let cached = self.net.models_dev();
         let task = cx.background_executor().spawn(async move {
-            let dev = match cached {
-                Some(dev) => dev,
-                None => Arc::new(models_dev::load(&data, &Http::new(&proxy)?)?),
-            };
+            let (dev, fresh) = models_dev_or_load(cached, &data, || {
+                models_dev::load(&data, &Http::new(&proxy)?)
+            });
+            let dev = dev?;
             let mut models = provider.models.clone();
             let mut filled = 0;
             for model in &mut models {
@@ -213,11 +261,11 @@ impl Store {
                     filled += 1;
                 }
             }
-            Ok::<_, NetError>((models, filled, dev))
+            Ok::<_, NetError>((models, filled, fresh))
         });
         cx.spawn(async move |this, cx| {
-            let (models, filled, dev) = task.await?;
-            this.update(cx, |store, _| store.net.models_dev = Some(dev))
+            let (models, filled, fresh) = task.await?;
+            this.update(cx, |store, _| store.net.keep_models_dev(fresh))
                 .ok();
             Ok((models, filled))
         })

@@ -1,7 +1,10 @@
 //! 会话页：各 agent 的本地会话，最近活动的在前；能搜、按 agent 筛，点开看对话，复制恢复命令。
 //! 会话列表和用量一起扫（`Store::refresh_usage`，`Loaded::sessions`），点开一个会话时才在后台读那个文件（core 的 `session::messages`）。
+//! 返回列表、点开别的会话时，没读完的那次读取就停掉，读回来的结果也只给读的那个会话。
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{Datelike as _, Local, TimeZone as _};
 use confdeck_core::agent::AgentKind;
@@ -34,13 +37,22 @@ pub struct SessionsPage {
     _subscriptions: Vec<Subscription>,
 }
 
-/// 点开的会话。
+/// 点开的会话。返回列表、换一个会话时整个丢掉：在读的任务跟着丢，后台的读取看到 `stop` 就停。
 struct Opened {
     session: Session,
     /// 还在读是 `None`。
     messages: Option<Result<Vec<Message>, String>>,
     /// 对话从倒数第几条画起。
     shown: usize,
+    _reading: Task<()>,
+    /// 读消息的循环每读一行看一眼（文件可能几十 MB，不看了就别读完）。
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl SessionsPage {
@@ -91,27 +103,36 @@ impl SessionsPage {
     }
 
     fn open(&mut self, session: Session, cx: &mut Context<Self>) {
+        let stop = Arc::new(AtomicBool::new(false));
         let reading = session.clone();
-        self.open = Some(Opened {
-            session,
-            messages: None,
-            shown: MESSAGES_PAGE,
+        let flag = stop.clone();
+        let task = cx.background_executor().spawn(async move {
+            session::messages(&reading, &flag).map_err(|err| err.to_string())
         });
-        cx.notify();
-        let task = cx
-            .background_executor()
-            .spawn(async move { session::messages(&reading).map_err(|err| err.to_string()) });
-        cx.spawn(async move |this, cx| {
+        let (agent, id) = (session.agent, session.id.clone());
+        let waiting = cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                if let Some(open) = this.open.as_mut() {
+                // 读完时开着的还得是这一个。
+                if let Some(open) = this
+                    .open
+                    .as_mut()
+                    .filter(|open| open.session.agent == agent && open.session.id == id)
+                {
                     open.messages = Some(result);
                     cx.notify();
                 }
             })
             .ok();
-        })
-        .detach();
+        });
+        self.open = Some(Opened {
+            session,
+            messages: None,
+            shown: MESSAGES_PAGE,
+            _reading: waiting,
+            stop,
+        });
+        cx.notify();
     }
 
     fn copy(&self, session: &Session, cx: &mut Context<Self>) {

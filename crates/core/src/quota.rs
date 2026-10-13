@@ -20,6 +20,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent::AgentKind;
 use crate::net::{Http, NetError};
 use crate::provider::{self, Provider};
 
@@ -58,6 +59,16 @@ impl Check {
             (false, None) => 0,
         }
     }
+}
+
+/// `state.json` 里 `checks` 一家供应商的键。
+pub fn provider_check_key(id: &str) -> String {
+    format!("provider:{id}")
+}
+
+/// `state.json` 里 `checks` 一个官方账号的键。
+pub fn account_check_key(agent: AgentKind, id: &str) -> String {
+    format!("account:{}:{id}", agent.id())
 }
 
 /// 一个账号或一个套餐的额度。

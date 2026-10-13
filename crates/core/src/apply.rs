@@ -14,6 +14,7 @@ use crate::engine::{Engine, EngineError, LiveFile, Outcome};
 use crate::fsx;
 use crate::patch::{self, LivePatch, PatchError};
 use crate::provider::Provider;
+use crate::quota::{self, Check};
 use crate::store::{self, StoreError};
 use crate::transfer;
 use crate::usage::history;
@@ -377,6 +378,8 @@ pub fn delete_provider(
         return Ok(Vec::new());
     }
     store::save(engine, &after)?;
+    // 这家的额度查询设置不留：以后新建同 ID 的供应商不该接着用（比如一建好查询就是关的）。清不掉只是留个废键。
+    let _ = engine.set_check(&quota::provider_check_key(id), Check::default());
 
     let coexist = AgentKind::ALL
         .into_iter()
@@ -1289,6 +1292,26 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn deleting_forgets_the_check_settings() {
+        let home = Home::new();
+        let providers = [relay(), other()];
+        store::save(&home.engine, &providers).unwrap();
+        let off = Check {
+            off: true,
+            ..Default::default()
+        };
+        for id in ["relay", "other"] {
+            home.engine
+                .set_check(&quota::provider_check_key(id), off.clone())
+                .unwrap();
+        }
+        delete_provider(&home.engine, home.path(), &providers, "relay").unwrap();
+        let checks = home.engine.checks();
+        assert!(!checks.contains_key("provider:relay"));
+        assert_eq!(checks.get("provider:other"), Some(&off));
     }
 
     #[test]
