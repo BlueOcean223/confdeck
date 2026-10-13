@@ -747,6 +747,7 @@ fn stats_card(t: &Theme) -> Div {
         .rounded(px(12.))
 }
 
+/// 统计块：Token（不含缓存的输入加输出）、缓存读取（命中率，悬停说写入缓存多少）、输入、输出（含推理）。
 fn stats(t: &Theme, total: &Totals) -> Div {
     let tokens = &total.tokens;
     let hit = tokens
@@ -755,22 +756,13 @@ fn stats(t: &Theme, total: &Totals) -> Div {
         .map(|rate| t!("usage.hit_rate", rate = percent(rate)));
     let written = (tokens.cache_write > 0)
         .then(|| t!("usage.cache_written", count = count(tokens.cache_write)));
-    let calls_label = if total.requests == 1 {
-        t!("usage.call")
-    } else {
-        t!("usage.calls")
-    };
     stats_card(t)
         .child(tile(
             t,
             0,
             count(tokens.in_out()),
             t!("usage.tokens"),
-            Some(t!(
-                "usage.in_out",
-                input = count(tokens.input),
-                output = count(tokens.output)
-            )),
+            None,
             None,
         ))
         .child(tile(
@@ -784,12 +776,19 @@ fn stats(t: &Theme, total: &Totals) -> Div {
         .child(tile(
             t,
             2,
-            count(tokens.reasoning),
-            t!("usage.reasoning"),
-            Some(t!("usage.inside_output")),
+            count(tokens.input),
+            t!("usage.input"),
+            None,
             None,
         ))
-        .child(tile(t, 3, grouped(total.requests), calls_label, None, None))
+        .child(tile(
+            t,
+            3,
+            count(tokens.output),
+            t!("usage.output"),
+            None,
+            None,
+        ))
 }
 
 fn tile(

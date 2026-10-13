@@ -902,19 +902,13 @@ usage:
   cached:
     en: "%{count} cached"
     zh-CN: "缓存 %{count}"
-  reasoning:
-    en: Reasoning
-    zh-CN: 推理
-  inside_output:
-    en: inside output
-    zh-CN: 计入输出
-  # 统计块的标题，数字在上面。
-  call:
-    en: call
-    zh-CN: 次调用
-  calls:
-    en: calls
-    zh-CN: 次调用
+  # 统计块的标题，数字在上面。输入不含缓存，输出含推理。
+  input:
+    en: Input
+    zh-CN: 输入
+  output:
+    en: Output
+    zh-CN: 输出
   calls_one:
     en: 1 call
     zh-CN: 1 次调用
