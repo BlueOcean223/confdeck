@@ -563,10 +563,7 @@ config:
   models:
     en: Models
     zh-CN: 模型
-  # Claude Code 的六个槽位（core 的 claude::SLOTS）。
-  slot_main:
-    en: Main model
-    zh-CN: 主模型
+  # Claude Code 的五个槽位（core 的 claude::SLOTS）。
   slot_opus:
     en: Opus
     zh-CN: Opus

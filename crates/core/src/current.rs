@@ -501,10 +501,7 @@ mod tests {
         assert_eq!(draft.models.len(), 1);
         assert_eq!(
             draft.override_for(AgentKind::ClaudeCode).unwrap().slots,
-            BTreeMap::from([
-                ("main".into(), "deepseek-chat".into()),
-                ("haiku".into(), "deepseek-chat".into()),
-            ])
+            BTreeMap::from([("haiku".into(), "deepseek-chat".into())])
         );
         draft.validate().unwrap();
 
@@ -533,12 +530,13 @@ mod tests {
                 .unwrap()
                 .slots
                 .len(),
-            6,
-            "every slot is written, the two from the file and the rest filled from the catalog"
+            4,
+            "the four alias slots are written: Haiku from the file, the rest from the catalog"
         );
-        // `[1m]` 记成了 1M 上下文，写回来还带着。
+        // `ANTHROPIC_MODEL` 的模型收进了目录，`[1m]` 记成了 1M 上下文；它不再写回去。
         let env: serde_json::Value = serde_json::from_slice(&after).unwrap();
-        assert_eq!(env["env"]["ANTHROPIC_MODEL"], "deepseek-chat[1m]");
+        assert_eq!(env["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "deepseek-chat[1m]");
+        assert!(env["env"].get("ANTHROPIC_MODEL").is_none());
     }
 
     #[test]
@@ -564,10 +562,7 @@ mod tests {
         assert_eq!(draft.endpoints, deepseek.endpoints);
         let ids: Vec<&str> = draft.models.iter().map(|model| model.id.as_str()).collect();
         assert_eq!(ids, ["deepseek-v4-pro", "deepseek-flash", "deepseek-chat"]);
-        assert_eq!(
-            draft.override_for(AgentKind::ClaudeCode).unwrap().slots,
-            BTreeMap::from([("main".into(), "deepseek-chat".into())])
-        );
+        assert_eq!(draft.override_for(AgentKind::ClaudeCode), None);
         draft.validate().unwrap();
     }
 

@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 
+use crate::agent::{AgentKind, claude};
 use crate::backup::{self, Reason, Shelf};
 use crate::data::DataDir;
 use crate::engine::{Engine, EngineError, LiveFile};
 use crate::fsx::{self, Mode};
 use crate::patch::Format;
-use crate::provider::{Provider, ProviderError};
+use crate::provider::{AgentOverride, Provider, ProviderError};
 
 pub const VERSION: u32 = 1;
 
@@ -91,11 +92,27 @@ pub fn parse(bytes: &[u8], path: &Path) -> Result<Vec<Provider>, StoreError> {
             found: file.version,
         });
     }
-    validate(&file.providers).map_err(|source| StoreError::Invalid {
+    let mut providers = file.providers;
+    retire_slots(&mut providers);
+    validate(&providers).map_err(|source| StoreError::Invalid {
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(file.providers)
+    Ok(providers)
+}
+
+/// 去掉了的槽位（Claude Code 的「主模型」，10-13）：读进来时丢掉，覆盖空了整个删掉，下次保存就不写了。
+fn retire_slots(providers: &mut [Provider]) {
+    let kind = AgentKind::ClaudeCode;
+    for provider in providers {
+        let Some(slots) = provider.overrides.get_mut(&kind).map(|o| &mut o.slots) else {
+            continue;
+        };
+        slots.retain(|key, _| !claude::RETIRED_SLOTS.contains(&key.as_str()));
+        if provider.overrides[&kind] == AgentOverride::default() {
+            provider.overrides.remove(&kind);
+        }
+    }
 }
 
 /// `providers.json` 的内容：两格缩进，末尾换行。导出的文件也是它。
@@ -183,6 +200,40 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("}\n"));
+    }
+
+    /// 去掉的「主模型」槽位：存着的读进来时丢掉，只剩它的覆盖整个删掉。
+    #[test]
+    fn retired_slots_are_dropped_on_load() {
+        let (_dir, engine) = setup();
+        let mut kept = relay();
+        kept.id = "kept".into();
+        let mut gone = relay();
+        for (provider, slots) in [
+            (&mut kept, vec![("main", "glm-4.6"), ("haiku", "glm-4.5-air")]),
+            (&mut gone, vec![("main", "glm-4.6")]),
+        ] {
+            provider.overrides.insert(
+                AgentKind::ClaudeCode,
+                AgentOverride {
+                    slots: slots
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                    ..Default::default()
+                },
+            );
+        }
+        let path = engine.data().providers();
+        fs::create_dir_all(engine.data().root()).unwrap();
+        fs::write(&path, to_bytes(&[gone, kept])).unwrap();
+
+        let loaded = load(engine.data()).unwrap();
+        assert_eq!(loaded[0].override_for(AgentKind::ClaudeCode), None);
+        assert_eq!(
+            loaded[1].override_for(AgentKind::ClaudeCode).unwrap().slots,
+            [("haiku".to_string(), "glm-4.5-air".to_string())].into()
+        );
     }
 
     #[test]

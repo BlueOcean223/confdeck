@@ -41,7 +41,7 @@ reasoning = ["low", "high", "max"]
 default_model = "deepseek-flash"
 
 # Kimi 开放平台（按量）。Responses 和 Chat 同一个地址（platform.kimi.com/docs/guide/codex-kimi.md）；
-# Claude Code 主模型 K3、Haiku 用 K2.7 Code（platform.kimi.com/docs/guide/claude-code-kimi，2026-10），和自动填的一样。
+# Claude Code 照 platform.kimi.com/docs/guide/claude-code-kimi（2026-10）用 K3：目录第一个，自动填的就是它。
 [[presets]]
 id = "kimi"
 name = "Kimi"
@@ -164,7 +164,6 @@ reasoning = ["low", "high", "max"]
 
 [presets.agents.claude-code.slots]
 haiku = "kimi-for-coding"
-subagent = "kimi-for-coding"
 
 [presets.agents.pi]
 protocol = "anthropic"
@@ -219,7 +218,6 @@ reasoning = ["low", "high", "max"]
 
 [presets.agents.claude-code.slots]
 haiku = "kimi-for-coding"
-subagent = "kimi-for-coding"
 
 [presets.agents.pi]
 protocol = "anthropic"
@@ -620,7 +618,7 @@ context = 1000000
 output = 384000
 input = ["text"]
 
-# OpenRouter。Claude 模型走 Anthropic 协议（ccs-lite 的 Pi、OpenCode 预设都这么配）；主模型用 Sonnet（ccs-lite 的 Claude Code 预设）。
+# OpenRouter。Claude 模型走 Anthropic 协议（ccs-lite 的 Pi、OpenCode 预设都这么配）；Sonnet 槽位用 Sonnet（ccs-lite 的 Claude Code 预设）。
 # Codex 默认用 GPT、Grok 默认用 Grok（ccs-lite 的 Codex、Grok Build 预设，2026-10-07 对过 OpenRouter 的模型列表），
 # 这两个排在最后，Pi、OpenCode 也会列出来，不想要就从目录里删。推理档位按 OpenRouter 统一的 reasoning.effort（low / medium / high）。
 # 上下文、输出上限、输入类型 10-10 对过 openrouter.ai/api/v1/models（`context_length`、`top_provider.max_completion_tokens`）。
@@ -684,7 +682,6 @@ input = ["text", "image"]
 reasoning = ["low", "medium", "high"]
 
 [presets.agents.claude-code.slots]
-main = "anthropic/claude-sonnet-5.5"
 sonnet = "anthropic/claude-sonnet-5.5"
 fable = "anthropic/claude-fable-5.1"
 
@@ -703,7 +700,7 @@ protocol = "anthropic"
 # ────────── 10-12 按 Pi 1.1.0 的 /login 列表加的（用户：内置供应商按 Pi 的列表，加上现有的国内几家） ──────────
 
 # Anthropic 官方 API（按量，用 API Key；Claude Code 的「默认」是官方登录，这个是另一回事）。模型取 Pi 的目录，
-# 槽位照 OpenRouter 的写法：主模型、Sonnet 用 Sonnet，Haiku、Fable 用各自的。
+# 槽位照 OpenRouter 的写法：Sonnet、Haiku、Fable 用各自的。
 [[presets]]
 id = "anthropic"
 name = "Anthropic"
@@ -750,7 +747,6 @@ reasoning = ["low", "medium", "high"]
 cost = { input = 10.0, output = 50.0, cache_read = 0.25, cache_write = 12.5 }
 
 [presets.agents.claude-code.slots]
-main = "claude-sonnet-5-5"
 sonnet = "claude-sonnet-5-5"
 haiku = "claude-haiku-5-5"
 fable = "claude-fable-5-1"
@@ -1408,7 +1404,6 @@ reasoning = ["low", "high", "max"]
 cost = { input = 1.74, output = 3.84, cache_read = 0.145 }
 
 [presets.agents.claude-code.slots]
-main = "claude-sonnet-5-5"
 sonnet = "claude-sonnet-5-5"
 haiku = "claude-haiku-5-5"
 
@@ -1511,12 +1506,10 @@ reasoning = ["low", "medium", "high"]
 cost = { input = 0.1, output = 0.5, cache_read = 0.01, cache_write = 0.125 }
 
 [presets.agents.claude-code.slots]
-main = "qwen3.8-max"
 opus = "qwen3.8-max"
 sonnet = "minimax-m3"
 fable = "qwen3.8-max"
 haiku = "claude-haiku-5-5"
-subagent = "minimax-m3"
 
 [presets.agents.codex]
 default_model = "gpt-6-luna"
@@ -1600,7 +1593,6 @@ reasoning = ["low", "medium", "high"]
 cost = { input = 0.75, output = 3.75, cache_read = 0.075 }
 
 [presets.agents.claude-code.slots]
-main = "anthropic/claude-sonnet-5.5"
 sonnet = "anthropic/claude-sonnet-5.5"
 haiku = "anthropic/claude-haiku-5.5"
 

@@ -106,18 +106,26 @@ pub fn is_floor_top(key: &str) -> bool {
     FLOOR_TOP.contains(&key)
 }
 
-/// 六个槽位和它们写进 `env` 的键。
+/// 五个槽位和它们写进 `env` 的键。
+///
+/// 不写 `ANTHROPIC_MODEL`：它每次启动都压过 `/model` 存下的选择。启动用哪个模型交给 Claude Code 和 `/model`，
+/// 第三方的别名都指到这家的模型（用户 10-13 定的）。子代理默认留空，用户填了才写。
 pub const SLOTS: &[(Slot, &str)] = &[
-    (slot("main"), "ANTHROPIC_MODEL"),
-    (slot("opus"), "ANTHROPIC_DEFAULT_OPUS_MODEL"),
-    (slot("sonnet"), "ANTHROPIC_DEFAULT_SONNET_MODEL"),
-    (slot("fable"), "ANTHROPIC_DEFAULT_FABLE_MODEL"),
-    (slot("haiku"), "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-    (slot("subagent"), "CLAUDE_CODE_SUBAGENT_MODEL"),
+    (slot("opus", true), "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+    (slot("sonnet", true), "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+    (slot("fable", true), "ANTHROPIC_DEFAULT_FABLE_MODEL"),
+    (slot("haiku", true), "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+    (slot("subagent", false), "CLAUDE_CODE_SUBAGENT_MODEL"),
 ];
 
-const fn slot(key: &'static str) -> Slot {
-    Slot { key }
+/// 以前有、现在去掉的槽位：`providers.json` 里存着的读进来时丢掉（`store::parse`）。
+pub const RETIRED_SLOTS: &[&str] = &["main"];
+
+/// 文件里 `ANTHROPIC_MODEL` 的模型：存成供应商时收进目录（排在最前），不当槽位。
+const MAIN_MODEL: &str = "ANTHROPIC_MODEL";
+
+const fn slot(key: &'static str, auto: bool) -> Slot {
+    Slot { key, auto }
 }
 
 /// 切到这家供应商的补丁；`None` 是「默认」：清掉关键字段，还原成 Claude Code 自带的登录。
@@ -304,16 +312,21 @@ pub fn setup(path: &Path, bytes: Option<&[u8]>) -> Result<Option<FileSetup>, Pat
     let env = doc.get("env").and_then(Value::as_object);
     let mut models: Vec<Model> = Vec::new();
     let mut slots = BTreeMap::new();
-    for (slot, name) in SLOTS {
+    let keys = [(None, MAIN_MODEL)]
+        .into_iter()
+        .chain(SLOTS.iter().map(|(slot, name)| (Some(slot), *name)));
+    for (slot, name) in keys {
         let value = env
-            .and_then(|env| env.get(*name))
+            .and_then(|env| env.get(name))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|model| !model.is_empty());
         let Some((id, long)) = value.map(strip_one_m).filter(|(id, _)| !id.is_empty()) else {
             continue;
         };
-        slots.insert(slot.key.to_string(), id.to_string());
+        if let Some(slot) = slot {
+            slots.insert(slot.key.to_string(), id.to_string());
+        }
         // 带 `[1m]` 的记成 1M 上下文，存成供应商后再写回来还是带着。
         let context = long.then_some(ONE_M_TOKENS);
         match models.iter_mut().find(|seen| seen.id == id) {
@@ -371,7 +384,7 @@ mod tests {
 }"#;
 
     #[test]
-    fn third_party_fills_every_slot_and_keeps_user_keys() {
+    fn third_party_fills_the_alias_slots_and_keeps_user_keys() {
         let provider = relay();
         assert_eq!(
             apply(Some(&provider), LIVE),
@@ -382,11 +395,9 @@ mod tests {
                     "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.6",
                     "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
                     "DISABLE_TELEMETRY": "1",
-                    "ANTHROPIC_MODEL": "glm-4.6",
                     "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.6",
                     "ANTHROPIC_DEFAULT_FABLE_MODEL": "glm-4.6",
-                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.6",
-                    "CLAUDE_CODE_SUBAGENT_MODEL": "glm-4.6"
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.6"
                 },
                 "permissions": {"allow": ["Bash"]},
                 "statusLine": {"type": "command", "command": "~/bin/status"}
@@ -439,8 +450,28 @@ mod tests {
         );
         let out = apply(Some(&provider), LIVE);
         assert!(out["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
-        assert_eq!(out["env"]["ANTHROPIC_MODEL"], json!("glm-4.6"));
+        assert_eq!(out["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], json!("glm-4.6"));
         assert_eq!(out["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], json!("glm-4.6"));
+    }
+
+    /// 子代理默认不写；用户填了才写。`ANTHROPIC_MODEL` 从来不写，文件里原来有的清掉。
+    #[test]
+    fn the_subagent_slot_is_written_only_when_chosen() {
+        let mut provider = relay();
+        let pre = r#"{"env": {"ANTHROPIC_MODEL": "old", "CLAUDE_CODE_SUBAGENT_MODEL": "old"}}"#;
+        let out = apply(Some(&provider), pre);
+        assert!(out["env"].get("ANTHROPIC_MODEL").is_none());
+        assert!(out["env"].get("CLAUDE_CODE_SUBAGENT_MODEL").is_none());
+
+        provider.overrides.insert(
+            AGENT,
+            AgentOverride {
+                slots: BTreeMap::from([("subagent".into(), "glm-4.5-air".into())]),
+                ..AgentOverride::default()
+            },
+        );
+        let out = apply(Some(&provider), pre);
+        assert_eq!(out["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], json!("glm-4.5-air"));
     }
 
     #[test]
@@ -646,7 +677,7 @@ mod tests {
             },
         );
         let env = &apply(Some(&provider), "{}")["env"];
-        assert_eq!(env["ANTHROPIC_MODEL"], "glm-4.6[1m]");
+        assert_eq!(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "glm-4.6[1m]");
         assert_eq!(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "glm-4.6[1m]");
         assert_eq!(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "glm-4.5-air");
 
@@ -655,12 +686,12 @@ mod tests {
         provider.overrides.insert(
             AGENT,
             AgentOverride {
-                slots: [("main".into(), "glm-4.6[1M]".into())].into(),
+                slots: [("opus".into(), "glm-4.6[1M]".into())].into(),
                 ..AgentOverride::default()
             },
         );
         assert_eq!(
-            apply(Some(&provider), "{}")["env"]["ANTHROPIC_MODEL"],
+            apply(Some(&provider), "{}")["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
             "glm-4.6[1M]"
         );
 
@@ -671,12 +702,12 @@ mod tests {
         official.overrides.insert(
             AGENT,
             AgentOverride {
-                slots: [("main".into(), "glm-4.6".into())].into(),
+                slots: [("opus".into(), "glm-4.6".into())].into(),
                 ..AgentOverride::default()
             },
         );
         assert_eq!(
-            apply(Some(&official), "{}")["env"]["ANTHROPIC_MODEL"],
+            apply(Some(&official), "{}")["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
             "glm-4.6"
         );
     }
@@ -693,6 +724,7 @@ mod tests {
     #[test]
     fn setup_reads_the_address_key_and_slots() {
         // 带 `[1m]` 的去掉后缀，记成 1M 上下文；同一个模型别的槽位没带也算。
+        // `ANTHROPIC_MODEL` 的模型收进目录、排第一，不是槽位。
         let text = r#"{"env": {
             "ANTHROPIC_BASE_URL": "https://relay.elsewhere.io",
             "ANTHROPIC_AUTH_TOKEN": "sk-x",
@@ -717,7 +749,6 @@ mod tests {
         assert_eq!(
             read.slots,
             BTreeMap::from([
-                ("main".into(), "glm-4.6".into()),
                 ("opus".into(), "glm-4.6".into()),
                 ("haiku".into(), "glm-4.5-air".into()),
             ])

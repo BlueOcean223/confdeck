@@ -577,6 +577,7 @@ impl ConfigPage {
 
     /// 槽位选了一个模型。目录里没有的先加进目录（decisions「模型」）。
     /// 给一个槽位选模型；`None` 是「留空」，覆盖里存空串，这个环境变量就不写（core 的 `agent::slots`）。
+    /// 本来就默认留空的槽位（子代理）留空就是没填，从覆盖里删掉。
     fn set_slot(
         &mut self,
         key: &'static str,
@@ -593,12 +594,21 @@ impl ConfigPage {
         if let Some(model) = &model {
             ensure_model(&mut provider, model);
         }
-        provider
-            .overrides
-            .entry(kind)
-            .or_default()
-            .slots
-            .insert(key.to_string(), model.unwrap_or_default());
+        let auto = claude::SLOTS
+            .iter()
+            .any(|(slot, _)| slot.key == key && slot.auto);
+        let o = provider.overrides.entry(kind).or_default();
+        match model {
+            None if !auto => {
+                o.slots.remove(key);
+            }
+            model => {
+                o.slots.insert(key.to_string(), model.unwrap_or_default());
+            }
+        }
+        if *o == AgentOverride::default() {
+            provider.overrides.remove(&kind);
+        }
         self.menu = None;
         self.stage(provider, window, cx);
     }
@@ -1690,7 +1700,6 @@ fn in_use(store: &Store, agent: usize) -> Vec<String> {
 /// 槽位的名字（core 的 `claude::SLOTS`）。
 fn slot_label(key: &str) -> SharedString {
     match key {
-        "main" => t!("config.slot_main").into(),
         "opus" => t!("config.slot_opus").into(),
         "sonnet" => t!("config.slot_sonnet").into(),
         "fable" => t!("config.slot_fable").into(),
