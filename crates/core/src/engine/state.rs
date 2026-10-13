@@ -9,6 +9,8 @@
 //! - `hidden_on_page`、`hidden_in_panel`：用户在设置页「显示哪些 agent」里关掉的 agent（id），
 //!   分别对应主窗口的 Agent 页和菜单栏面板。没写就是都显示，新接上的 agent 自然也显示。
 //! - `proxy`：设置页的出站代理（[`crate::net::Proxy`]）。没写是「跟随系统」。代理多半是本机的端口，所以只存本机。
+//! - `checks`：每家供应商、每个官方账号的额度查询设置（[`crate::quota::Check`]），键是 `provider:<id>`、`account:<agent>:<id>`。
+//!   没写是默认值。多久查一次是这台设备的事，不同步。
 //!
 //! 这份记录只是提示，丢了或读不出来就当作空的：后果只是多备份一次、认不出同地址的几家里是哪一家，
 //! 所以不像用户的文件那样「读不出就报错」。
@@ -23,6 +25,7 @@ use serde_json::Value;
 use crate::fsx::{self, Digest, Mode};
 use crate::net::Proxy;
 use crate::patch::KeyPath;
+use crate::quota::Check;
 
 const VERSION: u32 = 1;
 
@@ -47,6 +50,8 @@ pub struct State {
     hidden_in_panel: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Proxy::is_default")]
     proxy: Proxy,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    checks: BTreeMap<String, Check>,
 }
 
 /// 「显示哪些 agent」分两处：主窗口的 Agent 页、菜单栏面板。
@@ -135,6 +140,19 @@ impl State {
         self.proxy = proxy;
     }
 
+    pub fn checks(&self) -> &BTreeMap<String, Check> {
+        &self.checks
+    }
+
+    /// 默认值不存。
+    pub fn set_check(&mut self, key: &str, check: Check) {
+        if check.is_default() {
+            self.checks.remove(key);
+        } else {
+            self.checks.insert(key.to_string(), check);
+        }
+    }
+
     pub fn owned(&self, agent: &str) -> &[Owned] {
         self.owned.get(agent).map_or(&[], Vec::as_slice)
     }
@@ -167,6 +185,42 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn checks_keep_only_what_was_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = State::load(&path);
+        state.set_check(
+            "provider:deepseek",
+            Check {
+                off: true,
+                every: None,
+            },
+        );
+        state.set_check(
+            "account:codex:abc",
+            Check {
+                off: false,
+                every: Some(15),
+            },
+        );
+        state.set_check("provider:kimi", Check::default());
+        state.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("kimi"),
+            "default values are not stored: {text}"
+        );
+        let state = State::load(&path);
+        assert!(state.checks()["provider:deepseek"].off);
+        assert_eq!(state.checks()["account:codex:abc"].every, Some(15));
+        // 在用的默认 5 分钟，不在用的不自动查；关掉的都不查；设了的照设的。
+        assert_eq!(Check::default().every(true), Check::DEFAULT_EVERY);
+        assert_eq!(Check::default().every(false), 0);
+        assert_eq!(state.checks()["provider:deepseek"].every(true), 0);
+        assert_eq!(state.checks()["account:codex:abc"].every(false), 15);
+    }
 
     #[test]
     fn round_trips_and_tolerates_a_broken_file() {

@@ -4,12 +4,14 @@
 //! - 汇总一次算好四个时间段和热力图，切时间段不用等。算完把请求丢掉，只留汇总。
 //! - 会话页的会话列表也从这里来：扫的时候顺带记下的（core 的 `session`），文件已经不在的不要。
 //! - 价格用 models.dev 时只读磁盘上的缓存，不联网（供应商页拉列表、补全时会下）。
-//! - 余额（core 的 `balance`）和订阅额度（core 的 `quota`）：打开供应商页、菜单栏面板时查（10-13 起画在那两处，
-//!   不在用量页），能查的每家一个后台任务，同时查；5 分钟内不重查，供应商页点刷新按钮才重查。重查时先留着上次的数，
-//!   查回来再换。存下的官方账号也各查各的（`QuotaOf::Account`）。
-//! - Claude 官方的额度先不查（10-13 用户还没想好怎么查），官方那一行的额度一栏空着。
+//! - 余额（core 的 `balance`）和订阅额度（core 的 `quota`）画在供应商页、菜单栏面板（10-13 起不在用量页）。
+//!   每家供应商、每个官方账号（[`CheckOf`]）各有一份设置（core 的 `quota::Check`，存在 `state.json`）：关掉的不查；
+//!   自动查的到点就查（[`Store::check_due`]：每 30 秒看一次，打开面板、切到供应商页时也看）；在用的默认 5 分钟，
+//!   不在用的默认不自动查，那一格是个圆形箭头，点了查。供应商页点刷新是没关掉的全查（[`Store::check_all`]）。
+//!   一家一个后台任务，重查时先留着上次的数，查回来再换。存下的官方账号也各查各的（`QuotaOf::Account`）。
+//! - Claude 官方的额度先不查（10-13 用户说先不做），官方那一行的额度一栏空着。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,7 +22,8 @@ use confdeck_core::current::Current;
 use confdeck_core::fsx;
 use confdeck_core::models_dev::{self, ModelsDev};
 use confdeck_core::net::Http;
-use confdeck_core::quota::{self, Quota, QuotaError};
+use confdeck_core::provider::Provider;
+use confdeck_core::quota::{self, Check, Quota, QuotaError};
 use confdeck_core::session::Session;
 use confdeck_core::usage::history::{self, Target};
 use confdeck_core::usage::summary::{self, Context as Pricing, Heatmap, Period, Source, Summary};
@@ -45,9 +48,43 @@ pub struct UsageState {
     /// Claude、Codex、Grok Build 官方和各家套餐的额度。还在查、没查过的没有。
     pub quotas: HashMap<QuotaOf, Result<Quota, QuotaError>>,
     pub quota_checking: Vec<QuotaOf>,
-    /// 上次查余额和额度的时候。
-    checked_at: Option<Instant>,
+    /// 每家、每个账号上次开始查的时候。
+    checked_at: HashMap<CheckOf, Instant>,
+    /// 额度查询的设置（`state.json` 的 `checks`），`Store::reload` 时重读。
+    pub checks: BTreeMap<String, Check>,
+    /// 定时查的循环起了没有。
+    ticking: bool,
 }
+
+/// 额度查询的设置管的是谁：一家供应商，或一个官方账号。
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum CheckOf {
+    Provider(String),
+    /// 官方账号（账号 ID，登着的和存下的都是）。
+    Account(AgentKind, String),
+    /// 登录文件里认不出是谁（没登录、Codex 的登录在钥匙串里）：照样查一次，好写「未登录」。
+    Login(AgentKind),
+}
+
+impl CheckOf {
+    /// `state.json` 里 `checks` 的键。
+    pub fn key(&self) -> String {
+        match self {
+            CheckOf::Provider(id) => format!("provider:{id}"),
+            CheckOf::Account(kind, id) => format!("account:{}:{id}", kind.id()),
+            CheckOf::Login(kind) => format!("login:{}", kind.id()),
+        }
+    }
+}
+
+/// 查什么。
+enum Job {
+    Quota(QuotaOf, QuotaJob),
+    Balance(Provider),
+}
+
+/// 每隔多久看一次有没有到点该查的。
+const TICK: Duration = Duration::from_secs(30);
 
 /// 谁的额度。
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -62,9 +99,6 @@ pub enum QuotaOf {
 
 /// 后台查一家额度。
 type QuotaJob = Box<dyn FnOnce(&Http) -> Result<Quota, QuotaError> + Send>;
-
-/// 余额和额度多久以内不重查（点刷新按钮除外）。
-const REMOTE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
 pub struct Loaded {
     /// 和 [`PERIODS`] 一一对应。
@@ -157,71 +191,112 @@ impl Store {
         .detach();
     }
 
-    /// 联网查的那些：余额、官方订阅的额度、套餐额度。
-    pub(crate) fn refresh_remote(&mut self, force: bool, cx: &mut Context<Self>) {
-        let fresh = self
-            .usage
-            .checked_at
-            .is_some_and(|at| at.elapsed() < REMOTE_MAX_AGE);
-        if fresh && !force {
+    /// 一家供应商、一个账号的额度查询设置；没设过是默认值。
+    pub fn check_of(&self, target: &CheckOf) -> Check {
+        self.usage
+            .checks
+            .get(&target.key())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// 改一家供应商、一个账号的额度查询设置，改完按新的设置看一次要不要查。
+    pub fn set_check(&mut self, target: &CheckOf, check: Check, cx: &mut Context<Self>) {
+        let was_off = self.check_of(target).off;
+        if let Err(err) = self.engine.set_check(&target.key(), check) {
+            let notice = crate::data::Notice::err(err.to_string());
+            self.announce(&[notice], cx);
             return;
         }
-        self.usage.checked_at = Some(Instant::now());
-        self.refresh_quotas(cx);
-        let proxy = self.proxy();
-        for provider in self.providers.iter().filter(|p| balance::supported(p)) {
-            if self.usage.checking.contains(&provider.id) {
-                continue;
-            }
-            self.usage.checking.push(provider.id.clone());
-            let provider = provider.clone();
-            let proxy = proxy.clone();
-            let task = cx.background_executor().spawn(async move {
-                #[cfg(debug_assertions)]
-                if let Some(result) = fake_balance(&provider.id) {
-                    return (provider.id, result);
-                }
-                let result = Http::new(&proxy)
-                    .map_err(BalanceError::Net)
-                    .and_then(|http| balance::query(&http, &provider));
-                (provider.id, result)
-            });
-            cx.spawn(async move |this, cx| {
-                let (id, result) = task.await;
-                this.update(cx, |store, cx| {
-                    store.usage.checking.retain(|checking| checking != &id);
-                    store.usage.balances.insert(id, result);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
+        self.usage.checks = self.engine.checks();
+        // 刚打开的：马上查一次，不等间隔。
+        if was_off && !check.off {
+            self.check_one(target, cx);
         }
+        self.check_due(cx);
         cx.notify();
     }
 
-    /// 重查所有额度（不管 5 分钟内查没查过）。加了账号以后用：新账号还没有读数。
-    pub(crate) fn refresh_quotas(&mut self, cx: &mut Context<Self>) {
-        let proxy = self.proxy();
-        let home = self.home.clone();
-        // Claude 官方的额度先不查（10-13 用户说还没想好怎么做）。
-        let mut jobs: Vec<(QuotaOf, QuotaJob)> = Vec::new();
-        for agent in &self.agents {
-            if !agent.installed {
-                continue;
+    /// 这家、这个账号算不算在用：有 agent 选着的供应商，登录文件里登着的官方账号（agent 暂时在用第三方也算）。
+    pub fn in_use(&self, target: &CheckOf) -> bool {
+        match target {
+            CheckOf::Provider(id) => self
+                .providers
+                .iter()
+                .position(|p| &p.id == id)
+                .is_some_and(|i| !self.users_of(i).is_empty()),
+            CheckOf::Account(kind, id) => match self.live_account(*kind) {
+                Some(Live::Known(live)) => live == id,
+                Some(Live::Unknown(identity)) => &identity.id == id,
+                _ => false,
+            },
+            CheckOf::Login(_) => true,
+        }
+    }
+
+    /// 登录文件里那个官方账号的设置管它：认得出是谁就是那个账号，认不出是 `Login`。
+    pub fn live_target(&self, kind: AgentKind) -> CheckOf {
+        match self.live_account(kind) {
+            Some(Live::Known(id)) => CheckOf::Account(kind, id.clone()),
+            Some(Live::Unknown(identity)) => CheckOf::Account(kind, identity.id.clone()),
+            _ => CheckOf::Login(kind),
+        }
+    }
+
+    /// 起定时查的循环（第一次打开面板或主窗口时调，之后调了也只起一次）。
+    pub(crate) fn start_checks(&mut self, cx: &mut Context<Self>) {
+        if self.usage.ticking {
+            return;
+        }
+        self.usage.ticking = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TICK).await;
+                if this.update(cx, |store, cx| store.check_due(cx)).is_err() {
+                    break;
+                }
             }
-            let home = home.clone();
-            match agent.kind {
-                AgentKind::Codex => jobs.push((
-                    QuotaOf::Agent(agent.kind),
-                    Box::new(move |http| quota::codex(http, &home)),
-                )),
-                AgentKind::GrokBuild => jobs.push((
-                    QuotaOf::Agent(agent.kind),
-                    Box::new(move |http| quota::grok(http, &home)),
-                )),
-                _ => {}
-            }
+        })
+        .detach();
+    }
+
+    /// 到点的自动查：自动查的间隔不是 0、离上次查过了这么久的。
+    pub(crate) fn check_due(&mut self, cx: &mut Context<Self>) {
+        self.start_checks(cx);
+        let now = Instant::now();
+        self.run_checks(cx, |store, target| {
+            let every = store.check_of(target).every(store.in_use(target));
+            every > 0
+                && store.usage.checked_at.get(target).is_none_or(|at| {
+                    now.duration_since(*at) >= Duration::from_secs(u64::from(every) * 60)
+                })
+        });
+    }
+
+    /// 供应商页点刷新：没关掉的全查。
+    pub(crate) fn check_all(&mut self, cx: &mut Context<Self>) {
+        self.run_checks(cx, |_, _| true);
+    }
+
+    /// 只查这一个（行里和「额度查询」卡片里的圆形箭头、切了账号、加了账号以后）。
+    pub(crate) fn check_one(&mut self, target: &CheckOf, cx: &mut Context<Self>) {
+        self.run_checks(cx, |_, t| t == target);
+    }
+
+    /// 能查的每一个：供应商的套餐额度或余额、官方登录、存下的账号。Claude 官方的先不查（10-13 用户说先不做）。
+    fn jobs(&self) -> Vec<(CheckOf, Job)> {
+        let mut jobs: Vec<(CheckOf, Job)> = Vec::new();
+        for agent in self.agents.iter().filter(|a| a.installed) {
+            let home = self.home.clone();
+            let job: QuotaJob = match agent.kind {
+                AgentKind::Codex => Box::new(move |http| quota::codex(http, &home)),
+                AgentKind::GrokBuild => Box::new(move |http| quota::grok(http, &home)),
+                _ => continue,
+            };
+            jobs.push((
+                self.live_target(agent.kind),
+                Job::Quota(QuotaOf::Agent(agent.kind), job),
+            ));
         }
         // 存下的官方账号各查各的：用存着的登录。登着的那个上面已经查了。
         for account in &self.accounts.list {
@@ -229,60 +304,139 @@ impl Store {
             let installed = self.agents.iter().any(|a| a.kind == kind && a.installed);
             let live =
                 matches!(self.live_account(kind), Some(Live::Known(id)) if *id == account.id);
-            if !installed || live || self.account_blocked(kind) {
+            if !installed || live || self.account_blocked(kind) || !account::supported(kind) {
                 continue;
             }
             let data = self.engine.data().clone();
             let id = account.id.clone();
+            let job: QuotaJob = Box::new(move |http| {
+                let login =
+                    account::stored_login(&data, kind, &id).map_err(|_| QuotaError::NotLoggedIn)?;
+                match kind {
+                    AgentKind::Codex => quota::codex_login(http, &login),
+                    AgentKind::GrokBuild => quota::grok_login(http, &login),
+                    _ => Err(QuotaError::NotLoggedIn),
+                }
+            });
             jobs.push((
-                QuotaOf::Account(kind, id.clone()),
-                Box::new(move |http| {
-                    let login = account::stored_login(&data, kind, &id)
-                        .map_err(|_| QuotaError::NotLoggedIn)?;
-                    match kind {
-                        AgentKind::Codex => quota::codex_login(http, &login),
-                        AgentKind::GrokBuild => quota::grok_login(http, &login),
-                        _ => Err(QuotaError::NotLoggedIn),
-                    }
-                }),
+                CheckOf::Account(kind, account.id.clone()),
+                Job::Quota(QuotaOf::Account(kind, account.id.clone()), job),
             ));
         }
-        for provider in self.providers.iter().filter(|p| quota::plan_supported(p)) {
-            let provider = provider.clone();
-            jobs.push((
-                QuotaOf::Provider(provider.id.clone()),
-                Box::new(move |http| quota::plan(http, &provider)),
-            ));
+        for provider in &self.providers {
+            let target = CheckOf::Provider(provider.id.clone());
+            if quota::plan_supported(provider) {
+                let found = provider.clone();
+                jobs.push((
+                    target,
+                    Job::Quota(
+                        QuotaOf::Provider(provider.id.clone()),
+                        Box::new(move |http| quota::plan(http, &found)),
+                    ),
+                ));
+            } else if balance::supported(provider) {
+                jobs.push((target, Job::Balance(provider.clone())));
+            }
         }
-        for (of, job) in jobs {
-            if self.usage.quota_checking.contains(&of) {
+        jobs
+    }
+
+    /// 查 `pick` 选中的、没关掉的、没在查的。
+    fn run_checks(&mut self, cx: &mut Context<Self>, pick: impl Fn(&Self, &CheckOf) -> bool) {
+        let proxy = self.proxy();
+        let now = Instant::now();
+        for (target, job) in self.jobs() {
+            if self.check_of(&target).off || !pick(self, &target) {
                 continue;
             }
-            self.usage.quota_checking.push(of.clone());
-            let proxy = proxy.clone();
-            let task = cx.background_executor().spawn(async move {
-                #[cfg(debug_assertions)]
-                if let Some(result) = fake_quota(&of) {
-                    return (of, result);
+            match job {
+                Job::Quota(of, job) => {
+                    if self.usage.quota_checking.contains(&of) {
+                        continue;
+                    }
+                    self.usage.checked_at.insert(target, now);
+                    self.usage.quota_checking.push(of.clone());
+                    let proxy = proxy.clone();
+                    let task = cx.background_executor().spawn(async move {
+                        #[cfg(debug_assertions)]
+                        if let Some(result) = fake_quota(&of) {
+                            return (of, result);
+                        }
+                        let result = Http::new(&proxy)
+                            .map_err(QuotaError::Net)
+                            .and_then(|http| job(&http));
+                        (of, result)
+                    });
+                    cx.spawn(async move |this, cx| {
+                        let (of, result) = task.await;
+                        this.update(cx, |store, cx| {
+                            store
+                                .usage
+                                .quota_checking
+                                .retain(|checking| checking != &of);
+                            store.usage.quotas.insert(of, result);
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
                 }
-                let result = Http::new(&proxy)
-                    .map_err(QuotaError::Net)
-                    .and_then(|http| job(&http));
-                (of, result)
-            });
-            cx.spawn(async move |this, cx| {
-                let (of, result) = task.await;
-                this.update(cx, |store, cx| {
-                    store
+                Job::Balance(provider) => {
+                    if self.usage.checking.contains(&provider.id) {
+                        continue;
+                    }
+                    self.usage.checked_at.insert(target, now);
+                    self.usage.checking.push(provider.id.clone());
+                    let proxy = proxy.clone();
+                    let task = cx.background_executor().spawn(async move {
+                        #[cfg(debug_assertions)]
+                        if let Some(result) = fake_balance(&provider.id) {
+                            return (provider.id, result);
+                        }
+                        let result = Http::new(&proxy)
+                            .map_err(BalanceError::Net)
+                            .and_then(|http| balance::query(&http, &provider));
+                        (provider.id, result)
+                    });
+                    cx.spawn(async move |this, cx| {
+                        let (id, result) = task.await;
+                        this.update(cx, |store, cx| {
+                            store.usage.checking.retain(|checking| checking != &id);
+                            store.usage.balances.insert(id, result);
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 有没有哪家、哪个账号在查（供应商页的刷新按钮转）。
+    pub fn checking_any(&self) -> bool {
+        !self.usage.checking.is_empty() || !self.usage.quota_checking.is_empty()
+    }
+
+    /// 这一个现在是不是在查。
+    pub fn checking_target(&self, target: &CheckOf) -> bool {
+        match target {
+            CheckOf::Provider(id) => {
+                self.usage.checking.contains(id)
+                    || self
                         .usage
                         .quota_checking
-                        .retain(|checking| checking != &of);
-                    store.usage.quotas.insert(of, result);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
+                        .contains(&QuotaOf::Provider(id.clone()))
+            }
+            CheckOf::Account(kind, _) if self.in_use(target) => {
+                self.usage.quota_checking.contains(&QuotaOf::Agent(*kind))
+            }
+            CheckOf::Account(kind, id) => self
+                .usage
+                .quota_checking
+                .contains(&QuotaOf::Account(*kind, id.clone())),
+            CheckOf::Login(kind) => self.usage.quota_checking.contains(&QuotaOf::Agent(*kind)),
         }
     }
 

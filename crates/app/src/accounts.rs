@@ -16,6 +16,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{Notice, Selection, Store};
+use crate::usage::CheckOf;
 
 #[derive(Default)]
 pub(crate) struct AccountState {
@@ -215,6 +216,7 @@ impl Store {
                     .remove(&kind)
                     .is_some_and(|pending| pending.cancelled);
                 store.reload();
+                let added = result.as_ref().ok().map(|account| account.id.clone());
                 let notice = match result {
                     Ok(account) => Notice::ok(t!(
                         "accounts.added",
@@ -228,7 +230,11 @@ impl Store {
                 };
                 store.announce(&[notice], cx);
                 // 新加的账号还没有额度读数，不查的话一直是占位条，要等下一次刷新（10-13 用户截图里看到的）。
-                store.refresh_quotas(cx);
+                if let Some(id) = added {
+                    store.check_one(&CheckOf::Account(kind, id), cx);
+                }
+                let live = store.live_target(kind);
+                store.check_one(&live, cx);
             })
             .ok();
         })
@@ -304,7 +310,8 @@ impl Store {
                 };
                 store.announce(&notices, cx);
                 // 额度跟着账号走（Grok 联网查的是登录文件里的账号）。
-                store.refresh_remote(true, cx);
+                let live = store.live_target(kind);
+                store.check_one(&live, cx);
                 notices
             })
             .unwrap_or_default()

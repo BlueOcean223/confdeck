@@ -20,6 +20,7 @@ use crate::data::{self, Logo, Selection, Store};
 use crate::quota_view::{self, Reading};
 use crate::theme::Theme;
 use crate::ui::{self, Button};
+use crate::usage::CheckOf;
 
 /// 哪家的官方登录：预设 ID（图标）和名字。
 pub fn vendor(kind: AgentKind) -> Option<(&'static str, &'static str)> {
@@ -203,6 +204,15 @@ struct Editing {
     _subscriptions: Vec<Subscription>,
 }
 
+pub enum OfficialsEvent {
+    /// 「⋯」里点了「额度查询」。
+    Check {
+        target: CheckOf,
+        name: SharedString,
+        logo: Logo,
+    },
+}
+
 /// 供应商页最上面官方那一组。
 pub struct Officials {
     store: Entity<Store>,
@@ -215,6 +225,8 @@ pub struct Officials {
     editing: Option<Editing>,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<OfficialsEvent> for Officials {}
 
 impl Officials {
     pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -445,9 +457,6 @@ impl Officials {
         let note = entry.and_then(|entry| entry.note.clone());
         let blocked = store.account_blocked(kind);
         ui::row(t, false, first)
-            .when_some(key.clone(), |r, (_, id)| {
-                r.group(SharedString::from(format!("official-{agent}-{id}")))
-            })
             .child(ui::logo(logo(store, agent), 22., t, window, cx))
             .child(title_column(
                 t,
@@ -457,7 +466,9 @@ impl Officials {
                 note,
             ))
             .child(match &reading {
-                Some(reading) => quota_view::cells(t, &format!("official-{agent}"), reading),
+                Some(reading) => {
+                    quota_view::cells(t, &format!("official-{agent}"), reading, &self.store)
+                }
                 None => quota_view::blank(),
             })
             .child(div().flex_1())
@@ -568,9 +579,6 @@ impl Officials {
         ui::row(t, false, false)
             .min_h(px(42.))
             .py(px(4.))
-            .when_some(key.clone(), |r, (_, id)| {
-                r.group(SharedString::from(format!("official-{agent}-{id}")))
-            })
             .child(indent())
             .child(with_note(
                 name_column(true).child(
@@ -593,7 +601,9 @@ impl Officials {
                 entry.note.clone(),
             ))
             .child(match &entry.reading {
-                Some(reading) => quota_view::cells(t, &format!("account-{agent}-{n}"), reading),
+                Some(reading) => {
+                    quota_view::cells(t, &format!("account-{agent}-{n}"), reading, &self.store)
+                }
                 None => quota_view::blank(),
             })
             .child(div().flex_1())
@@ -644,11 +654,8 @@ impl Officials {
                 .into_any_element();
         }
         let open = self.menu.as_ref() == Some(&key);
-        let group = SharedString::from(format!("official-{agent}-{}", key.1));
         let toggle = key.clone();
-        let more = ui::icon_button(ElementId::Name(format!("more-{tag}").into()), t, "ellipsis")
-            .when(open, |b| b.bg(t.pill))
-            .when(!open, |b| b.invisible().group_hover(group, |s| s.visible()))
+        let more = ui::more_button(ElementId::Name(format!("more-{tag}").into()), t, open)
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_menu(toggle.clone(), cx)));
         div()
             .h_flex()
@@ -661,58 +668,70 @@ impl Officials {
             .into_any_element()
     }
 
-    /// 「⋯」里的菜单：编辑（名字和备注）；存下的能删除。
+    /// 「⋯」里的菜单：编辑（名字和备注）、额度查询（Claude 的先不查）；存下的能删除。
     fn menu_list(&self, key: Key, stored: bool, t: &Theme, cx: &Context<Self>) -> impl IntoElement {
-        let hover = t.sel;
-        let item = |id: &'static str, label: SharedString, color: Hsla| {
-            div()
-                .id(id)
-                .h_flex()
-                .items_center()
-                .h(px(30.))
-                .px(px(9.))
-                .rounded(px(7.))
-                .text_size(px(12.5))
-                .text_color(color)
-                .cursor_pointer()
-                .hover(move |s| s.bg(hover))
-                .child(label)
-        };
         let edit = key.clone();
         let remove = key.clone();
-        let closed = key;
-        div()
-            .v_flex()
-            .w(px(120.))
-            .p(px(5.))
-            .bg(Hsla { a: 1., ..t.pop_bg })
-            .rounded(px(11.))
-            .border_1()
-            .border_color(t.line)
-            .shadow(t.pop_shadow())
-            .occlude()
+        let closed = key.clone();
+        let target = CheckOf::Account(key.0, key.1.clone());
+        let checkable = self.store.read(cx).checkable(&target);
+        ui::menu(t)
             .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
                 this.menu = None;
                 this.just_closed = Some(closed.clone());
                 cx.notify();
             }))
             .child(
-                item("account-edit", t!("accounts.edit").into(), t.fg).on_click(cx.listener(
+                ui::menu_item("account-edit", t, t!("accounts.edit"), false).on_click(cx.listener(
                     move |this, _, window, cx| this.start_edit(edit.clone(), window, cx),
                 )),
             )
-            .when(stored, |menu| {
-                menu.child(div().h(px(1.)).mx(px(4.)).my(px(4.)).bg(t.line_2))
-                    .child(
-                        item("account-remove", t!("accounts.remove").into(), t.danger).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.menu = None;
-                                this.removing = Some(remove.clone());
-                                cx.notify();
-                            }),
-                        ),
-                    )
+            .when(checkable, |menu| {
+                menu.child(
+                    ui::menu_item("account-check", t, t!("check.title"), false).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.menu = None;
+                            this.open_check(target.clone(), cx);
+                        }),
+                    ),
+                )
             })
+            .when(stored, |menu| {
+                menu.child(ui::menu_divider(t)).child(
+                    ui::menu_item("account-remove", t, t!("accounts.remove"), true).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.menu = None;
+                            this.removing = Some(remove.clone());
+                            cx.notify();
+                        }),
+                    ),
+                )
+            })
+    }
+
+    /// 「额度查询」：交给主窗口盖一层（[`OfficialsEvent::Check`]），名字写账号的名字或邮箱。
+    fn open_check(&mut self, target: CheckOf, cx: &mut Context<Self>) {
+        let (name, logo) = {
+            let store = self.store.read(cx);
+            let CheckOf::Account(kind, id) = &target else {
+                return;
+            };
+            let Some(agent) = store.agents.iter().position(|a| a.kind == *kind) else {
+                return;
+            };
+            let title = store
+                .official_entries(agent)
+                .into_iter()
+                .find(|entry| entry.id.as_deref() == Some(id.as_str()))
+                .map(|entry| entry.title())
+                .unwrap_or_default();
+            (
+                SharedString::from(format!("{} · {title}", name(*kind))),
+                logo(store, agent),
+            )
+        };
+        cx.emit(OfficialsEvent::Check { target, name, logo });
+        cx.notify();
     }
 
     fn editing_for(&self, key: Option<&Key>) -> Option<&Editing> {

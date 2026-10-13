@@ -66,6 +66,10 @@ agents:
     zh-CN: 配置
 
 providers:
+  # 供应商行「⋯」里打开编辑器。
+  edit:
+    en: Edit
+    zh-CN: 编辑
   count_one:
     en: 1 provider
     zh-CN: 1 家供应商
@@ -961,6 +965,10 @@ usage:
 
 quota:
   # 供应商页、官方卡片、菜单栏里的额度和余额。
+  # 不自动查、还没查过的那一格，点了查这一家。
+  check_now:
+    en: Check
+    zh-CN: 查一下
   span_5h:
     en: 5 hours
     zh-CN: 5 小时
@@ -1016,6 +1024,35 @@ quota:
   unknown:
     en: Unrecognized response
     zh-CN: 返回的内容认不出
+
+# 「额度查询」：一家供应商、一个官方账号的额度或余额查不查、多久自动查一次。
+check:
+  title:
+    en: Usage check
+    zh-CN: 额度查询
+  enabled:
+    en: Check
+    zh-CN: 查询
+  every:
+    en: Auto
+    zh-CN: 自动查询
+  never:
+    # 要加引号：YAML 把裸的 Off 当成布尔值。
+    en: "Off"
+    zh-CN: 不自动
+  minutes:
+    en: "%{n} min"
+    zh-CN: "%{n} 分钟"
+  hour:
+    en: 1 hour
+    zh-CN: 1 小时
+  # 这家现在的读数。
+  now:
+    en: Now
+    zh-CN: 现在
+  run:
+    en: Check now
+    zh-CN: 现在查
 
 official:
   # 官方登录当成一家供应商：「Anthropic 官方」。

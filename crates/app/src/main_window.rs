@@ -10,17 +10,19 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::add_provider::{AddEvent, AddProvider};
+use crate::check_sheet::{CheckEvent, CheckSheet};
 use crate::config_page::{self, ConfigEvent, ConfigPage};
 use crate::data::{self, Notice, NoticeKind, Store};
 use crate::editor::{Editor, EditorEvent};
 use crate::net;
-use crate::official::{self, Officials};
+use crate::official::{self, Officials, OfficialsEvent};
 use crate::picker::{Picker, PickerEvent};
 use crate::quota_view;
 use crate::sessions_page::SessionsPage;
 use crate::settings_page::SettingsPage;
 use crate::theme::Theme;
 use crate::ui;
+use crate::usage::CheckOf;
 use crate::usage_page::UsagePage;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -140,8 +142,12 @@ struct OpenConfig {
     _subscription: Subscription,
 }
 
-/// 盖在页面上的弹层：添加供应商的卡片表，或一家供应商的编辑器。
+/// 盖在页面上的弹层：添加供应商的卡片表、一家供应商的编辑器，或「额度查询」。
 enum Overlay {
+    Check {
+        sheet: Entity<CheckSheet>,
+        _subscription: Subscription,
+    },
     Add {
         sheet: Entity<AddProvider>,
         _subscription: Subscription,
@@ -174,6 +180,9 @@ pub struct MainWindow {
     overlay: Option<Overlay>,
     /// 供应商页最上面官方那一组（账号摊在里面）。
     officials: Entity<Officials>,
+    /// 供应商行上打开了「⋯」的那家（ID）；刚被「点外面」关掉的那家（点的正好是它的「⋯」时不要立刻再打开）。
+    provider_menu: Option<String>,
+    provider_menu_closed: Option<String>,
     toasts: Vec<Toast>,
     toast_seq: u64,
     /// 刚被「点外面」关掉的选择器。点的正好是它的下拉框时，不要立刻再打开。
@@ -203,6 +212,16 @@ impl MainWindow {
             }),
         ];
         let officials = cx.new(|cx| Officials::new(store.clone(), window, cx));
+        let mut _subscriptions = _subscriptions;
+        _subscriptions.push(cx.subscribe_in(
+            &officials,
+            window,
+            |this, _, event: &OfficialsEvent, window, cx| match event {
+                OfficialsEvent::Check { target, name, logo } => {
+                    this.open_check(target.clone(), name.clone(), *logo, window, cx)
+                }
+            },
+        ));
         Self {
             store,
             tab: Tab::Agents,
@@ -213,6 +232,8 @@ impl MainWindow {
             sessions: None,
             overlay: None,
             officials,
+            provider_menu: None,
+            provider_menu_closed: None,
             toasts: Vec::new(),
             toast_seq: 0,
             just_closed: None,
@@ -304,9 +325,9 @@ impl MainWindow {
                             this.config = None;
                             this.settings = None;
                             match *tab {
-                                Tab::Providers => this
-                                    .store
-                                    .update(cx, |store, cx| store.refresh_remote(false, cx)),
+                                Tab::Providers => {
+                                    this.store.update(cx, |store, cx| store.check_due(cx))
+                                }
                                 Tab::Usage => this.open_usage(cx),
                                 Tab::Sessions => this.open_sessions(window, cx),
                                 _ => {}
@@ -317,22 +338,21 @@ impl MainWindow {
             )
             .child(div().flex_1())
             .child(
-                ui::icon_button("refresh", t, "rotate-cw").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        match this.tab {
-                            Tab::Providers => this
-                                .store
-                                .update(cx, |store, cx| store.refresh_remote(true, cx)),
-                            Tab::Usage => {
-                                this.store.update(cx, |store, cx| store.refresh_usage(cx))
-                            }
-                            Tab::Sessions => {
-                                this.store.update(cx, |store, cx| store.refresh_usage(cx))
-                            }
-                            _ => {}
-                        }
-                    },
-                )),
+                ui::icon_button_with(
+                    "refresh",
+                    t,
+                    ui::spinning(
+                        ui::icon("rotate-cw", 16., t.ctl_fg),
+                        "refresh-spin",
+                        self.tab == Tab::Providers && self.store.read(cx).checking_any(),
+                    ),
+                )
+                .on_click(cx.listener(|this, _, _, cx| match this.tab {
+                    Tab::Providers => this.store.update(cx, |store, cx| store.check_all(cx)),
+                    Tab::Usage => this.store.update(cx, |store, cx| store.refresh_usage(cx)),
+                    Tab::Sessions => this.store.update(cx, |store, cx| store.refresh_usage(cx)),
+                    _ => {}
+                })),
             )
             .child(
                 ui::icon_button("settings", t, "settings")
@@ -796,7 +816,7 @@ impl MainWindow {
                     .when(meters, |row| {
                         row.child(match &reading {
                             Some(reading) => {
-                                quota_view::cells(t, &format!("provider-{i}"), reading)
+                                quota_view::cells(t, &format!("provider-{i}"), reading, &self.store)
                             }
                             None => quota_view::blank(),
                         })
@@ -829,7 +849,7 @@ impl MainWindow {
                     })
                     .children(reach)
                     .child(key_pill)
-                    .child(ui::icon("chevron-right", 13., t.faint).ml(px(4.))),
+                    .child(self.provider_more(i, provider, t, cx)),
             );
         }
 
@@ -992,13 +1012,116 @@ impl MainWindow {
         cx.notify();
     }
 
-    /// 点弹层外面：编辑器有改动会先问，卡片表直接关。
+    /// 供应商行尾的「⋯」：编辑、额度查询（查得了的）、删除（打开编辑器问一句）。
+    fn provider_more(
+        &self,
+        i: usize,
+        provider: &confdeck_core::provider::Provider,
+        t: &Theme,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let open = self.provider_menu.as_deref() == Some(provider.id.as_str());
+        let id = provider.id.clone();
+        let more = ui::more_button(ElementId::named_usize("provider-more", i), t, open)
+            .ml(px(2.))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if this.provider_menu_closed.take().as_deref() == Some(id.as_str()) {
+                    return;
+                }
+                this.provider_menu = if this.provider_menu.as_deref() == Some(id.as_str()) {
+                    None
+                } else {
+                    Some(id.clone())
+                };
+                cx.notify();
+            }));
+        if !open {
+            return more.into_any_element();
+        }
+        let target = CheckOf::Provider(provider.id.clone());
+        let checkable = self.store.read(cx).checkable(&target);
+        let (edit, remove) = (provider.clone(), provider.clone());
+        let name: SharedString = provider.name.clone().into();
+        let logo = data::logo(provider);
+        let closed = provider.id.clone();
+        let menu = ui::menu(t)
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                this.provider_menu = None;
+                this.provider_menu_closed = Some(closed.clone());
+                cx.notify();
+            }))
+            .child(
+                ui::menu_item("provider-edit", t, t!("providers.edit"), false).on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.provider_menu = None;
+                        this.open_editor(edit.clone(), window, cx);
+                    }),
+                ),
+            )
+            .when(checkable, |menu| {
+                menu.child(
+                    ui::menu_item("provider-check", t, t!("check.title"), false).on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.provider_menu = None;
+                            this.open_check(target.clone(), name.clone(), logo, window, cx);
+                        }),
+                    ),
+                )
+            })
+            .child(ui::menu_divider(t))
+            .child(
+                ui::menu_item("provider-remove", t, t!("accounts.remove"), true).on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.provider_menu = None;
+                        this.open_editor(remove.clone(), window, cx);
+                        if let Some(Overlay::Edit { editor, .. }) = &this.overlay {
+                            editor.update(cx, |editor, cx| editor.ask_delete(cx));
+                        }
+                    }),
+                ),
+            );
+        div()
+            .relative()
+            .child(more)
+            .child(ui::dropdown(menu))
+            .into_any_element()
+    }
+
+    /// 「额度查询」：一家供应商或一个官方账号的查询设置，盖在页面上。
+    fn open_check(
+        &mut self,
+        target: CheckOf,
+        name: SharedString,
+        logo: data::Logo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let sheet = cx.new(|cx| CheckSheet::new(store, target, name, logo, window, cx));
+        let _subscription = cx.subscribe(&sheet, |this, _, event: &CheckEvent, cx| match event {
+            CheckEvent::Closed => {
+                this.overlay = None;
+                cx.notify();
+            }
+        });
+        self.overlay = Some(Overlay::Check {
+            sheet,
+            _subscription,
+        });
+        cx.notify();
+    }
+
+    /// 点弹层外面：编辑器有改动会先问，卡片表、额度查询直接关。
     fn close_overlay(&mut self, cx: &mut Context<Self>) {
         match &self.overlay {
             Some(Overlay::Edit { editor, .. }) => {
                 editor.update(cx, |editor, cx| editor.request_close(cx));
             }
-            Some(Overlay::Add { .. }) => {
+            Some(Overlay::Add { .. }) | Some(Overlay::Check { .. }) => {
                 self.overlay = None;
                 cx.notify();
             }
@@ -1010,6 +1133,7 @@ impl MainWindow {
         let content: AnyElement = match self.overlay.as_ref()? {
             Overlay::Add { sheet, .. } => sheet.clone().into_any_element(),
             Overlay::Edit { editor, .. } => editor.clone().into_any_element(),
+            Overlay::Check { sheet, .. } => sheet.clone().into_any_element(),
         };
         Some(
             deferred(

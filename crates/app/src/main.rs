@@ -1,6 +1,7 @@
 mod accounts;
 mod add_provider;
 mod assets;
+mod check_sheet;
 mod config_page;
 mod data;
 #[cfg(debug_assertions)]

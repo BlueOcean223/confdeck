@@ -235,6 +235,20 @@ impl Engine {
         state.save(&path).map_err(io_error(&path))
     }
 
+    /// 额度查询的设置（键见 `state.json` 的 `checks`）。
+    pub fn checks(&self) -> std::collections::BTreeMap<String, crate::quota::Check> {
+        State::load(&self.data.state()).checks().clone()
+    }
+
+    /// 改一家供应商或一个账号的额度查询设置。只存在本机。
+    pub fn set_check(&self, key: &str, check: crate::quota::Check) -> Result<(), EngineError> {
+        let _lock = self.lock()?;
+        let path = self.data.state();
+        let mut state = State::load(&path);
+        state.set_check(key, check);
+        state.save(&path).map_err(io_error(&path))
+    }
+
     /// 上次切换时原始片段写进这个 agent 共用位置的键和值（见 `state.json` 的 `owned`）。
     pub fn owned(&self, agent: &str) -> Vec<(KeyPath, serde_json::Value)> {
         State::load(&self.data.state())

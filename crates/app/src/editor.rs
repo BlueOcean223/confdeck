@@ -527,7 +527,7 @@ impl Editor {
         }
     }
 
-    fn ask_delete(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn ask_delete(&mut self, cx: &mut Context<Self>) {
         let used_by = self.store.read(cx).used_by(&self.initial.id);
         self.confirm = Some(Confirm::Delete(used_by));
         cx.notify();

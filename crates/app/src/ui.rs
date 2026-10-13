@@ -231,6 +231,51 @@ fn dropdown_layer(content: impl IntoElement, priority: usize) -> Div {
     )
 }
 
+/// 行尾的「⋯」：点开是这一行的菜单（[`menu`]）。打开时垫一块底色。
+pub fn more_button(id: impl Into<ElementId>, t: &Theme, open: bool) -> Stateful<Div> {
+    let button = icon_button(id, t, "ellipsis");
+    if open { button.bg(t.pill) } else { button }
+}
+
+/// 「⋯」点开的菜单：一列 [`menu_item`]，危险的放最后、上面一条分隔线（[`menu_divider`]）。
+pub fn menu(t: &Theme) -> Div {
+    div()
+        .v_flex()
+        .min_w(px(120.))
+        .p(px(5.))
+        .bg(Hsla { a: 1., ..t.pop_bg })
+        .rounded(px(11.))
+        .border_1()
+        .border_color(t.line)
+        .shadow(t.pop_shadow())
+        .occlude()
+}
+
+pub fn menu_item(
+    id: impl Into<ElementId>,
+    t: &Theme,
+    label: impl Into<SharedString>,
+    danger: bool,
+) -> Stateful<Div> {
+    let hover = t.sel;
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .h(px(30.))
+        .px(px(9.))
+        .rounded(px(7.))
+        .text_size(px(12.5))
+        .text_color(if danger { t.danger } else { t.fg })
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child(label.into())
+}
+
+pub fn menu_divider(t: &Theme) -> Div {
+    div().h(px(1.)).mx(px(4.)).my(px(4.)).bg(t.line_2)
+}
+
 /// 浮层里的分组标题（`.pop li.group`）。
 pub fn group_label(t: &Theme, label: impl Into<SharedString>) -> Div {
     div()
@@ -346,7 +391,29 @@ pub fn text_button(id: impl Into<ElementId>, t: &Theme) -> Stateful<Div> {
 }
 
 /// 顶栏右边的图标按钮。
+/// 图标转圈（在查、在刷新）；`on` 是假时原样不动。各处一起转，步调一致。
+pub fn spinning(icon: Svg, id: impl Into<ElementId>, on: bool) -> AnyElement {
+    if !on {
+        return icon.into_any_element();
+    }
+    icon.with_animation(
+        id,
+        Animation::new(Duration::from_millis(900)).repeat_synced(),
+        |icon, delta| icon.with_transformation(Transformation::rotate(percentage(delta))),
+    )
+    .into_any_element()
+}
+
 pub fn icon_button(id: impl Into<ElementId>, t: &Theme, name: &str) -> Stateful<Div> {
+    icon_button_with(id, t, icon(name, 16., t.ctl_fg))
+}
+
+/// 和 [`icon_button`] 一样，图标自己给（比如会转的）。
+pub fn icon_button_with(
+    id: impl Into<ElementId>,
+    t: &Theme,
+    icon: impl IntoElement,
+) -> Stateful<Div> {
     let hover = t.pill;
     div()
         .id(id)
@@ -358,7 +425,7 @@ pub fn icon_button(id: impl Into<ElementId>, t: &Theme, name: &str) -> Stateful<
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(icon(name, 16., t.ctl_fg))
+        .child(icon)
 }
 
 /// 按钮的几种样子。

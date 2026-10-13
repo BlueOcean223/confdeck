@@ -17,12 +17,44 @@
 use std::path::Path;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::net::{Http, NetError};
 use crate::provider::{self, Provider};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 一家供应商、一个官方账号的额度或余额查不查、多久自动查一次（10-13 提案 13 之后用户定的：按供应商配置，参考 cc-switch 的
+/// 「配置用量查询」）。存在 `state.json`（[`crate::engine::Engine::checks`]），只属于这台设备；没存过的是默认值。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Check {
+    /// 关掉了：不自动查，点刷新也不查。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub off: bool,
+    /// 自动查的间隔（分钟），0 是不自动查。没设过是 `None`：在用的每 [`Check::DEFAULT_EVERY`] 分钟，不在用的不自动查。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every: Option<u32>,
+}
+
+impl Check {
+    /// 在用的默认多久查一次（分钟）。
+    pub const DEFAULT_EVERY: u32 = 5;
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 实际多久自动查一次（分钟），0 是不自动查。`in_use`：有 agent 选着这家，或者是登录文件里登着的官方账号。
+    pub fn every(&self, in_use: bool) -> u32 {
+        match (self.off, self.every) {
+            (true, _) => 0,
+            (false, Some(every)) => every,
+            (false, None) if in_use => Self::DEFAULT_EVERY,
+            (false, None) => 0,
+        }
+    }
+}
 
 /// 一个账号或一个套餐的额度。
 #[derive(Debug, Clone, PartialEq)]

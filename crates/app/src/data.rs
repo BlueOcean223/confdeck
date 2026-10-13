@@ -271,6 +271,7 @@ impl Store {
             self.engine.hidden(Place::Page),
             self.engine.hidden(Place::Panel),
         );
+        self.usage.checks = self.engine.checks();
         self.agents = AGENTS.iter().map(|def| self.agent(def, &hidden)).collect();
         self.note_selections();
         self.reload_accounts();

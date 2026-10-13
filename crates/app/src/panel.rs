@@ -96,8 +96,8 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
         return;
     }
 
-    // 选的那家的额度、余额：5 分钟内查过的不再查。
-    store.update(cx, |store, cx| store.refresh_remote(false, cx));
+    // 选的那家的额度、余额：到点了的查。
+    store.update(cx, |store, cx| store.check_due(cx));
     let height = base_height(store.read(cx));
     let origin = point(icon.center().x - px(WIDTH / 2.), icon.bottom() + px(OFFSET));
     // 和 Wails 一样先激活应用再显示面板。不激活的话，应用在后台、主窗口又开着时，
