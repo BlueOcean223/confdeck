@@ -128,7 +128,7 @@ mod tests {
             for (&agent, recommended) in &preset.agents {
                 let at = format!("{} → {}", preset.id, agent.id());
                 if let Some(protocol) = recommended.protocol {
-                    assert!(agent.protocols().contains(&protocol), "{at}");
+                    assert!(agent.adapter().protocols().contains(&protocol), "{at}");
                     assert!(preset.endpoints.contains_key(&protocol), "{at}");
                 }
                 let models = recommended

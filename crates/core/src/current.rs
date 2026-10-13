@@ -15,10 +15,8 @@
 
 use std::path::Path;
 
-use crate::agent::{AgentKind, Connection, FileSetup, Mode, claude, codex, grok, opencode, pi};
-use crate::apply::{ApplyError, CodexFiles, PatchFor, Writer, writer, writer_with};
+use crate::agent::{AgentKind, ApplyError, Connection, Disk, FileSetup, PatchFor, Role, Single};
 use crate::engine::{Engine, LiveFile};
-use crate::patch::PatchError;
 use crate::preset;
 use crate::provider::{self, AgentOverride, Provider};
 
@@ -55,7 +53,7 @@ pub fn current(
     agent: AgentKind,
     providers: &[Provider],
 ) -> Result<Current, ApplyError> {
-    let source = source(home, agent)?;
+    let source = source(home, agent, None)?;
     let snapshot = engine.read(&source.file)?;
     let local = engine.local();
     let (current, _) = current_in(
@@ -75,14 +73,14 @@ fn current_in(
     record: Option<&str>,
 ) -> Result<(Current, Connection), ApplyError> {
     let file = &source.file;
-    let live = (source.read)(&file.path, bytes)?;
+    let live = source.single.connection(&file.path, bytes)?;
     let candidates: Vec<Candidate> = providers
         .iter()
         .filter_map(|provider| {
             // 这个 agent 用不了的供应商（接口对不上、没有 Key）不参与。
             let patch = (source.patch)(provider).ok()?;
             let fresh = patch.apply(&file.path, None).ok()?;
-            let expected = (source.read)(&file.path, Some(&fresh)).ok()?;
+            let expected = source.single.connection(&file.path, Some(&fresh)).ok()?;
             let exact = bytes.is_some_and(|bytes| {
                 patch.apply(&file.path, Some(bytes)).ok().as_deref() == Some(bytes)
             });
@@ -103,9 +101,11 @@ pub(crate) fn connection(
     home: &Path,
     agent: AgentKind,
 ) -> Result<Connection, ApplyError> {
-    let source = source(home, agent)?;
+    let source = source(home, agent, None)?;
     let snapshot = engine.read(&source.file)?;
-    Ok((source.read)(&source.file.path, snapshot.bytes.as_deref())?)
+    Ok(source
+        .single
+        .connection(&source.file.path, snapshot.bytes.as_deref())?)
 }
 
 /// 「把当前配置存成供应商」：从单选 agent 的配置文件里读出地址、Key 和模型，拼成一家新供应商，
@@ -125,7 +125,7 @@ pub(crate) fn draft(
     agent: AgentKind,
     providers: &[Provider],
 ) -> Result<Option<Provider>, ApplyError> {
-    let source = source(home, agent)?;
+    let source = source(home, agent, None)?;
     let snapshot = engine.read(&source.file)?;
     draft_in(&source, snapshot.bytes.as_deref(), agent, providers)
 }
@@ -136,7 +136,7 @@ fn draft_in(
     agent: AgentKind,
     providers: &[Provider],
 ) -> Result<Option<Provider>, ApplyError> {
-    let Some(setup) = (source.setup)(&source.file.path, bytes)? else {
+    let Some(setup) = source.single.setup(&source.file.path, bytes)? else {
         return Ok(None);
     };
     let host = provider::host(&setup.base_url)
@@ -184,50 +184,26 @@ pub fn setup_of(
     agent: AgentKind,
     bytes: &[u8],
 ) -> Result<Option<FileSetup>, ApplyError> {
-    let (_, setup) = readers(agent)?;
-    let file = crate::apply::live_files(home, agent).swap_remove(0);
-    Ok(setup(&file.path, Some(bytes))?)
+    let adapter = agent.writes();
+    let file = adapter.config(home);
+    Ok(adapter.single()?.setup(&file.path, Some(bytes))?)
 }
 
 /// 单选 agent 的配置文件，和读它、往里写某一家的办法。
 struct Source {
     file: LiveFile,
-    read: Reader,
-    setup: SetupReader,
+    single: &'static dyn Single,
     patch: Box<PatchFor>,
 }
 
-type Reader = fn(&Path, Option<&[u8]>) -> Result<Connection, PatchError>;
-type SetupReader = fn(&Path, Option<&[u8]>) -> Result<Option<FileSetup>, PatchError>;
-type EnabledReader = fn(&Path, Option<&[u8]>) -> Result<Vec<String>, PatchError>;
-
-fn source(home: &Path, agent: AgentKind) -> Result<Source, ApplyError> {
-    let readers = readers(agent)?;
-    Ok(source_of(writer(home, agent)?, readers))
-}
-
-/// [`source`]，Codex 的补丁要看的文件已经读好了。
-fn source_with(home: &Path, agent: AgentKind, codex: CodexFiles) -> Result<Source, ApplyError> {
-    let readers = readers(agent)?;
-    Ok(source_of(writer_with(home, agent, codex), readers))
-}
-
-fn readers(agent: AgentKind) -> Result<(Reader, SetupReader), ApplyError> {
-    Ok(match agent {
-        AgentKind::ClaudeCode => (claude::connection, claude::setup),
-        AgentKind::Codex => (codex::connection, codex::setup),
-        AgentKind::GrokBuild => (grok::connection, grok::setup),
-        AgentKind::Pi | AgentKind::Opencode => return Err(ApplyError::WrongMode { agent }),
+/// `disk` 是补丁要看的、读好的文件；`None` 是要看的现读（[`crate::agent::Adapter::writer`]）。
+fn source(home: &Path, agent: AgentKind, disk: Option<Disk>) -> Result<Source, ApplyError> {
+    let adapter = agent.writes();
+    Ok(Source {
+        file: adapter.config(home),
+        single: adapter.single()?,
+        patch: adapter.writer(home, disk)?,
     })
-}
-
-fn source_of(Writer { file, patch }: Writer, (read, setup): (Reader, SetupReader)) -> Source {
-    Source {
-        file,
-        read,
-        setup,
-        patch,
-    }
 }
 
 fn identify(live: &Connection, candidates: &[Candidate], record: Option<&str>) -> Current {
@@ -303,30 +279,12 @@ fn unique_id(base: &str, taken: &[Provider]) -> String {
 
 /// 多选 agent 勾了哪几家（供应商 id，按文件里的顺序）。
 pub fn enabled(engine: &Engine, home: &Path, agent: AgentKind) -> Result<Vec<String>, ApplyError> {
-    let (file, read) = multi(home, agent)?;
+    let adapter = agent.writes();
+    let file = adapter.config(home);
     let snapshot = engine.read(&file)?;
-    Ok(read(&file.path, snapshot.bytes.as_deref())?)
-}
-
-/// [`enabled`]，文件已经读好了。
-fn enabled_in(
-    home: &Path,
-    agent: AgentKind,
-    bytes: Option<&[u8]>,
-) -> Result<Vec<String>, ApplyError> {
-    let (file, read) = multi(home, agent)?;
-    Ok(read(&file.path, bytes)?)
-}
-
-/// 多选 agent 的配置文件和读它勾了哪几家的办法。
-fn multi(home: &Path, agent: AgentKind) -> Result<(LiveFile, EnabledReader), ApplyError> {
-    match agent {
-        AgentKind::Pi => Ok((pi::live_file(home), pi::enabled)),
-        AgentKind::Opencode => Ok((opencode::live_file(home), opencode::enabled)),
-        AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::GrokBuild => {
-            Err(ApplyError::WrongMode { agent })
-        }
-    }
+    Ok(adapter
+        .multi()?
+        .enabled(&file.path, snapshot.bytes.as_deref())?)
 }
 
 /// 一个 agent 的配置文件读出来以后认出的样子（[`crate::status`] 用）：文件只读一次，几样都从这份内容算。
@@ -342,24 +300,21 @@ pub(crate) enum Recognized {
     Multi(Vec<String>),
 }
 
-/// 按读好的文件内容认（`record` 是 `state.json` 里上次选的哪家；`codex_auth` 是 Codex 的 `auth.json`，
-/// 别的 agent 用不着）。
+/// 按读好的文件内容认（`disk` 是配置文件和补丁要看的登录文件，`record` 是 `state.json` 里上次选的哪家）。
 pub(crate) fn read(
     home: &Path,
     agent: AgentKind,
     providers: &[Provider],
-    bytes: Option<&[u8]>,
+    disk: Disk,
     record: Option<&str>,
-    codex_auth: Option<&[u8]>,
 ) -> Result<Recognized, ApplyError> {
-    if agent.mode() == Mode::Coexist {
-        return Ok(Recognized::Multi(enabled_in(home, agent, bytes)?));
+    let adapter = agent.writes();
+    let bytes = disk.config;
+    if let Role::Multi(multi) = adapter.role() {
+        let file = adapter.config(home);
+        return Ok(Recognized::Multi(multi.enabled(&file.path, bytes)?));
     }
-    let codex = CodexFiles {
-        config: bytes,
-        auth: codex_auth,
-    };
-    let source = source_with(home, agent, codex)?;
+    let source = source(home, agent, Some(disk))?;
     let (current, connection) = current_in(&source, bytes, providers, record)?;
     let draft = match current {
         Current::Custom { .. } => draft_in(&source, bytes, agent, providers)?,
@@ -378,7 +333,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::agent::Credential;
+    use crate::agent::{Credential, claude};
     use crate::apply::{enable, switch};
     use crate::data::DataDir;
     use crate::provider::Protocol;

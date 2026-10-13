@@ -27,8 +27,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent::AgentKind;
-use crate::apply::CodexFiles;
+use crate::agent::{AgentKind, Disk};
 use crate::data::DataDir;
 use crate::engine::{Engine, EngineError, LiveFile, Outcome};
 use crate::fsx::{self, Digest, Mode};
@@ -531,7 +530,7 @@ pub(crate) fn read_all(
     engine: &Engine,
     home: &Path,
     installed: &[AgentKind],
-    codex: CodexFiles,
+    codex: Disk,
 ) -> Accounts {
     let mut accounts = Accounts::default();
     let claude = installed
@@ -562,7 +561,7 @@ pub(crate) fn read_all(
                         bytes: None,
                     }))
             }
-            AgentKind::Codex => Ok(found_in(kind, codex.auth.map(<[u8]>::to_vec))),
+            AgentKind::Codex => Ok(found_in(kind, codex.login.map(<[u8]>::to_vec))),
             _ => read_login(home, kind),
         };
         let live = found.and_then(|found| match found {
@@ -1140,9 +1139,9 @@ pub(crate) mod tests {
     fn read(s: &Setup, kind: AgentKind) -> Accounts {
         let config = fs::read(s.home.join(".codex/config.toml")).ok();
         let auth = s.auth();
-        let codex = CodexFiles {
+        let codex = Disk {
             config: config.as_deref(),
-            auth: auth.as_deref(),
+            login: auth.as_deref(),
         };
         read_all(&s.engine, &s.home, &[kind], codex)
     }

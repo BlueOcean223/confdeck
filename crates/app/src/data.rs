@@ -1,7 +1,7 @@
 //! 界面的数据层。供应商、每个 agent 现在连的是谁、本机设置、官方账号都来自 core 的一份快照（`status::snapshot`）：
 //! 启动时在界面线程读第一份（免得窗口先空着闪一下），之后每次 `reload` 都在后台读，读完换上。
 //! 读和写排在同一队里（`enqueue`），一个跑完才开始下一个。
-//! agent 的清单在这里写死：core 里有适配器的五个能选供应商。
+//! agent 的清单（排序和图标）在这里写死；配置文件、单选多选、协议、要不要 Key 都问 core 的适配器（`AgentKind::adapter`）。
 //!
 //! 用户点出来的写操作（选一家、存供应商、开关……，列表见 app.md「写」）走 `write.rs` 的 `Store::run`：内存里先改，写在后台线程，
 //! 写完再读一份快照，文件里的实际状态盖掉先改的。写了什么、失败的原因做成 [`Notice`] 事件发出去，主窗口做成提示条。
@@ -13,16 +13,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use confdeck_core::account;
-use confdeck_core::agent::codex::catalog::Skipped;
-use confdeck_core::agent::{self, AgentKind, FileSetup, Mode};
-use confdeck_core::apply::{self, ApplyError, UsedBy};
+use confdeck_core::agent::codex::{self, catalog::Skipped};
+use confdeck_core::agent::{self, AdaptError, AgentKind, ApplyError, FileSetup, Mode};
+use confdeck_core::apply::{self, UsedBy};
 use confdeck_core::backup::{self, Backup, Reason};
 use confdeck_core::current;
 use confdeck_core::data::DataDir;
 use confdeck_core::engine::{Engine, EngineError, LiveFile, Local, Outcome, Place, Snapshot};
 use confdeck_core::preset;
 use confdeck_core::provider::{self, Protocol, Provider};
-use confdeck_core::status::{self, AgentStatus};
+use confdeck_core::status::{self, AgentState, AgentStatus};
 use confdeck_core::store;
 use confdeck_core::toggles::{self, ClaudeToggle};
 use gpui_kit::*;
@@ -50,13 +50,9 @@ pub struct Agent {
     pub kind: AgentKind,
     pub name: &'static str,
     pub logo: Logo,
-    /// 配置文件，相对家目录。
-    pub config: &'static str,
+    /// 显示用的配置文件路径（`~/…`）。
+    config: String,
     pub mode: Mode,
-    /// 能说的协议，按偏好排序：供应商提供好几种时用第一种（decisions「供应商和 agent 的关系」）。
-    pub protocols: &'static [Protocol],
-    /// 连第三方必须有 Key：core 的适配器没 Key 就拒绝写（Claude Code、Codex、Grok Build）。
-    pub requires_key: bool,
     /// 现在连的是谁（core 的快照；切换时先改成选的那家，不等写完）。
     pub status: AgentStatus,
     /// 设置页「显示哪些 agent」里关掉了：Agent 页不列它。
@@ -78,95 +74,40 @@ impl Agent {
 
     /// 显示用的配置文件路径。
     pub fn config_path(&self) -> String {
-        format!("~/{}", self.config)
+        self.config.clone()
     }
 }
 
-struct AgentDef {
-    kind: AgentKind,
-    name: &'static str,
-    logo: Logo,
-    config: &'static str,
-    mode: Mode,
-    protocols: &'static [Protocol],
-    requires_key: bool,
-}
-
-/// 界面上列的 agent，按这个顺序：只有 core 里有适配器的（decisions「Agent 页」：还没接上的不列）。
-const AGENTS: &[AgentDef] = &[
-    AgentDef {
-        kind: AgentKind::ClaudeCode,
-        name: "Claude Code",
-        logo: Logo::Color("icons/brand/claudecode-color.svg"),
-        config: ".claude/settings.json",
-        mode: Mode::Switch,
-        protocols: &[Protocol::Anthropic],
-        requires_key: true,
-    },
-    AgentDef {
-        kind: AgentKind::Codex,
-        name: "Codex",
-        logo: Logo::Color("icons/brand/codex-color.svg"),
-        config: ".codex/config.toml",
-        mode: Mode::Switch,
-        protocols: &[Protocol::OpenaiResponses],
-        requires_key: true,
-    },
-    AgentDef {
-        kind: AgentKind::Opencode,
-        name: "OpenCode",
-        logo: Logo::Mono("icons/brand/opencode.svg"),
-        config: ".config/opencode/opencode.json",
-        mode: Mode::Coexist,
-        protocols: &[
-            Protocol::OpenaiChat,
-            Protocol::Anthropic,
-            Protocol::OpenaiResponses,
-            Protocol::Gemini,
-        ],
-        requires_key: false,
-    },
-    AgentDef {
-        kind: AgentKind::Pi,
-        name: "Pi",
-        logo: Logo::Mono("icons/brand/pi.svg"),
-        config: ".pi/agent/models.json",
-        mode: Mode::Coexist,
-        protocols: &[
-            Protocol::OpenaiChat,
-            Protocol::Anthropic,
-            Protocol::OpenaiResponses,
-            Protocol::Gemini,
-        ],
-        requires_key: false,
-    },
-    AgentDef {
-        kind: AgentKind::GrokBuild,
-        name: "Grok Build",
-        logo: Logo::Mono("icons/brand/grok.svg"),
-        config: ".grok/config.toml",
-        mode: Mode::Switch,
-        protocols: &[
-            Protocol::OpenaiResponses,
-            Protocol::OpenaiChat,
-            Protocol::Anthropic,
-        ],
-        requires_key: true,
-    },
+/// 界面上列的 agent 和图标，按这个顺序：只有 core 里有适配器的（decisions「Agent 页」：还没接上的不列）。
+const AGENTS: [(AgentKind, Logo); 5] = [
+    (
+        AgentKind::ClaudeCode,
+        Logo::Color("icons/brand/claudecode-color.svg"),
+    ),
+    (AgentKind::Codex, Logo::Color("icons/brand/codex-color.svg")),
+    (AgentKind::Opencode, Logo::Mono("icons/brand/opencode.svg")),
+    (AgentKind::Pi, Logo::Mono("icons/brand/pi.svg")),
+    (AgentKind::GrokBuild, Logo::Mono("icons/brand/grok.svg")),
 ];
 
-fn agent(def: &AgentDef, status: &AgentStatus, local: &Local) -> Agent {
+fn agent((kind, logo): (AgentKind, Logo), state: &AgentState, home: &Path, local: &Local) -> Agent {
     Agent {
-        kind: def.kind,
-        name: def.name,
-        logo: def.logo,
-        config: def.config,
-        mode: def.mode,
-        protocols: def.protocols,
-        requires_key: def.requires_key,
-        status: status.clone(),
-        hidden_on_page: hidden(local, Place::Page, def.kind),
-        hidden_in_panel: hidden(local, Place::Panel, def.kind),
+        kind,
+        name: kind.name(),
+        logo,
+        config: tilde(home, &state.config),
+        mode: kind.adapter().mode(),
+        status: state.status.clone(),
+        hidden_on_page: hidden(local, Place::Page, kind),
+        hidden_in_panel: hidden(local, Place::Panel, kind),
+    }
+}
+
+/// 家目录下的路径写成 `~/…`。
+fn tilde(home: &Path, path: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
     }
 }
 
@@ -462,8 +403,8 @@ impl Store {
         }
         let local = &self.local;
         self.agents = AGENTS
-            .iter()
-            .map(|def| agent(def, &snapshot.agent(def.kind).status, local))
+            .into_iter()
+            .map(|def| agent(def, snapshot.agent(def.0), &self.home, local))
             .collect();
         self.load_error = snapshot.providers_error.map(|err| err.to_string());
         self.providers = snapshot.providers;
@@ -519,9 +460,8 @@ impl Store {
     }
 
     /// 这个 agent 的配置文件（Codex 有两个，「原始文件」只编辑 config.toml）。
-    pub fn live_file(&self, agent: usize) -> Option<LiveFile> {
-        let kind = self.agents[agent].kind;
-        apply::live_files(&self.home, kind).into_iter().next()
+    pub fn live_file(&self, agent: usize) -> LiveFile {
+        self.agents[agent].kind.adapter().config(&self.home)
     }
 
     pub fn read_file(&self, file: &LiveFile) -> Result<Snapshot, EngineError> {
@@ -587,7 +527,7 @@ impl Store {
         let mut files: Vec<LiveFile> = self
             .agents
             .iter()
-            .flat_map(|agent| apply::live_files(&self.home, agent.kind))
+            .flat_map(|agent| agent.kind.adapter().files(&self.home))
             .collect();
         files.extend(toggles::extra_files(&self.home));
         files.push(store::live_file(self.engine.data()));
@@ -688,10 +628,7 @@ impl Store {
             |store, result, cx| {
                 let notice = match result {
                     Ok(Some(Ok(outcome))) if outcome.changed => {
-                        let file = apply::live_files(&store.home, AgentKind::Codex)
-                            .last()
-                            .map(|file| store.tilde(&file.path))
-                            .unwrap_or_default();
+                        let file = store.tilde(&codex::catalog::live_file(&store.home).path);
                         Some(Notice::ok(t!("write.codex_catalog_refreshed", file = file)))
                     }
                     Ok(Some(Err(Skipped::NotFound))) => None,
@@ -722,10 +659,7 @@ impl Store {
 
     /// 家目录下的路径写成 `~/…`。
     pub fn tilde(&self, path: &Path) -> String {
-        match path.strip_prefix(&self.home) {
-            Ok(rest) => format!("~/{}", rest.display()),
-            Err(_) => path.display().to_string(),
-        }
+        tilde(&self.home, path)
     }
 
     pub fn is_enabled(&self, agent: usize, provider: usize) -> bool {
@@ -737,25 +671,26 @@ impl Store {
         }
     }
 
-    /// 这个 agent 连这家会用哪种协议：agent 偏好顺序里这家提供的第一种；一种都没有就是接口对不上。
+    /// 这个 agent 连这家会用哪种协议（和写进文件的一样：用户选的 > 预设推荐的 > agent 偏好顺序里这家提供的第一种）；用不了是 `None`。
     pub fn protocol_for(&self, agent: usize, provider: usize) -> Option<Protocol> {
-        let provider = &self.providers[provider];
-        self.agents[agent]
-            .protocols
-            .iter()
-            .copied()
-            .find(|protocol| provider.endpoints.contains_key(protocol))
+        let usable = self.agents[agent]
+            .kind
+            .adapter()
+            .usable(&self.providers[provider]);
+        usable.ok().map(|(protocol, _)| protocol)
     }
 
     /// 这个 agent 用不了这家的原因；能用是 `None`。
     pub fn unusable(&self, agent: usize, provider: usize) -> Option<Unusable> {
-        if self.protocol_for(agent, provider).is_none() {
-            return Some(Unusable::Incompatible);
+        match self.agents[agent]
+            .kind
+            .adapter()
+            .usable(&self.providers[provider])
+        {
+            Ok(_) => None,
+            Err(AdaptError::MissingKey { .. }) => Some(Unusable::NoKey),
+            Err(_) => Some(Unusable::Incompatible),
         }
-        if self.agents[agent].requires_key && self.providers[provider].key.is_empty() {
-            return Some(Unusable::NoKey);
-        }
-        None
     }
 
     /// 这个 agent 用这家时的模型（在用的芯片上显示）。
@@ -915,14 +850,13 @@ pub fn key_tail(provider: &Provider) -> Option<String> {
 #[cfg(test)]
 mod tests {
     // 不能 `use super::*`：gpui 也导出一个 `test` 属性宏，会把 `#[test]` 抢走。
-    use std::path::Path;
 
     use std::sync::atomic::Ordering;
 
+    use confdeck_core::preset;
     use confdeck_core::status::AgentStatus;
-    use confdeck_core::{apply, preset};
 
-    use super::{AGENTS, Queue, key_tail, logo, settled};
+    use super::{Queue, key_tail, logo, settled};
 
     #[test]
     fn settled_means_the_file_is_what_is_shown() {
@@ -957,22 +891,6 @@ mod tests {
         assert!(queue.reload().is_none());
         begun.store(true, Ordering::Release);
         assert!(queue.reload().is_some(), "it began before this change");
-    }
-
-    /// 写死的配置文件路径要和 core 适配器写的文件一致，不然「配置文件存在」和实际写的不是同一个文件。
-    #[test]
-    fn config_paths_match_core_live_files() {
-        let home = Path::new("/home/x");
-        for def in AGENTS {
-            let kind = def.kind;
-            let live = apply::live_files(home, kind)
-                .into_iter()
-                .next()
-                .expect("every agent writes a file");
-            assert_eq!(live.path, home.join(def.config), "{}", def.name);
-            assert_eq!(def.mode, kind.mode(), "{}", def.name);
-            assert_eq!(def.protocols, kind.protocols(), "{}", def.name);
-        }
     }
 
     #[test]

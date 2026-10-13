@@ -419,7 +419,9 @@ impl Picker {
         }
         if !unusable.is_empty() {
             let protocols = agent
-                .protocols
+                .kind
+                .adapter()
+                .protocols()
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
@@ -580,7 +582,7 @@ impl Picker {
                 let sub = match (&reason, store.protocol_for(self.agent, p)) {
                     (Some(reason), _) => reason.clone(),
                     // 多协议的 agent 才需要说明走哪种协议（decisions「供应商和 agent 的关系」）。
-                    (None, Some(protocol)) if agent.protocols.len() > 1 => {
+                    (None, Some(protocol)) if agent.kind.adapter().protocols().len() > 1 => {
                         format!("{host} · {protocol}").into()
                     }
                     (None, _) => host.to_string().into(),

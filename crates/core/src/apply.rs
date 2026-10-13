@@ -8,59 +8,17 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::codex::catalog::Skipped;
-use crate::agent::{AdaptError, AgentKind, Mode, claude, codex, grok, opencode, pi};
+use crate::agent::{AgentKind, ApplyError, Mode, Role, Switched, codex};
 use crate::current::{self, Current};
-use crate::engine::{Engine, EngineError, LiveFile, Outcome};
-use crate::fsx;
-use crate::patch::{self, LivePatch, PatchError};
+use crate::engine::{Engine, LiveFile, Outcome};
+use crate::patch;
 use crate::provider::Provider;
 use crate::quota::{Check, CheckKey};
 use crate::store::{self, StoreError};
 use crate::transfer;
 use crate::usage::history;
 
-#[derive(Debug, thiserror::Error)]
-pub enum ApplyError {
-    #[error(transparent)]
-    Adapt(#[from] AdaptError),
-    #[error(transparent)]
-    Engine(#[from] EngineError),
-    /// 读 agent 的配置文件时解析不了（认当前是哪家时）。
-    #[error(transparent)]
-    Parse(#[from] PatchError),
-    #[error("{agent} 是{}，不能这样写", mode_name(*.agent))]
-    WrongMode { agent: AgentKind },
-}
-
-fn mode_name(agent: AgentKind) -> &'static str {
-    match agent.mode() {
-        Mode::Switch => "单选 agent",
-        Mode::Coexist => "多选 agent",
-    }
-}
-
-/// 这个 agent 由 confdeck 写的配置文件（备份页、状态检查用）。
-pub fn live_files(home: &Path, agent: AgentKind) -> Vec<LiveFile> {
-    match agent {
-        AgentKind::ClaudeCode => vec![claude::live_file(home)],
-        AgentKind::Codex => vec![codex::live_file(home), codex::catalog::live_file(home)],
-        AgentKind::Pi => vec![pi::live_file(home)],
-        AgentKind::GrokBuild => vec![grok::live_file(home)],
-        AgentKind::Opencode => vec![opencode::live_file(home)],
-    }
-}
-
-/// [`switch`] 的结果。
-#[derive(Debug)]
-pub struct Switched {
-    /// agent 的配置文件写了没有。
-    pub outcome: Outcome,
-    /// Codex 切到第三方时的模型目录文件：写了，或者没写成的原因。没写成时界面要说一声：
-    /// `/model` 列的还是 GPT 模型，这家的模型按 272K 窗口算。别的 agent、Codex 切回默认时为 `None`。
-    pub catalog: Option<Result<Outcome, Skipped>>,
-}
-
-/// 单选 agent 换供应商；`None` 还原成 agent 自带的登录。写完记下选了哪家（只存在本机），
+/// 单选 agent 换供应商；`None` 还原成 agent 自带的登录。写完记下适配器要记的（Claude Code 的 `owned`）、选了哪家（只存在本机），
 /// 再记一笔切换记录（[`history`]，用量页认供应商用）。
 pub fn switch(
     engine: &Engine,
@@ -68,64 +26,13 @@ pub fn switch(
     agent: AgentKind,
     provider: Option<&Provider>,
 ) -> Result<Switched, ApplyError> {
-    let switched = write_switch(engine, home, agent, provider)?;
+    let adapter = agent.writes();
+    let switched = adapter.single()?.switch(engine, home, provider)?;
+    adapter.after_write(engine, provider)?;
     engine.set_selection(agent.id(), provider.map(|provider| provider.id.as_str()))?;
     // 切换已经写成了；记不下来只是用量页少一条线索，不算切换失败。
     let _ = history::note(engine.data(), agent, history::Target::of(provider));
     Ok(switched)
-}
-
-fn write_switch(
-    engine: &Engine,
-    home: &Path,
-    agent: AgentKind,
-    provider: Option<&Provider>,
-) -> Result<Switched, ApplyError> {
-    let only = |outcome| Switched {
-        outcome,
-        catalog: None,
-    };
-    match agent {
-        AgentKind::ClaudeCode => {
-            let patch = claude::patch(provider, &engine.owned(agent.id()))?;
-            let outcome = engine.write(&claude::live_file(home), &patch)?;
-            engine.set_owned(agent.id(), &claude::raw_entries(provider)?)?;
-            Ok(only(outcome))
-        }
-        AgentKind::Codex => {
-            let config = codex::live_file(home);
-            let patch = codex::patch(provider, codex_login(home)?)?;
-            let catalog = match provider {
-                Some(provider) => {
-                    codex::catalog::generate(home, &codex::catalog_models(provider)?).map(Some)
-                }
-                None => Ok(None),
-            };
-            let catalog = match catalog {
-                Ok(Some(catalog)) => catalog,
-                Ok(None) => return Ok(only(engine.write(&config, &patch)?)),
-                Err(skipped) => {
-                    return Ok(Switched {
-                        outcome: engine.write(&config, &patch)?,
-                        catalog: Some(Err(skipped)),
-                    });
-                }
-            };
-            // 先试着改 config.toml：改不了（解析不了、profile 盖过了路由）就什么都不写。
-            // 再先写目录、后改指针：指针指着不存在的文件，Codex 起不来。
-            let patch = patch.with_catalog();
-            patch.apply(&config.path, engine.read(&config)?.bytes.as_deref())?;
-            let written = engine.write(&codex::catalog::live_file(home), &patch::Whole(catalog))?;
-            Ok(Switched {
-                outcome: engine.write(&config, &patch)?,
-                catalog: Some(Ok(written)),
-            })
-        }
-        AgentKind::GrokBuild => Ok(only(
-            engine.write(&grok::live_file(home), &grok::patch(provider)?)?,
-        )),
-        AgentKind::Pi | AgentKind::Opencode => Err(ApplyError::WrongMode { agent }),
-    }
 }
 
 /// 照本机现在的 Codex 重写模型目录，启动时调一次。目录里的提示词是切换时从本机 Codex 取的，
@@ -165,13 +72,9 @@ pub fn enable(
     agent: AgentKind,
     provider: &Provider,
 ) -> Result<Outcome, ApplyError> {
-    match agent {
-        AgentKind::Pi => Ok(engine.write(&pi::live_file(home), &pi::add(provider)?)?),
-        AgentKind::Opencode => {
-            Ok(engine.write(&opencode::live_file(home), &opencode::add(provider)?)?)
-        }
-        _ => Err(ApplyError::WrongMode { agent }),
-    }
+    let adapter = agent.writes();
+    let patch = adapter.multi()?.add(provider)?;
+    Ok(engine.write(&adapter.config(home), patch.as_ref())?)
 }
 
 /// 多选 agent 取消勾选一家供应商。
@@ -181,93 +84,9 @@ pub fn disable(
     agent: AgentKind,
     provider_id: &str,
 ) -> Result<Outcome, ApplyError> {
-    match agent {
-        AgentKind::Pi => Ok(engine.write(&pi::live_file(home), &pi::remove(provider_id))?),
-        AgentKind::Opencode => {
-            Ok(engine.write(&opencode::live_file(home), &opencode::remove(provider_id))?)
-        }
-        _ => Err(ApplyError::WrongMode { agent }),
-    }
-}
-
-/// `~/.codex/auth.json` 里有没有 ChatGPT 登录，决定 `requires_openai_auth`。
-fn codex_login(home: &Path) -> Result<bool, EngineError> {
-    Ok(codex::login_on_disk(
-        read_file(codex::auth_path(home))?.as_deref(),
-    ))
-}
-
-/// 读一个文件，不存在是 `None`。
-fn read_file(path: PathBuf) -> Result<Option<Vec<u8>>, EngineError> {
-    fsx::read_optional(&path).map_err(|source| EngineError::Io { path, source })
-}
-
-/// 这个 agent 的配置文件，和「把某一家写进去」的补丁：单选 agent 是切到这家，多选 agent 是勾上这家。
-pub(crate) struct Writer {
-    pub file: LiveFile,
-    pub patch: Box<PatchFor>,
-}
-
-pub(crate) type PatchFor = dyn Fn(&Provider) -> Result<Box<dyn LivePatch>, AdaptError>;
-
-pub(crate) fn writer(home: &Path, agent: AgentKind) -> Result<Writer, ApplyError> {
-    if agent != AgentKind::Codex {
-        return Ok(writer_with(home, agent, CodexFiles::default()));
-    }
-    let config = read_file(codex::live_file(home).path)?;
-    let auth = read_file(codex::auth_path(home))?;
-    Ok(writer_with(
-        home,
-        agent,
-        CodexFiles {
-            config: config.as_deref(),
-            auth: auth.as_deref(),
-        },
-    ))
-}
-
-/// Codex 的补丁要看的两个文件的内容（不存在是 `None`）：`config.toml` 现在指不指着 confdeck 的模型目录，
-/// `auth.json` 里有没有 ChatGPT 登录。
-#[derive(Default, Clone, Copy)]
-pub(crate) struct CodexFiles<'a> {
-    pub config: Option<&'a [u8]>,
-    pub auth: Option<&'a [u8]>,
-}
-
-/// [`writer`]，Codex 要看的文件已经读好了（[`crate::status`] 一次快照里每个文件只读一次）。
-pub(crate) fn writer_with(home: &Path, agent: AgentKind, codex_files: CodexFiles) -> Writer {
-    let (file, patch): (LiveFile, Box<PatchFor>) = match agent {
-        AgentKind::ClaudeCode => (
-            claude::live_file(home),
-            Box::new(|provider| Ok(Box::new(claude::patch(Some(provider), &[])?))),
-        ),
-        AgentKind::Codex => {
-            let login = codex::login_on_disk(codex_files.auth);
-            let file = codex::live_file(home);
-            // 现在指着 confdeck 的模型目录就照样指着：认当前是哪家时逐字比较，改供应商时这一项不变。
-            let catalog = codex::uses_catalog(&file.path, codex_files.config);
-            (
-                file,
-                Box::new(move |provider| {
-                    let patch = codex::patch(Some(provider), login)?;
-                    Ok(Box::new(if catalog { patch.with_catalog() } else { patch }))
-                }),
-            )
-        }
-        AgentKind::GrokBuild => (
-            grok::live_file(home),
-            Box::new(|provider| Ok(Box::new(grok::patch(Some(provider))?))),
-        ),
-        AgentKind::Pi => (
-            pi::live_file(home),
-            Box::new(|provider| Ok(Box::new(pi::add(provider)?))),
-        ),
-        AgentKind::Opencode => (
-            opencode::live_file(home),
-            Box::new(|provider| Ok(Box::new(opencode::add(provider)?))),
-        ),
-    };
-    Writer { file, patch }
+    let adapter = agent.writes();
+    let patch = adapter.multi()?.remove(provider_id);
+    Ok(engine.write(&adapter.config(home), patch.as_ref())?)
 }
 
 /// 改了一家供应商以后，一个在用它的 agent 的结果。
@@ -406,7 +225,7 @@ pub fn delete_provider(
 
     let coexist = AgentKind::ALL
         .into_iter()
-        .filter(|agent| agent.mode() == Mode::Coexist);
+        .filter(|agent| agent.writes().mode() == Mode::Coexist);
     let mut synced = Vec::new();
     for (agent, file, in_use) in scan(engine, home, providers, id, coexist) {
         let result = match in_use {
@@ -433,9 +252,9 @@ fn scan(
 ) -> Vec<(AgentKind, LiveFile, Result<bool, ApplyError>)> {
     agents
         .into_iter()
-        .filter_map(|agent| {
-            let file = live_files(home, agent).into_iter().next()?;
-            Some((agent, file, in_use(engine, home, agent, providers, id)))
+        .map(|agent| {
+            let file = agent.writes().config(home);
+            (agent, file, in_use(engine, home, agent, providers, id))
         })
         .collect()
 }
@@ -447,11 +266,11 @@ fn in_use(
     providers: &[Provider],
     id: &str,
 ) -> Result<bool, ApplyError> {
-    Ok(match agent.mode() {
-        Mode::Switch => {
+    Ok(match agent.writes().role() {
+        Role::Single(_) => {
             current::current(engine, home, agent, providers)? == Current::Provider(id.to_string())
         }
-        Mode::Coexist => current::enabled(engine, home, agent)?
+        Role::Multi(_) => current::enabled(engine, home, agent)?
             .iter()
             .any(|enabled| enabled == id),
     })
@@ -467,7 +286,9 @@ pub fn preview(
     after: &Provider,
     text: &[u8],
 ) -> Result<Vec<u8>, ApplyError> {
-    let Writer { file, patch } = writer(home, agent)?;
+    let adapter = agent.writes();
+    let file = adapter.config(home);
+    let patch = adapter.writer(home, None)?;
     let new = patch(after)?;
     let Ok(old) = patch(before) else {
         return Ok(new.apply(&file.path, Some(text))?);
@@ -486,7 +307,9 @@ fn write_changes(
     before: &Provider,
     after: &Provider,
 ) -> Result<Outcome, ApplyError> {
-    let Writer { file, patch } = writer(home, agent)?;
+    let adapter = agent.writes();
+    let file = adapter.config(home);
+    let patch = adapter.writer(home, None)?;
     let new = patch(after)?;
     let old = match patch(before) {
         Ok(old) => old.apply(&file.path, None)?,
@@ -495,17 +318,9 @@ fn write_changes(
     };
     let new = new.apply(&file.path, None)?;
     let delta = patch::delta(file.format, &file.path, &old, &new)?;
-    // Codex 的模型列表在目录文件里，先重写目录（找不到 `codex` 就留着旧的）。
-    if agent == AgentKind::Codex
-        && codex::uses_catalog(&file.path, engine.read(&file)?.bytes.as_deref())
-        && let Ok(catalog) = codex::catalog::generate(home, &codex::catalog_models(after)?)
-    {
-        engine.write(&codex::catalog::live_file(home), &patch::Whole(catalog))?;
-    }
+    adapter.before_sync(engine, home, after)?;
     let outcome = engine.write(&file, delta.as_ref())?;
-    if agent == AgentKind::ClaudeCode {
-        engine.set_owned(agent.id(), &claude::raw_entries(Some(after))?)?;
-    }
+    adapter.after_write(engine, Some(after))?;
     Ok(outcome)
 }
 
@@ -516,7 +331,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::agent::Credential;
+    use crate::agent::{AdaptError, Credential, pi};
     use crate::backup::Reason;
     use crate::data::DataDir;
     use crate::engine::FileStatus;

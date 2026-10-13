@@ -1,8 +1,11 @@
-//! 适配器：把一家供应商翻译成某个 agent 的配置补丁。只算补丁，不读写磁盘（写入见 [`crate::apply`]）。
+//! 适配器：把一家供应商翻译成某个 agent 的配置补丁。各 agent 的 module 只算补丁、读文件，不读写磁盘；
+//! 每个 agent 一个适配器（`adapter.rs`）把它们和要写的文件、写前写后要做的事接起来。对外经 [`Adapter`]（[`AgentKind::adapter`]）
+//! 用，写入经 [`crate::apply`]。
 //!
 //! 每个 agent 的配置里，「关键字段」（请求发到哪、凭什么鉴权、哪个模型、说哪种协议）
 //! 完全归供应商所有：切换时一律清空，再写目标供应商的值。其余键归用户，confdeck 不写也不删。
 
+mod adapter;
 pub mod claude;
 pub mod codex;
 pub mod grok;
@@ -18,6 +21,9 @@ use serde_json::{Map, Value};
 
 use crate::preset::{self, Recommended};
 use crate::provider::{AgentOverride, Model, Protocol, Provider};
+
+pub use adapter::{Adapter, ApplyError, Switched};
+pub(crate) use adapter::{Disk, PatchFor, Role, Single};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -56,34 +62,21 @@ impl AgentKind {
         }
     }
 
-    pub fn mode(self) -> Mode {
+    /// 界面上的名字。
+    pub fn name(self) -> &'static str {
         match self {
-            Self::ClaudeCode | Self::Codex | Self::GrokBuild => Mode::Switch,
-            Self::Pi | Self::Opencode => Mode::Coexist,
-        }
-    }
-
-    /// agent 能说的协议，按偏好排序：供应商提供好几种时取第一种。
-    pub fn protocols(self) -> &'static [Protocol] {
-        use Protocol::*;
-        match self {
-            Self::ClaudeCode => &[Anthropic],
-            Self::Codex => &[OpenaiResponses],
-            Self::GrokBuild => &[OpenaiResponses, OpenaiChat, Anthropic],
-            Self::Pi | Self::Opencode => &[OpenaiChat, Anthropic, OpenaiResponses, Gemini],
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Pi => "Pi",
+            Self::GrokBuild => "Grok Build",
+            Self::Opencode => "OpenCode",
         }
     }
 }
 
 impl fmt::Display for AgentKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::ClaudeCode => "Claude Code",
-            Self::Codex => "Codex",
-            Self::Pi => "Pi",
-            Self::GrokBuild => "Grok Build",
-            Self::Opencode => "OpenCode",
-        })
+        f.write_str(self.name())
     }
 }
 
@@ -220,7 +213,7 @@ pub fn choose_protocol(
     provider: &Provider,
     agent: AgentKind,
 ) -> Result<(Protocol, &str), AdaptError> {
-    let supported = agent.protocols();
+    let supported = agent.adapter().protocols();
     let incompatible = || AdaptError::Incompatible {
         agent,
         provider: provider.name.clone(),

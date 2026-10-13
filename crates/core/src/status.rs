@@ -8,11 +8,11 @@
 //! - 单选 agent 现在连的是哪家，记进切换记录（`history.jsonl`，和上一笔一样不记），在别处改了配置，用量也能对上是哪家。
 //! - 登录文件是存过的账号时，把 agent 新换的令牌存回去（`account::read_all`）。
 
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::account::{self, Accounts};
-use crate::agent::{self, AgentKind, Connection, Credential, Mode};
-use crate::apply::{self, CodexFiles};
+use crate::agent::{AgentKind, Connection, Credential, Disk, Mode};
 use crate::current::{self, Current, Recognized};
 use crate::engine::{Engine, EngineError, Local};
 use crate::fsx;
@@ -45,6 +45,8 @@ impl Snapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentState {
     pub kind: AgentKind,
+    /// 配置文件在哪（OpenCode 有 `opencode.jsonc` 时是它，要看磁盘）。
+    pub config: PathBuf,
     pub status: AgentStatus,
 }
 
@@ -111,37 +113,32 @@ pub fn snapshot(engine: &Engine, home: &Path) -> Snapshot {
         Err(err) => (Vec::new(), Some(err)),
     };
     let local = engine.local();
-    // Codex 的两个文件认当前是哪家、认登录都要用，先读好，只读一次。
-    let codex_config = read_config(engine, home, AgentKind::Codex);
-    let auth_path = agent::codex::auth_path(home);
-    let codex_auth = fsx::read_optional(&auth_path);
+    // 每个 agent 的配置文件和补丁要看的登录文件（Codex 的 `auth.json`，认官方账号也要用）先读好，只读一次。
+    let files: Vec<(AgentKind, Files)> = AgentKind::ALL
+        .into_iter()
+        .map(|kind| (kind, Files::read(engine, home, kind)))
+        .collect();
     let mut agents = Vec::new();
-    for kind in AgentKind::ALL {
+    for &(kind, ref files) in &files {
         let record = local.selection(kind).flatten();
-        let recognize = |bytes: Option<&[u8]>, auth: Option<&[u8]>| match bytes {
-            None => AgentStatus::Absent,
-            Some(bytes) => match current::read(home, kind, &providers, Some(bytes), record, auth) {
+        let status = match files.disk() {
+            None => AgentStatus::Unreadable,
+            Some(Disk { config: None, .. }) => AgentStatus::Absent,
+            Some(disk) => match current::read(home, kind, &providers, disk, record) {
                 Ok(recognized) => status_of(recognized),
                 Err(_) => AgentStatus::Unreadable,
             },
         };
-        let status = match kind {
-            AgentKind::Codex => match (&codex_config, &codex_auth) {
-                (Ok(None), _) => AgentStatus::Absent,
-                (Ok(config), Ok(auth)) => recognize(config.as_deref(), auth.as_deref()),
-                _ => AgentStatus::Unreadable,
-            },
-            _ => match read_config(engine, home, kind) {
-                Ok(bytes) => recognize(bytes.as_deref(), None),
-                Err(_) => AgentStatus::Unreadable,
-            },
-        };
-        agents.push(AgentState { kind, status });
+        agents.push(AgentState {
+            kind,
+            config: files.path.clone(),
+            status,
+        });
     }
 
     let noted = agents
         .iter()
-        .filter(|agent| agent.kind.mode() == Mode::Switch)
+        .filter(|agent| agent.kind.writes().mode() == Mode::Switch)
         .filter_map(|agent| Some((agent.kind, agent.status.target(&providers)?)))
         .collect();
     // 记不下来只是用量页少一条线索。
@@ -152,23 +149,24 @@ pub fn snapshot(engine: &Engine, home: &Path) -> Snapshot {
         .filter(|agent| agent.status.installed())
         .map(|agent| agent.kind)
         .collect();
-    let codex = CodexFiles {
-        config: codex_config.as_ref().ok().and_then(Option::as_deref),
-        auth: codex_auth.as_ref().ok().and_then(Option::as_deref),
+    let (_, codex) = files
+        .into_iter()
+        .find(|(kind, _)| *kind == AgentKind::Codex)
+        .expect("Codex is in ALL");
+    let codex_disk = Disk {
+        config: codex.config.as_ref().ok().and_then(Option::as_deref),
+        login: codex
+            .login
+            .as_ref()
+            .and_then(|(_, login)| login.as_ref().ok()?.as_deref()),
     };
-    let mut accounts = account::read_all(engine, home, &installed, codex);
+    let mut accounts = account::read_all(engine, home, &installed, codex_disk);
     // `auth.json` 读不了：不知道登的是谁（不是「未登录」），原因记下来。Codex 没装时不用说。
     if installed.contains(&AgentKind::Codex)
-        && let Err(source) = codex_auth
+        && let Some((path, Err(source))) = codex.login
     {
         accounts.live.remove(&AgentKind::Codex);
-        accounts.error = Some(
-            EngineError::Io {
-                path: auth_path,
-                source,
-            }
-            .into(),
-        );
+        accounts.error = Some(EngineError::Io { path, source }.into());
     }
     Snapshot {
         providers,
@@ -179,14 +177,38 @@ pub fn snapshot(engine: &Engine, home: &Path) -> Snapshot {
     }
 }
 
-/// 一个 agent 的配置文件（Codex 是 `config.toml`）。不存在是 `None`。
-fn read_config(
-    engine: &Engine,
-    home: &Path,
-    kind: AgentKind,
-) -> Result<Option<Vec<u8>>, EngineError> {
-    let file = apply::live_files(home, kind).swap_remove(0);
-    Ok(engine.read(&file)?.bytes)
+/// 一个 agent 读好的文件：配置文件（Codex 是 `config.toml`）和补丁要看的登录文件（适配器的 `login`）。
+/// 不存在是 `None`。
+struct Files {
+    path: PathBuf,
+    config: Result<Option<Vec<u8>>, EngineError>,
+    login: Option<(PathBuf, io::Result<Option<Vec<u8>>>)>,
+}
+
+impl Files {
+    fn read(engine: &Engine, home: &Path, kind: AgentKind) -> Self {
+        let adapter = kind.writes();
+        let file = adapter.config(home);
+        Self {
+            config: engine.read(&file).map(|snapshot| snapshot.bytes),
+            path: file.path,
+            login: adapter.login(home).map(|path| {
+                let read = fsx::read_optional(&path);
+                (path, read)
+            }),
+        }
+    }
+
+    /// 认连着谁要的样子；读不了是 `None`（配置文件不在时登录文件读不了也不要紧：没装）。
+    fn disk(&self) -> Option<Disk<'_>> {
+        let config = self.config.as_ref().ok()?.as_deref();
+        let login = match &self.login {
+            Some((_, Ok(login))) => login.as_deref(),
+            Some((_, Err(_))) if config.is_some() => return None,
+            _ => None,
+        };
+        Some(Disk { config, login })
+    }
 }
 
 fn status_of(recognized: Recognized) -> AgentStatus {

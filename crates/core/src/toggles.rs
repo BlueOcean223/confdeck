@@ -37,7 +37,7 @@ pub const CLAUDE_TOGGLES: &[ClaudeToggle] = &[
     ClaudeToggle::HideAttribution,
 ];
 
-/// 开关会写的、不在 [`crate::apply::live_files`] 里的文件（备份页要列它们）。
+/// 开关会写的、不在 [`crate::agent::Adapter::files`] 里的文件（备份页要列它们）。
 pub fn extra_files(home: &Path) -> Vec<LiveFile> {
     vec![
         ClaudeToggle::SkipOnboarding.file(home),

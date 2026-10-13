@@ -17,7 +17,6 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone};
 use super::history::{self, Switch, Target};
 use super::{Request, Tokens};
 use crate::agent::AgentKind;
-use crate::agent::grok::TABLE_PREFIX;
 use crate::models_dev::{self, ModelsDev};
 use crate::preset;
 use crate::provider::{Cost, Provider};
@@ -59,8 +58,9 @@ impl Context<'_> {
     pub fn source(&self, request: &Request) -> Source {
         let hint = request.provider.as_deref();
         match request.agent {
+            // 多选 agent 的记录写的是配置里那一项的名字（`confdeck-<供应商 ID>`）。
             AgentKind::Pi | AgentKind::Opencode => match hint {
-                Some(name) => match name.strip_prefix(TABLE_PREFIX) {
+                Some(name) => match provider_of(request.agent, name) {
                     Some(id) => Source::Provider(id.to_string()),
                     None => Source::Other(request.agent, name.to_string()),
                 },
@@ -147,6 +147,11 @@ type Prices = HashMap<(Source, AgentKind, String), Price>;
 fn official(preset_id: &str, model: &str, dev: Option<&ModelsDev>) -> Option<Cost> {
     let preset = preset::get(preset_id)?;
     models_dev::known(&preset.provider(preset_id, ""), model, dev).and_then(|m| m.cost)
+}
+
+/// 多选 agent 配置里一项的名字是哪家供应商的（适配器的 `provider_of`）。
+fn provider_of(agent: AgentKind, name: &str) -> Option<&str> {
+    agent.writes().multi().ok()?.provider_of(name)
 }
 
 /// agent 自家的模型。

@@ -531,8 +531,9 @@ mod tests {
     use std::path::PathBuf;
 
     use confdeck_core::agent::AgentKind;
+    use confdeck_core::agent::ApplyError;
     use confdeck_core::agent::codex::catalog::Skipped;
-    use confdeck_core::apply::{ApplyError, Synced};
+    use confdeck_core::apply::Synced;
     use confdeck_core::engine::Outcome;
     use rust_i18n::t;
 

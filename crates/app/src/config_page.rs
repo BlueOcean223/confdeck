@@ -237,7 +237,7 @@ impl ConfigPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<RawEditor> {
-        let file = store.read(cx).live_file(agent)?;
+        let file = store.read(cx).live_file(agent);
         let (snapshot, text, error) = read(store.read(cx), &file);
         let language = match &file.format {
             Format::Json | Format::Json5 => "json",
@@ -1193,7 +1193,9 @@ impl ConfigPage {
             let provider = self.provider(store, p);
             let expanded = self.expanded == Some(p);
             let listed = listed(provider, kind);
-            let protocol = agent::choose_protocol(provider, kind)
+            let protocol = kind
+                .adapter()
+                .usable(provider)
                 .ok()
                 .map(|(protocol, _)| protocol);
             let count = if listed.len() == 1 {
@@ -1256,6 +1258,7 @@ impl ConfigPage {
             }
             // 接口：这家提供、这个 agent 也能用的不止一种时才给选。
             let choices: Vec<(Protocol, SharedString)> = kind
+                .adapter()
                 .protocols()
                 .iter()
                 .copied()
