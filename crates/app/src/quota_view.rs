@@ -1,6 +1,7 @@
 //! 额度和余额怎么画（10-13 从用量页挪出来，用户说它们属于供应商）：供应商页每一行（官方的和各家的）、官方卡片里的账号、
 //! 菜单栏面板里每个 agent 选的那家。查在 `usage.rs`（`check_due` 等），这里只读 `Store::usage`。
-//! 关掉查询的那一格空着；不自动查、还没查过的是一个圆形箭头，点了查这一个，查着的时候转。
+//! 供应商页上能查的每一行，读数后面一个圆形箭头：点了重查这一个，查着的时候转（10-13 用户：显示了的也要能手动刷新）。
+//! 关掉查询的那一格空着、没有箭头；不自动查、还没查过的只有箭头。
 
 use chrono::{Local, TimeZone as _};
 use confdeck_core::agent::AgentKind;
@@ -17,17 +18,22 @@ use crate::theme::Theme;
 use crate::ui;
 use crate::usage::{CheckOf, QuotaOf};
 
-/// 一家查到了什么。
-pub enum Reading<'a> {
-    /// 还在查，或者自动查、还没轮到（打开页面时会查）。
-    Checking,
+/// 一家的读数：查的是谁、在不在查、查到了什么。
+pub struct Reading<'a> {
+    pub of: CheckOf,
+    /// 正在查：箭头转。
+    pub checking: bool,
+    pub shown: Shown<'a>,
+}
+
+/// 查到了什么。
+pub enum Shown<'a> {
+    /// 自动查的、还没有读数（到点就查，打开页面时也查）。
+    Waiting,
     /// 关掉了查询：这一格空着。
     Off,
-    /// 不自动查、还没查过：一个圆形箭头，点了只查这一个；`checking` 是正在查，箭头转。
-    Unchecked {
-        target: CheckOf,
-        checking: bool,
-    },
+    /// 不自动查、还没查过：只有箭头。
+    Unchecked,
     Quota(&'a Quota),
     Balance(&'a Balance),
     QuotaFailed(&'a QuotaError),
@@ -39,37 +45,46 @@ pub const MAX_WINDOWS: usize = 3;
 /// 供应商页一行里一个窗口的宽度、窗口之间的空隙。
 const CELL: f32 = 86.;
 const CELL_GAP: f32 = 14.;
-/// 供应商页额度那一列的宽度：三个窗口。
-pub const COLUMN: f32 = CELL * MAX_WINDOWS as f32 + CELL_GAP * (MAX_WINDOWS as f32 - 1.);
+/// 三个窗口的宽度。
+const METERS: f32 = CELL * MAX_WINDOWS as f32 + CELL_GAP * (MAX_WINDOWS as f32 - 1.);
+/// 读数后面的圆形箭头占多宽、离读数多远。
+const ARROW: f32 = 26.;
+const ARROW_GAP: f32 = 6.;
+/// 供应商页额度那一栏的宽度：三个窗口加箭头。
+pub const COLUMN: f32 = METERS + ARROW_GAP + ARROW;
 
 impl Store {
-    /// 这家供应商的套餐额度或余额；两样都查不了是 `None`。
+    /// 这家供应商的套餐额度或余额；两样都查不了、也没自己配查法的是 `None`。
     pub fn provider_reading(&self, provider: &Provider) -> Option<Reading<'_>> {
         let target = CheckOf::Provider(provider.id.clone());
-        if quota::plan_supported(provider) {
-            return Some(self.quota_reading(&target, &QuotaOf::Provider(provider.id.clone())));
+        let custom = self.custom_query(provider).is_some();
+        if !custom && quota::plan_supported(provider) {
+            return Some(self.quota_reading(target, &QuotaOf::Provider(provider.id.clone())));
         }
-        if balance::supported(provider) {
-            if self.check_of(&target).off {
-                return Some(Reading::Off);
-            }
-            return Some(match self.usage.balances.get(&provider.id) {
-                Some(Ok(found)) => Reading::Balance(found),
-                Some(Err(err)) => Reading::BalanceFailed(err),
-                None => self.pending(&target),
-            });
+        if custom || balance::supported(provider) {
+            let shown = if self.check_of(&target).off {
+                Shown::Off
+            } else {
+                match self.usage.balances.get(&provider.id) {
+                    Some(Ok(found)) => Shown::Balance(found),
+                    Some(Err(err)) => Shown::BalanceFailed(err),
+                    None => self.pending(&target),
+                }
+            };
+            return Some(self.reading(target, shown));
         }
         None
     }
 
-    /// 能不能查额度或余额（「⋯」里有没有「额度查询」）。
+    /// 认得这家的查法（套餐额度、余额）：「额度查询」卡片里有没有「内置」。
+    pub fn built_in(&self, provider: &Provider) -> bool {
+        quota::plan_supported(provider) || balance::supported(provider)
+    }
+
+    /// 「⋯」里有没有「额度查询」：供应商都有（认不出的可以自己配），Claude 官方没有。
     pub fn checkable(&self, target: &CheckOf) -> bool {
         match target {
-            CheckOf::Provider(id) => self
-                .providers
-                .iter()
-                .find(|p| &p.id == id)
-                .is_some_and(|p| quota::plan_supported(p) || balance::supported(p)),
+            CheckOf::Provider(_) => true,
             CheckOf::Account(kind, _) | CheckOf::Login(kind) => *kind != AgentKind::ClaudeCode,
         }
     }
@@ -77,15 +92,29 @@ impl Store {
     /// 官方登录（登录文件里那个账号）的额度。Claude 官方先不查（10-13 用户说先不做），是 `None`。
     pub fn official_reading(&self, kind: AgentKind) -> Option<Reading<'_>> {
         (kind != AgentKind::ClaudeCode)
-            .then(|| self.quota_reading(&self.live_target(kind), &QuotaOf::Agent(kind)))
+            .then(|| self.quota_reading(self.live_target(kind), &QuotaOf::Agent(kind)))
     }
 
     /// 存下的一个官方账号（不是登着的那个）的额度。
     pub fn account_reading(&self, kind: AgentKind, id: &str) -> Reading<'_> {
         self.quota_reading(
-            &CheckOf::Account(kind, id.to_string()),
+            CheckOf::Account(kind, id.to_string()),
             &QuotaOf::Account(kind, id.to_string()),
         )
+    }
+
+    /// 「额度查询」卡片里那一家的读数。
+    pub fn reading_of(&self, target: &CheckOf) -> Option<Reading<'_>> {
+        match target {
+            CheckOf::Provider(id) => self
+                .providers
+                .iter()
+                .find(|p| &p.id == id)
+                .and_then(|p| self.provider_reading(p)),
+            CheckOf::Account(kind, _) if self.in_use(target) => self.official_reading(*kind),
+            CheckOf::Account(kind, id) => Some(self.account_reading(*kind, id)),
+            CheckOf::Login(kind) => self.official_reading(*kind),
+        }
     }
 
     /// 这个 agent 现在选的那家：单选的、选的是列表里的哪家或者官方登录时才有。
@@ -97,71 +126,64 @@ impl Store {
             _ => None,
         }
         // 面板里关掉的、没查过的不写那一行。
-        .filter(|reading| !matches!(reading, Reading::Off | Reading::Unchecked { .. }))
+        .filter(|reading| !matches!(reading.shown, Shown::Off | Shown::Unchecked))
     }
 
-    fn quota_reading(&self, target: &CheckOf, of: &QuotaOf) -> Reading<'_> {
-        if self.check_of(target).off {
-            return Reading::Off;
-        }
-        match self.usage.quotas.get(of) {
-            Some(Ok(found)) => Reading::Quota(found),
-            Some(Err(err)) => Reading::QuotaFailed(err),
-            None => self.pending(target),
-        }
-    }
-
-    /// 还没有读数：到点会自动查的是占位条，不自动查的是圆形箭头（在查就转）。
-    fn pending(&self, target: &CheckOf) -> Reading<'static> {
-        if self.check_of(target).every(self.in_use(target)) > 0 {
-            Reading::Checking
+    fn quota_reading(&self, target: CheckOf, of: &QuotaOf) -> Reading<'_> {
+        let shown = if self.check_of(&target).off {
+            Shown::Off
         } else {
-            Reading::Unchecked {
-                target: target.clone(),
-                checking: self.checking_target(target),
+            match self.usage.quotas.get(of) {
+                Some(Ok(found)) => Shown::Quota(found),
+                Some(Err(err)) => Shown::QuotaFailed(err),
+                None => self.pending(&target),
             }
+        };
+        self.reading(target, shown)
+    }
+
+    fn reading<'a>(&self, of: CheckOf, shown: Shown<'a>) -> Reading<'a> {
+        Reading {
+            checking: self.checking_target(&of),
+            of,
+            shown,
+        }
+    }
+
+    /// 还没有读数：到点会自动查的是占位条，不自动查的只有箭头。
+    fn pending(&self, target: &CheckOf) -> Shown<'static> {
+        if self.check_of(target).every(self.in_use(target)) > 0 {
+            Shown::Waiting
+        } else {
+            Shown::Unchecked
         }
     }
 }
 
-/// 供应商页一行右边的那一块：每个窗口一格（名字和百分比、细进度条，悬停说几点重置），
-/// 或者「余额 ¥86.40」，或者一句状态。宽度是 [`COLUMN`]，各行的格子上下对齐。圆形箭头点了经 `store` 查这一个。
+/// 供应商页一行右边的那一块：读数（[`meters`]），后面一个圆形箭头。宽度是 [`COLUMN`]，各行的格子、箭头上下对齐。
+/// 箭头点了经 `store` 重查这一个。关掉查询的整栏空着。
 pub fn cells(t: &Theme, id: &str, reading: &Reading, store: &Entity<Store>) -> Div {
-    let column = div().flex_none().w(px(COLUMN)).h_flex().items_center();
+    let column = div()
+        .flex_none()
+        .w(px(COLUMN))
+        .h_flex()
+        .items_center()
+        .gap(px(ARROW_GAP));
+    if matches!(reading.shown, Shown::Off) {
+        return column;
+    }
+    column
+        .child(meters(t, id, &reading.shown))
+        .child(refresh(t, id, reading, store))
+}
+
+/// 读数：每个窗口一格（名字和百分比、细进度条，悬停说几点重置），或者「余额 ¥86.40」，或者一句状态。宽度是三个窗口。
+pub fn meters(t: &Theme, id: &str, shown: &Shown) -> Div {
+    let column = div().flex_none().w(px(METERS)).h_flex().items_center();
     let now = Local::now().timestamp_millis();
-    match reading {
-        Reading::Off => column,
-        Reading::Unchecked { target, checking } => {
-            let store = store.clone();
-            let target = target.clone();
-            let checking = *checking;
-            column.child(
-                div()
-                    .id(ElementId::Name(format!("check-{id}").into()))
-                    .size(px(26.))
-                    .ml(px(-6.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(t.pill))
-                    .tooltip(ui::tooltip(t!("quota.check_now")))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        if !checking {
-                            store.update(cx, |store, cx| store.check_one(&target, cx));
-                        }
-                    })
-                    .child(ui::spinning(
-                        ui::icon("rotate-cw", 14., t.muted),
-                        ElementId::Name(format!("check-spin-{id}").into()),
-                        checking,
-                    )),
-            )
-        }
-        Reading::Checking => column.gap(px(CELL_GAP)).children((0..2).map(|_| {
+    match shown {
+        Shown::Off | Shown::Unchecked => column,
+        Shown::Waiting => column.gap(px(CELL_GAP)).children((0..2).map(|_| {
             div()
                 .w(px(CELL))
                 .v_flex()
@@ -169,10 +191,10 @@ pub fn cells(t: &Theme, id: &str, reading: &Reading, store: &Entity<Store>) -> D
                 .child(div().w(px(44.)).h(px(10.)).rounded(px(3.)).bg(t.pill))
                 .child(div().h(px(3.)).rounded(px(2.)).bg(t.pill))
         })),
-        Reading::Quota(found) if found.windows.is_empty() => {
+        Shown::Quota(found) if found.windows.is_empty() => {
             column.child(status(t, id, &QuotaError::NoPlan))
         }
-        Reading::Quota(found) => column.gap(px(CELL_GAP)).children(
+        Shown::Quota(found) => column.gap(px(CELL_GAP)).children(
             found
                 .windows
                 .iter()
@@ -180,10 +202,40 @@ pub fn cells(t: &Theme, id: &str, reading: &Reading, store: &Entity<Store>) -> D
                 .enumerate()
                 .map(|(i, w)| cell(t, &format!("{id}-{i}"), w, now)),
         ),
-        Reading::Balance(found) => column.child(money(t, found, 13.)),
-        Reading::QuotaFailed(err) => column.child(status(t, id, err)),
-        Reading::BalanceFailed(err) => column.child(balance_status(t, id, err)),
+        Shown::Balance(found) => column.child(money(t, found, 13.)),
+        Shown::QuotaFailed(err) => column.child(status(t, id, err)),
+        Shown::BalanceFailed(err) => column.child(balance_status(t, id, err)),
     }
+}
+
+/// 圆形箭头：点了重查这一个，查着的时候转。
+fn refresh(t: &Theme, id: &str, reading: &Reading, store: &Entity<Store>) -> Stateful<Div> {
+    let store = store.clone();
+    let target = reading.of.clone();
+    let checking = reading.checking;
+    div()
+        .id(ElementId::Name(format!("check-{id}").into()))
+        .flex_none()
+        .size(px(ARROW))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .cursor_pointer()
+        .hover(|s| s.bg(t.pill))
+        .tooltip(ui::tooltip(t!("quota.check_now")))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            if !checking {
+                store.update(cx, |store, cx| store.check_one(&target, cx));
+            }
+        })
+        .child(ui::spinning(
+            ui::icon("rotate-cw", 13., t.muted),
+            ElementId::Name(format!("check-spin-{id}").into()),
+            checking,
+        ))
 }
 
 /// 没有额度可写的行：空出 [`COLUMN`] 那么宽，右边的东西和别的行对齐。
@@ -200,13 +252,13 @@ pub fn line(t: &Theme, id: &str, reading: &Reading) -> Div {
         .h(px(14.))
         .text_size(px(11.));
     let now = Local::now().timestamp_millis();
-    match reading {
-        Reading::Off | Reading::Unchecked { .. } => row,
-        Reading::Checking => row.child(div().w(px(120.)).h(px(8.)).rounded(px(3.)).bg(t.pill)),
-        Reading::Quota(found) if found.windows.is_empty() => {
+    match &reading.shown {
+        Shown::Off | Shown::Unchecked => row,
+        Shown::Waiting => row.child(div().w(px(120.)).h(px(8.)).rounded(px(3.)).bg(t.pill)),
+        Shown::Quota(found) if found.windows.is_empty() => {
             row.child(status(t, id, &QuotaError::NoPlan))
         }
-        Reading::Quota(found) => row.children(
+        Shown::Quota(found) => row.children(
             found
                 .windows
                 .iter()
@@ -233,9 +285,9 @@ pub fn line(t: &Theme, id: &str, reading: &Reading) -> Div {
                         .tooltip(ui::tooltip(tip(w, now)))
                 }),
         ),
-        Reading::Balance(found) => row.child(money(t, found, 11.5)),
-        Reading::QuotaFailed(err) => row.child(status(t, id, err)),
-        Reading::BalanceFailed(err) => row.child(balance_status(t, id, err)),
+        Shown::Balance(found) => row.child(money(t, found, 11.5)),
+        Shown::QuotaFailed(err) => row.child(status(t, id, err)),
+        Shown::BalanceFailed(err) => row.child(balance_status(t, id, err)),
     }
 }
 
@@ -332,6 +384,7 @@ fn money(t: &Theme, found: &Balance, size: f32) -> Div {
     let sign = match found.currency {
         Currency::Cny => "¥",
         Currency::Usd => "$",
+        Currency::Plain => "",
     };
     div()
         .h_flex()

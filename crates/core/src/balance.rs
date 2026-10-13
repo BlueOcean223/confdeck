@@ -16,6 +16,7 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::net::{Http, NetError};
@@ -23,10 +24,14 @@ use crate::provider::{self, Provider};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Currency {
     Cny,
+    #[default]
     Usd,
+    /// 不是钱（积分、次数、token），只写数。自己配的查询（[`crate::query`]）才有。
+    Plain,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -204,13 +209,13 @@ fn code_error(body: &Value, code: &Value) -> BalanceError {
 }
 
 /// 数字或写成字符串的数字。
-fn number(value: &Value) -> Option<f64> {
+pub(crate) fn number(value: &Value) -> Option<f64> {
     value
         .as_f64()
         .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
 }
 
-fn truncate(text: &str) -> String {
+pub(crate) fn truncate(text: &str) -> String {
     text.chars().take(200).collect()
 }
 

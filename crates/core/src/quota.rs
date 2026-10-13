@@ -27,7 +27,7 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 一家供应商、一个官方账号的额度或余额查不查、多久自动查一次（10-13 提案 13 之后用户定的：按供应商配置，参考 cc-switch 的
 /// 「配置用量查询」）。存在 `state.json`（[`crate::engine::Engine::checks`]），只属于这台设备；没存过的是默认值。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Check {
     /// 关掉了：不自动查，点刷新也不查。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -35,6 +35,10 @@ pub struct Check {
     /// 自动查的间隔（分钟），0 是不自动查。没设过是 `None`：在用的每 [`Check::DEFAULT_EVERY`] 分钟，不在用的不自动查。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub every: Option<u32>,
+    /// 供应商自己配的查法（[`crate::query`]）。没有是用认得的查法（[`plan_supported`]、[`crate::balance::supported`]），
+    /// 都认不出就不查。存着它的供应商查的是余额。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<crate::query::Query>,
 }
 
 impl Check {

@@ -16,6 +16,7 @@
 //! - [`net`]：confdeck 自己发出去的请求（测连通、拉模型列表、下 models.dev），出站代理在这里生效；
 //!   [`remote`]：对一家供应商测各个接口地址、拉模型列表；[`models_dev`]：按 models.dev 补模型的上下文、价格等。
 //! - [`usage`]：扫各 agent 的会话记录算用量，认是哪家供应商、按价格算花费；[`balance`]：查供应商账户里还有多少钱；
+//!   [`query`]：认不出的站点（new-api 一类的中转）按自己配的模板查余额；
 //!   [`quota`]：官方订阅和套餐的限额窗口用了多少；[`session`]：各 agent 的会话列表、对话内容、恢复命令。
 //! - [`account`]：官方账号多账号（Codex、Grok Build）：存下每个账号的登录，切换时写回 agent 的登录文件；
 //!   [`program`]：找 agent 的命令行程序。
@@ -40,6 +41,7 @@ pub mod patch;
 pub mod preset;
 pub mod program;
 pub mod provider;
+pub mod query;
 pub mod quota;
 pub mod remote;
 pub mod session;

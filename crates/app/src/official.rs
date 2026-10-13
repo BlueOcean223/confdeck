@@ -17,7 +17,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{self, Logo, Selection, Store};
-use crate::quota_view::{self, Reading};
+use crate::quota_view::{self, Reading, Shown};
 use crate::theme::Theme;
 use crate::ui::{self, Button};
 use crate::usage::CheckOf;
@@ -172,7 +172,10 @@ impl Store {
     /// 登着的官方账号的套餐：查到的额度里有就用它，没有用账号资料里的。
     pub fn official_plan(&self, agent: usize) -> Option<String> {
         let kind = self.agents[agent].kind;
-        if let Some(Reading::Quota(found)) = self.official_reading(kind)
+        if let Some(Reading {
+            shown: Shown::Quota(found),
+            ..
+        }) = self.official_reading(kind)
             && let Some(plan) = &found.plan
         {
             return Some(plan.clone());
@@ -448,7 +451,10 @@ impl Officials {
                 .into_any_element();
         }
         let reading = store.official_reading(kind);
-        let signed_out = matches!(reading, Some(Reading::QuotaFailed(QuotaError::NotLoggedIn)));
+        let signed_out = matches!(
+            reading.as_ref().map(|r| &r.shown),
+            Some(Shown::QuotaFailed(QuotaError::NotLoggedIn))
+        );
         let sub: SharedString = match entry {
             Some(entry) => format!("{} · {}", row.name, entry.title()).into(),
             None if signed_out => format!("{} · {}", row.name, t!("quota.signed_out")).into(),

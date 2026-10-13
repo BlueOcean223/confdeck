@@ -10,7 +10,8 @@
 //!   分别对应主窗口的 Agent 页和菜单栏面板。没写就是都显示，新接上的 agent 自然也显示。
 //! - `proxy`：设置页的出站代理（[`crate::net::Proxy`]）。没写是「跟随系统」。代理多半是本机的端口，所以只存本机。
 //! - `checks`：每家供应商、每个官方账号的额度查询设置（[`crate::quota::Check`]），键是 `provider:<id>`、`account:<agent>:<id>`。
-//!   没写是默认值。多久查一次是这台设备的事，不同步。
+//!   没写是默认值。多久查一次是这台设备的事，不同步。自己配的查法（[`crate::query::Query`]）也在这里，里面可能有站点的访问令牌，
+//!   所以不随供应商导出（文件只有自己能读）。
 //!
 //! 这份记录只是提示，丢了或读不出来就当作空的：后果只是多备份一次、认不出同地址的几家里是哪一家，
 //! 所以不像用户的文件那样「读不出就报错」。
@@ -195,14 +196,14 @@ mod tests {
             "provider:deepseek",
             Check {
                 off: true,
-                every: None,
+                ..Default::default()
             },
         );
         state.set_check(
             "account:codex:abc",
             Check {
-                off: false,
                 every: Some(15),
+                ..Default::default()
             },
         );
         state.set_check("provider:kimi", Check::default());

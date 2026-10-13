@@ -202,10 +202,31 @@ impl Http {
         timeout: Duration,
         secrets: &[&str],
     ) -> Result<Vec<u8>, NetError> {
+        self.send(false, url, headers, None, timeout, secrets)
+    }
+
+    /// GET 或 POST（`post`），带上 `body`。返回同 [`Http::get`]。
+    pub(crate) fn send(
+        &self,
+        post: bool,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&str>,
+        timeout: Duration,
+        secrets: &[&str],
+    ) -> Result<Vec<u8>, NetError> {
         check_url(url)?;
-        let mut request = self.client.get(url).timeout(timeout);
+        let mut request = if post {
+            self.client.post(url)
+        } else {
+            self.client.get(url)
+        }
+        .timeout(timeout);
         for (name, value) in headers {
             request = request.header(*name, *value);
+        }
+        if let Some(body) = body {
+            request = request.body(body.to_string());
         }
         let response = request.send().map_err(|err| self.error(err))?;
         let status = response.status();
@@ -349,8 +370,21 @@ pub(crate) mod tests {
                 while let Ok(n @ 1..) = stream.read(&mut chunk) {
                     buf.extend_from_slice(&chunk[..n]);
                     while let Some(end) = find(&buf, b"\r\n\r\n") {
-                        let request = String::from_utf8_lossy(&buf[..end]).to_string();
-                        buf.drain(..end + 4);
+                        // 有请求体的（POST）连着请求体一起交给 `reply`，没收全就等下一段。
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() < end + 4 + length {
+                            break;
+                        }
+                        let request = String::from_utf8_lossy(&buf[..end + 4 + length]).to_string();
+                        buf.drain(..end + 4 + length);
                         let (status, body) = reply(&request);
                         let head = request.starts_with("HEAD ");
                         let response = format!(

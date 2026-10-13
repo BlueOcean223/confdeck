@@ -23,6 +23,7 @@ use confdeck_core::fsx;
 use confdeck_core::models_dev::{self, ModelsDev};
 use confdeck_core::net::Http;
 use confdeck_core::provider::Provider;
+use confdeck_core::query::{self, Query};
 use confdeck_core::quota::{self, Check, Quota, QuotaError};
 use confdeck_core::session::Session;
 use confdeck_core::usage::history::{self, Target};
@@ -80,7 +81,8 @@ impl CheckOf {
 /// 查什么。
 enum Job {
     Quota(QuotaOf, QuotaJob),
-    Balance(Provider),
+    /// 余额：认得的几家（`None`），或者按自己配的查法。
+    Balance(Box<Provider>, Option<Query>),
 }
 
 /// 每隔多久看一次有没有到点该查的。
@@ -196,21 +198,28 @@ impl Store {
         self.usage
             .checks
             .get(&target.key())
-            .copied()
+            .cloned()
             .unwrap_or_default()
     }
 
     /// 改一家供应商、一个账号的额度查询设置，改完按新的设置看一次要不要查。
     pub fn set_check(&mut self, target: &CheckOf, check: Check, cx: &mut Context<Self>) {
-        let was_off = self.check_of(target).off;
+        let old = self.check_of(target);
+        // 刚打开的、换了查法的：马上查一次，不等间隔。换了查法的，旧的读数不留。
+        let now = !check.off && (old.off || old.query != check.query);
+        if old.query != check.query
+            && let CheckOf::Provider(id) = target
+        {
+            self.usage.balances.remove(id);
+            self.usage.quotas.remove(&QuotaOf::Provider(id.clone()));
+        }
         if let Err(err) = self.engine.set_check(&target.key(), check) {
             let notice = crate::data::Notice::err(err.to_string());
             self.announce(&[notice], cx);
             return;
         }
         self.usage.checks = self.engine.checks();
-        // 刚打开的：马上查一次，不等间隔。
-        if was_off && !check.off {
+        if now {
             self.check_one(target, cx);
         }
         self.check_due(cx);
@@ -325,7 +334,12 @@ impl Store {
         }
         for provider in &self.providers {
             let target = CheckOf::Provider(provider.id.clone());
-            if quota::plan_supported(provider) {
+            if let Some(query) = self.custom_query(provider) {
+                jobs.push((
+                    target,
+                    Job::Balance(Box::new(provider.clone()), Some(query)),
+                ));
+            } else if quota::plan_supported(provider) {
                 let found = provider.clone();
                 jobs.push((
                     target,
@@ -335,7 +349,7 @@ impl Store {
                     ),
                 ));
             } else if balance::supported(provider) {
-                jobs.push((target, Job::Balance(provider.clone())));
+                jobs.push((target, Job::Balance(Box::new(provider.clone()), None)));
             }
         }
         jobs
@@ -381,7 +395,7 @@ impl Store {
                     })
                     .detach();
                 }
-                Job::Balance(provider) => {
+                Job::Balance(provider, custom) => {
                     if self.usage.checking.contains(&provider.id) {
                         continue;
                     }
@@ -393,9 +407,13 @@ impl Store {
                         if let Some(result) = fake_balance(&provider.id) {
                             return (provider.id, result);
                         }
-                        let result = Http::new(&proxy)
-                            .map_err(BalanceError::Net)
-                            .and_then(|http| balance::query(&http, &provider));
+                        let result =
+                            Http::new(&proxy)
+                                .map_err(BalanceError::Net)
+                                .and_then(|http| match &custom {
+                                    Some(custom) => query::run(&http, &provider, custom),
+                                    None => balance::query(&http, &provider),
+                                });
                         (provider.id, result)
                     });
                     cx.spawn(async move |this, cx| {
@@ -412,6 +430,13 @@ impl Store {
             }
         }
         cx.notify();
+    }
+
+    /// 这家供应商自己配的查法（填够了的）。
+    pub fn custom_query(&self, provider: &Provider) -> Option<Query> {
+        self.check_of(&CheckOf::Provider(provider.id.clone()))
+            .query
+            .filter(Query::complete)
     }
 
     /// 有没有哪家、哪个账号在查（供应商页的刷新按钮转）。

@@ -967,8 +967,8 @@ quota:
   # 供应商页、官方卡片、菜单栏里的额度和余额。
   # 不自动查、还没查过的那一格，点了查这一家。
   check_now:
-    en: Check
-    zh-CN: 查一下
+    en: Refresh
+    zh-CN: 刷新
   span_5h:
     en: 5 hours
     zh-CN: 5 小时
@@ -1053,6 +1053,69 @@ check:
   run:
     en: Check now
     zh-CN: 现在查
+  # 怎么查（供应商才有，10-13 用户：照 cc-switch 做模板）。
+  template:
+    en: Method
+    zh-CN: 方式
+  # 认得的几家的查法。
+  built_in:
+    en: Built-in
+    zh-CN: 内置
+  general:
+    en: General
+    zh-CN: 通用
+  custom:
+    en: Custom
+    zh-CN: 自定义
+  url:
+    en: URL
+    zh-CN: 地址
+  # NewAPI 的系统访问令牌。
+  token:
+    en: Access token
+    zh-CN: 访问令牌
+  user:
+    en: User ID
+    zh-CN: 用户 ID
+  request:
+    en: Request
+    zh-CN: 请求
+  headers:
+    en: Headers
+    zh-CN: 请求头
+  body:
+    en: Body
+    zh-CN: 请求体
+  # 余额、已用在响应的哪里（data.balance）。
+  left:
+    en: Balance
+    zh-CN: 余额
+  used:
+    en: Used
+    zh-CN: 已用
+  divisor:
+    en: Divide by
+    zh-CN: 除以
+  unit:
+    en: Unit
+    zh-CN: 单位
+  usd:
+    en: USD
+    zh-CN: 美元
+  cny:
+    en: CNY
+    zh-CN: 人民币
+  # 不是钱：积分、次数。
+  plain:
+    en: Other
+    zh-CN: 其他
+  optional:
+    en: Optional
+    zh-CN: 可选
+  # 通用模板的 Key 空着时用供应商的。
+  key_hint:
+    en: Provider's key
+    zh-CN: 供应商的 Key
 
 official:
   # 官方登录当成一家供应商：「Anthropic 官方」。
