@@ -96,26 +96,7 @@ impl Store {
     pub fn official_entries(&self, agent: usize) -> Vec<Entry> {
         let kind = self.agents[agent].kind;
         let official = self.uses_official(agent);
-        if kind == AgentKind::ClaudeCode && !account::supported(kind) {
-            return self
-                .accounts
-                .claude
-                .as_ref()
-                .map(|profile| Entry {
-                    id: None,
-                    stored: false,
-                    name: None,
-                    note: None,
-                    email: profile.email.clone(),
-                    plan: profile.plan.clone(),
-                    live: true,
-                    in_use: official,
-                    check: self.live_target(kind),
-                })
-                .into_iter()
-                .collect();
-        }
-        if !account::supported(kind) || self.account_blocked(kind) {
+        if self.account_blocked(kind) {
             return Vec::new();
         }
         let live = self.live_account(kind);
@@ -137,9 +118,10 @@ impl Store {
                 }
             })
             .collect();
-        if let Some(Live::Unknown(identity)) = live {
+        if let Some(Live::Unknown(identity) | Live::ViewOnly(identity)) = live {
+            let storable = matches!(live, Some(Live::Unknown(_)));
             entries.push(Entry {
-                id: Some(identity.id.clone()),
+                id: storable.then(|| identity.id.clone()),
                 stored: false,
                 name: None,
                 note: None,
@@ -153,12 +135,9 @@ impl Store {
         entries
     }
 
-    /// 登着的官方账号的邮箱：存不了多个账号的 Claude Code 看 `~/.claude.json`，别的看登录文件现在是谁。
+    /// 登着的官方账号的邮箱。
     pub fn official_email(&self, agent: usize) -> Option<String> {
         let kind = self.agents[agent].kind;
-        if kind == AgentKind::ClaudeCode && !account::supported(kind) {
-            return self.accounts.claude.as_ref()?.email.clone();
-        }
         match self.live_account(kind)? {
             Live::Known(id) => self
                 .accounts_of(kind)
@@ -166,7 +145,7 @@ impl Store {
                 .find(|account| &account.id == id)?
                 .email
                 .clone(),
-            Live::Unknown(identity) => identity.email.clone(),
+            Live::Unknown(identity) | Live::ViewOnly(identity) => identity.email.clone(),
             Live::LoggedOut => None,
         }
     }
@@ -182,9 +161,6 @@ impl Store {
         {
             return Some(plan.clone());
         }
-        if kind == AgentKind::ClaudeCode && !account::supported(kind) {
-            return self.accounts.claude.as_ref()?.plan.clone();
-        }
         match self.live_account(kind)? {
             Live::Known(id) => self
                 .accounts_of(kind)
@@ -192,7 +168,7 @@ impl Store {
                 .find(|account| &account.id == id)?
                 .plan
                 .clone(),
-            Live::Unknown(identity) => identity.plan.clone(),
+            Live::Unknown(identity) | Live::ViewOnly(identity) => identity.plan.clone(),
             Live::LoggedOut => None,
         }
     }
@@ -300,6 +276,7 @@ impl Officials {
             let store = self.store.read(cx);
             let found = store
                 .accounts
+                .read
                 .list
                 .iter()
                 .find(|account| account.agent == key.0 && account.id == key.1);

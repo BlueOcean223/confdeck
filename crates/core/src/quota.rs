@@ -20,6 +20,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::account;
 use crate::agent::AgentKind;
 use crate::net::{Http, NetError};
 use crate::provider::{self, Provider};
@@ -484,22 +485,11 @@ fn parse_codex(body: &Value) -> Result<Quota, QuotaError> {
     })
 }
 
-/// Grok Build 官方：用一份登录（`~/.grok/auth.json` 的内容，或存下的账号的）查。这个文件按登录的范围分条，用 `https://auth.x.ai::`
-/// 开头那条，没有再用老的 `…/sign-in` 那条。账单只回一个额度窗口：`config.creditUsagePercent` 和 `config.currentPeriod`（类型、结束时间）。
+/// Grok Build 官方：用一份登录（`~/.grok/auth.json` 的内容，或存下的账号的）查。这个文件按登录的范围分条，用哪条和认账号一样
+/// （`account::grok_entry`）。账单只回一个额度窗口：`config.creditUsagePercent` 和 `config.currentPeriod`（类型、结束时间）。
 pub fn grok_login(http: &Http, login: &[u8]) -> Result<Quota, QuotaError> {
     let auth: Value = serde_json::from_slice(login).map_err(|_| QuotaError::NotLoggedIn)?;
-    let entries = auth.as_object().ok_or(QuotaError::NotLoggedIn)?;
-    let usable = |entry: &Value| entry["key"].as_str().is_some_and(|k| !k.is_empty());
-    let entry = entries
-        .iter()
-        .find(|(scope, entry)| scope.starts_with("https://auth.x.ai::") && usable(entry))
-        .or_else(|| {
-            entries
-                .iter()
-                .find(|(scope, entry)| scope.contains("/sign-in") && usable(entry))
-        })
-        .map(|(_, entry)| entry)
-        .ok_or(QuotaError::NotLoggedIn)?;
+    let entry = account::grok_entry(&auth).ok_or(QuotaError::NotLoggedIn)?;
     let token = entry["key"].as_str().unwrap_or_default();
     let bearer = format!("Bearer {token}");
     let mut headers = vec![

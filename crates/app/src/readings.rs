@@ -222,7 +222,7 @@ impl Store {
             };
             subjects.push(Subject::Live(agent.kind, account));
         }
-        for account in &self.accounts.list {
+        for account in &self.accounts.read.list {
             let kind = account.agent;
             let installed = self.agents.iter().any(|a| a.kind == kind && a.installed());
             let live =

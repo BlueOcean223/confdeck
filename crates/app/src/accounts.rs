@@ -7,7 +7,7 @@
 //! - 选择器或供应商页上选一个账号：这个 agent 不在「默认」就先切回默认，再换登录文件。
 //! - 账号的名字和备注（提案 13）只存在 confdeck 的 `accounts.json`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use confdeck_core::account::{self, Account, AccountError, Accounts, Live, Login, LoginHandle};
@@ -23,18 +23,11 @@ use crate::write::{Done, Report, Written};
 
 #[derive(Default)]
 pub(crate) struct AccountState {
-    /// 存下的全部账号，先存的在前。
-    pub list: Vec<Account>,
-    /// 装了的、能切账号的 agent 的登录文件现在是谁。
-    pub live: HashMap<AgentKind, Live>,
-    /// Codex 的登录存在钥匙串里：切不了。
-    pub blocked: HashSet<AgentKind>,
+    /// 快照里读到的（core 的 `account::read_all`）：存下的账号、登录文件现在是谁（不是 macOS 时的 Claude Code 只能看：
+    /// `Live::ViewOnly`）、切不了的、读不了的原因。
+    pub read: Accounts,
     /// 正在登录的。
     pub logins: HashMap<AgentKind, Pending>,
-    /// `accounts.json` 读不了的原因。
-    pub error: Option<String>,
-    /// Claude Code 登着的官方账号的资料（邮箱、套餐）。存不了多个 Claude 账号（不是 macOS）时用。
-    pub claude: Option<account::Profile>,
 }
 
 /// 一次正在跑的登录。
@@ -48,16 +41,13 @@ pub(crate) struct Pending {
 impl Store {
     /// 换上快照里的账号（`Store::reload` 读完调）。
     pub(crate) fn apply_accounts(&mut self, accounts: Accounts) {
-        self.accounts.list = accounts.list;
-        self.accounts.live = accounts.live;
-        self.accounts.blocked = accounts.blocked;
-        self.accounts.claude = accounts.claude;
-        self.accounts.error = accounts.error.map(|err| err.to_string());
+        self.accounts.read = accounts;
     }
 
     /// 这个 agent 存下的账号。
     pub fn accounts_of(&self, kind: AgentKind) -> Vec<&Account> {
         self.accounts
+            .read
             .list
             .iter()
             .filter(|account| account.agent == kind)
@@ -66,11 +56,11 @@ impl Store {
 
     /// 登录文件现在是谁；没装、切不了的是 `None`。
     pub fn live_account(&self, kind: AgentKind) -> Option<&Live> {
-        self.accounts.live.get(&kind)
+        self.accounts.read.live.get(&kind)
     }
 
     pub fn account_blocked(&self, kind: AgentKind) -> bool {
-        self.accounts.blocked.contains(&kind)
+        self.accounts.read.blocked.contains(&kind)
     }
 
     pub fn login_pending(&self, kind: AgentKind) -> Option<&Pending> {
@@ -87,12 +77,13 @@ impl Store {
             Live::Known(id) => {
                 let account = self
                     .accounts
+                    .read
                     .list
                     .iter()
                     .find(|account| account.agent == kind && &account.id == id)?;
                 account.name.clone().or_else(|| account.email.clone())
             }
-            Live::Unknown(identity) => identity.email.clone(),
+            Live::Unknown(identity) | Live::ViewOnly(identity) => identity.email.clone(),
             Live::LoggedOut => None,
         }
     }
@@ -109,7 +100,7 @@ impl Store {
         let result = account::label(&self.engine, &self.home, kind, id, name, note);
         if let Ok(labeled) = &result {
             // 先换上，不等快照（名字不闪回旧的）。登录文件里没存的那个这时存下了。
-            let list = &mut self.accounts.list;
+            let list = &mut self.accounts.read.list;
             match list
                 .iter_mut()
                 .find(|a| a.agent == kind && a.id == labeled.id)
@@ -117,9 +108,10 @@ impl Store {
                 Some(slot) => *slot = labeled.clone(),
                 None => list.push(labeled.clone()),
             }
-            if matches!(self.accounts.live.get(&kind), Some(Live::Unknown(identity)) if identity.id == labeled.id)
+            if matches!(self.accounts.read.live.get(&kind), Some(Live::Unknown(identity)) if identity.id == labeled.id)
             {
                 self.accounts
+                    .read
                     .live
                     .insert(kind, Live::Known(labeled.id.clone()));
             }
@@ -256,6 +248,7 @@ impl Store {
         let to_default = self.agents[agent].status != AgentStatus::Official;
         let email = self
             .accounts
+            .read
             .list
             .iter()
             .find(|account| account.agent == kind && account.id == id)
@@ -267,7 +260,10 @@ impl Store {
             return Written::nothing();
         }
         self.agents[agent].status = AgentStatus::Official;
-        self.accounts.live.insert(kind, Live::Known(id.clone()));
+        self.accounts
+            .read
+            .live
+            .insert(kind, Live::Known(id.clone()));
         // 额度跟着账号走（Grok 联网查的是登录文件里的账号）：按换上的快照查。
         self.after_snapshot(move |store, cx| {
             let live = store.live_target(kind);
@@ -298,6 +294,7 @@ impl Store {
         let result = account::remove(&self.engine, &self.home, kind, id);
         if result.is_ok() {
             self.accounts
+                .read
                 .list
                 .retain(|a| !(a.agent == kind && a.id == id));
         }

@@ -149,25 +149,19 @@ pub fn snapshot(engine: &Engine, home: &Path) -> Snapshot {
         .filter(|agent| agent.status.installed())
         .map(|agent| agent.kind)
         .collect();
-    let (_, codex) = files
-        .into_iter()
-        .find(|(kind, _)| *kind == AgentKind::Codex)
-        .expect("Codex is in ALL");
-    let codex_disk = Disk {
-        config: codex.config.as_ref().ok().and_then(Option::as_deref),
-        login: codex
-            .login
-            .as_ref()
-            .and_then(|(_, login)| login.as_ref().ok()?.as_deref()),
-    };
-    let mut accounts = account::read_all(engine, home, &installed, codex_disk);
-    // `auth.json` 读不了：不知道登的是谁（不是「未登录」），原因记下来。Codex 没装时不用说。
-    if installed.contains(&AgentKind::Codex)
-        && let Some((path, Err(source))) = codex.login
-    {
-        accounts.live.remove(&AgentKind::Codex);
-        accounts.error = Some(EngineError::Io { path, source }.into());
-    }
+    // 读过的配置文件、登录文件（Codex 的 `auth.json`）给官方账号接着用；读不了的原因也在里面。
+    let read: Vec<account::Read> = files
+        .iter()
+        .map(|(kind, files)| account::Read {
+            kind: *kind,
+            config: files.config.as_ref().ok().and_then(Option::as_deref),
+            login: files
+                .login
+                .as_ref()
+                .map(|(path, login)| (path.as_path(), login)),
+        })
+        .collect();
+    let accounts = account::read_all(engine, home, &installed, &read);
     Snapshot {
         providers,
         providers_error,
@@ -579,7 +573,13 @@ mod tests {
         );
         assert_eq!(snapshot.accounts.list.len(), 1);
         assert_eq!(
-            account::stored_login(home.engine.data(), AgentKind::Codex, &identity.id).unwrap(),
+            account::stored_login(
+                home.engine.data(),
+                home.path(),
+                AgentKind::Codex,
+                &identity.id
+            )
+            .unwrap(),
             later
         );
 

@@ -196,14 +196,15 @@ impl Reader for Web {
     fn read(&self, ticket: &Ticket, net: &Net) -> Option<Outcome> {
         let login = match &ticket.method {
             Method::Live(kind) => {
-                let login = account::login_file(&self.home, *kind)
-                    .and_then(|file| std::fs::read(file.path).ok());
+                let login = account::live_login(&self.home, *kind);
                 if !still_logged_in(&ticket.key, *kind, login.as_deref()) {
                     return None;
                 }
                 login
             }
-            Method::Stored(kind, id) => account::stored_login(&self.data, *kind, id).ok(),
+            Method::Stored(kind, id) => {
+                account::stored_login(&self.data, &self.home, *kind, id).ok()
+            }
             _ => None,
         };
         Some(read_with(&ticket.method, login, net))

@@ -1,50 +1,49 @@
 //! 官方账号多账号（10-13，阶段 4）：Codex、Grok Build、Claude Code（10-13 后加，只在 macOS）各存几个官方登录，
-//! 切换时把选中的那个写回 agent 的登录。Claude Code 的登录不是一个文件（令牌在钥匙串里），见 [`claude`]。
+//! 切换时把选中的那个写回 agent 的登录。
 //!
-//! - **存在哪**：`~/.confdeck/accounts.json` 记有哪些账号（[`Account`]），每个账号的登录文件原样存在
-//!   `~/.confdeck/accounts/<agent>/<id>.json`（只有自己能读；Claude Code 的存在钥匙串里）。不同步、不导出。
+//! - **存在哪**（`Storage`，arch-perf R5 按存储方式分两种）：Codex、Grok Build 的登录是一个文件（`files`），
+//!   Claude Code 的令牌在钥匙串里、是谁在 `~/.claude.json`（[`claude`]）。`~/.confdeck/accounts.json` 记有哪些账号（[`Account`]），
+//!   每个账号的登录原样存在 `~/.confdeck/accounts/<agent>/<id>.json`（只有自己能读；Claude Code 的存在钥匙串里）。不同步、不导出。
+//!   下面存、切、加、改名、删的算法不分 agent，只经 `Storage` 碰登录；按 agent 挑 `Storage` 只在 `storage` 一处。
+//! - **锁**：钥匙串的读写都在引擎的锁外面（`security` 可能等授权框），存下的登录（每个账号一份，整份写）也在锁外读写；
+//!   引擎的锁只包住改 `accounts.json` 和写 agent 的登录文件。同一个 agent 的账号操作在这个进程里一个一个来（`serial`），
+//!   钥匙串等授权框时只挡同一个 agent 的账号操作。
 //! - **登录**（[`Login`]）：不自己做 OAuth，用 agent 自己的 `login` 命令，把它的家目录（`CODEX_HOME`、`GROK_HOME`）
-//!   指到一个临时目录；登录完读那里的 `auth.json` 存成账号（[`add`]），删掉临时目录。
+//!   指到一个临时目录；登录完读那里的登录存成账号（[`add`]），删掉临时目录。
 //! - **换下来的登录先存好**：agent 用着用着会换新令牌（刷新令牌用一次就作废），所以切换（[`switch`]）时先把登录文件
 //!   现在的内容存回它所属的账号（比存着的新才存；不认识的账号存成新账号），再写入要切的账号。每次读快照时（`read_all`）也这样存。
 //! - **认账号**（[`identify`]）：Codex 看 `id_token` 里的用户和工作区（同一个人的个人、团队工作区算两个），
-//!   Grok 看 `user_id` 和 `team_id`。账号 ID 是这两样的 hash。
+//!   Grok 看 `user_id` 和 `team_id`，Claude Code 看 `oauthAccount` 的账号和组织。账号 ID 是这两样的 hash。
 //! - **不换令牌**：confdeck 不用刷新令牌（同「订阅额度」）。存着不用的账号放久了令牌可能失效，到时候重新登录。
 //! - **名字和备注**（[`label`]，10-13 提案 13）：用户自己起的，只存在 `accounts.json`，不碰登录文件。
 
 pub mod claude;
+mod files;
+mod login;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent::{AgentKind, Disk};
+use crate::agent::AgentKind;
 use crate::data::DataDir;
 use crate::engine::{Engine, EngineError, LiveFile, Outcome};
 use crate::fsx::{self, Digest, Mode};
 use crate::keychain::Keychain;
-use crate::patch::Format;
 use crate::quota::{Check, CheckKey};
 
-/// 能存多个官方账号的 agent。
-pub const SUPPORTED: [AgentKind; 3] = [
-    AgentKind::Codex,
-    AgentKind::GrokBuild,
-    AgentKind::ClaudeCode,
-];
+pub(crate) use files::grok_entry;
+pub use login::{Login, LoginHandle, clean_stale_logins, program};
 
-/// Claude Code 的只在 macOS（令牌在钥匙串里；别的系统没做）。
+/// 能存多个官方账号。Claude Code 不是 macOS 时不能（令牌在系统的钥匙串里，没做），只看登着的是谁（[`Live::ViewOnly`]）。
 pub fn supported(kind: AgentKind) -> bool {
-    SUPPORTED.contains(&kind) && (kind != AgentKind::ClaudeCode || cfg!(target_os = "macos"))
+    storage(kind).is_some_and(Storage::storable)
 }
 
 /// 存下的一个官方账号。
@@ -72,15 +71,34 @@ pub const NAME_MAX: usize = 24;
 /// 备注最长几个字。
 pub const NOTE_MAX: usize = 200;
 
-/// 一个登录文件是谁的。
+/// 一个登录是谁的。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// 账号 ID，同 [`Account::id`]。
     pub id: String,
     pub email: Option<String>,
     pub plan: Option<String>,
-    /// 这份登录有多新（毫秒）：Codex 的 `last_refresh`，Grok 的 `expires_at`。
+    /// 这份登录有多新（毫秒）：Codex 的 `last_refresh`，Grok 的 `expires_at`，Claude Code 的令牌的 `expiresAt`。
     fresh: Option<i64>,
+}
+
+impl Identity {
+    /// `key` 是认人的那几样拼起来的（Codex 的用户和工作区等），账号 ID 是它和 agent 一起的 hash。
+    fn new(
+        kind: AgentKind,
+        key: &str,
+        email: Option<String>,
+        plan: Option<String>,
+        fresh: Option<i64>,
+    ) -> Self {
+        let digest = Digest::of(format!("{}:{key}", kind.id()).as_bytes()).0;
+        Self {
+            id: digest[..16].to_string(),
+            email,
+            plan,
+            fresh,
+        }
+    }
 }
 
 /// 登录文件现在是谁。
@@ -92,6 +110,8 @@ pub enum Live {
     Known(String),
     /// 还没存的账号：切到别的账号时会存下来。
     Unknown(Identity),
+    /// 登着的是谁，但存不了、切不了（不是 macOS 时的 Claude Code）。
+    ViewOnly(Identity),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -121,159 +141,153 @@ pub(crate) fn io_error(path: &Path) -> impl FnOnce(io::Error) -> EngineError + '
     }
 }
 
-/// agent 的登录文件。
-pub fn login_file(home: &Path, kind: AgentKind) -> Option<LiveFile> {
-    let path = match kind {
-        AgentKind::Codex => home.join(".codex").join("auth.json"),
-        AgentKind::GrokBuild => home.join(".grok").join("auth.json"),
-        _ => return None,
-    };
-    Some(LiveFile {
-        owner: kind.id(),
-        path,
-        mode: Mode::Private,
-        format: Format::Json,
-    })
-}
+// ── 存储方式 ─────────────────────────────────────────
 
-/// Codex 的登录存在钥匙串里（`config.toml` 的 `cli_auth_credentials_store` 不是 `file`）时，换 `auth.json` 没用。
-/// confdeck 不读钥匙串，这时不让切。`config` 是读好的 `config.toml`（没有是 `None`）。
-fn codex_blocked(config: Option<&[u8]>) -> bool {
-    let Some(text) = config.and_then(|bytes| std::str::from_utf8(bytes).ok()) else {
-        return false;
-    };
-    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
-        return false;
-    };
-    doc.get("cli_auth_credentials_store")
-        .is_some_and(|store| store.as_str() != Some("file"))
-}
+/// 一个 agent 的官方登录存在哪、怎么读写。下面的算法只经它碰登录。
+///
+/// 一份「登录」是存、比、切的单位：Codex、Grok Build 是 `auth.json` 原样的内容，Claude Code 是令牌和 `oauthAccount`
+/// 拼成的一份（[`claude::bundle`]）。
+pub(crate) trait Storage: Sync {
+    fn kind(&self) -> AgentKind;
 
-/// Claude Code 登着的官方账号的资料。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Profile {
-    pub email: Option<String>,
-    /// `max`、`pro`、`team`……
-    pub plan: Option<String>,
-}
-
-/// Claude Code 登着的官方账号的资料：`~/.claude.json` 的 `oauthAccount`（邮箱 `emailAddress`；`organizationType` 去掉 `claude_`
-/// 是套餐）。这里只有资料，凭证在钥匙串里，confdeck 不读。
-fn profile_of(account: &Value) -> Option<Profile> {
-    account.as_object()?;
-    let text = |key: &str| {
-        account[key]
-            .as_str()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-    };
-    Some(Profile {
-        email: text("emailAddress"),
-        plan: text("organizationType").and_then(|kind| {
-            kind.strip_prefix("claude_")
-                .filter(|plan| !plan.is_empty())
-                .map(str::to_string)
-        }),
-    })
-}
-
-/// 认出一个登录文件是谁的；没有登录（Codex 只有 API Key 的也算）是 `None`。
-pub fn identify(kind: AgentKind, bytes: &[u8]) -> Option<Identity> {
-    let json: Value = serde_json::from_slice(bytes).ok()?;
-    let text = |value: &Value| {
-        value
-            .as_str()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string)
-    };
-    let (key, email, plan, fresh) = match kind {
-        AgentKind::Codex => {
-            let tokens = &json["tokens"];
-            let claims = tokens["id_token"]
-                .as_str()
-                .and_then(jwt_claims)
-                .unwrap_or(Value::Null);
-            let auth = &claims["https://api.openai.com/auth"];
-            let workspace =
-                text(&auth["chatgpt_account_id"]).or_else(|| text(&tokens["account_id"]))?;
-            let user = text(&auth["chatgpt_user_id"])
-                .or_else(|| text(&auth["user_id"]))
-                .or_else(|| text(&claims["sub"]))
-                .unwrap_or_default();
-            (
-                format!("{user}:{workspace}"),
-                text(&claims["email"]),
-                text(&auth["chatgpt_plan_type"]),
-                json["last_refresh"].as_str().and_then(millis),
-            )
-        }
-        AgentKind::GrokBuild => {
-            // 按登录的范围分条，同「订阅额度」：`https://auth.x.ai::` 开头的那条，没有再用老的 `…/sign-in`。
-            let entries = json.as_object()?;
-            let entry = entries
-                .iter()
-                .find(|(scope, _)| scope.starts_with("https://auth.x.ai::"))
-                .or_else(|| entries.iter().find(|(scope, _)| scope.contains("/sign-in")))
-                .or_else(|| entries.iter().next())?
-                .1;
-            let user = text(&entry["user_id"])?;
-            let team = text(&entry["team_id"]).unwrap_or_default();
-            (
-                format!("{user}:{team}"),
-                text(&entry["email"]),
-                None,
-                entry["expires_at"].as_str().and_then(millis),
-            )
-        }
-        AgentKind::ClaudeCode => return claude::identify(&json),
-        _ => return None,
-    };
-    let digest = Digest::of(format!("{}:{key}", kind.id()).as_bytes()).0;
-    Some(Identity {
-        id: digest[..16].to_string(),
-        email,
-        plan,
-        fresh,
-    })
-}
-
-fn millis(text: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(text)
-        .ok()
-        .map(|time| time.timestamp_millis())
-}
-
-/// JWT 中间那段（base64url）解出来的 JSON。不验签名：只用来认是谁。
-fn jwt_claims(token: &str) -> Option<Value> {
-    let payload = token.split('.').nth(1)?;
-    serde_json::from_slice(&base64url(payload)?).ok()
-}
-
-fn base64url(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
-    let (mut buffer, mut bits) = (0u32, 0u32);
-    for byte in text.bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
-            b'=' => break,
-            _ => return None,
-        };
-        buffer = (buffer << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-            buffer &= (1 << bits) - 1;
-        }
+    /// 能存多个账号（见 [`supported`]）。
+    fn storable(&self) -> bool {
+        true
     }
-    Some(out)
+
+    /// 认出一份登录是谁的；没有登录（Codex 只有 API Key 的也算）是 `None`。
+    fn identify(&self, login: &Value) -> Option<Identity>;
+
+    /// agent 的登录文件（换账号时引擎写的那个）：Codex、Grok Build 是 `auth.json`，Claude Code 是 `~/.claude.json`。
+    fn live_file(&self, home: &Path) -> LiveFile;
+
+    /// 登录文件里看得出的：是谁，和整份登录（令牌不在文件里的是 `None`）。不读钥匙串。
+    fn in_file(&self, file: &[u8]) -> Option<Found>;
+
+    /// 现在登着的整份登录；没登录、只有一半的是 `None`。`file` 是读好的登录文件，令牌在钥匙串里的在这里读（锁外调）。
+    fn read_live(&self, home: &Path, file: Option<&[u8]>) -> Result<Option<Vec<u8>>, EngineError>;
+
+    /// 登录有一半不在登录文件里（Claude Code 的令牌在钥匙串里），换账号时先换那一半（[`Storage::put_secret`]）。
+    fn secret(&self) -> bool {
+        false
+    }
+
+    /// 换成 `login` 时先换不在登录文件里的那一半（锁外调，在写登录文件之前）。[`Storage::secret`] 为假的什么也不做。
+    fn put_secret(&self, _home: &Path, _login: &[u8]) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// 换成 `login` 时登录文件的新内容（在引擎的锁里调，`file` 是文件现在的内容）。
+    fn put_file(
+        &self,
+        home: &Path,
+        file: Option<&[u8]>,
+        login: &[u8],
+    ) -> Result<Vec<u8>, EngineError>;
+
+    /// 存下的一个账号的登录；没有是 `None`。
+    fn read_stored(
+        &self,
+        data: &DataDir,
+        home: &Path,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, EngineError>;
+
+    fn write_stored(
+        &self,
+        data: &DataDir,
+        home: &Path,
+        id: &str,
+        login: &[u8],
+    ) -> Result<(), EngineError>;
+
+    /// 删掉存下的登录；本来就没有不算错。
+    fn delete_stored(&self, data: &DataDir, home: &Path, id: &str) -> Result<(), EngineError>;
+
+    /// 切不了：Codex 的登录存在钥匙串里（`config` 是读好的 agent 配置文件）。
+    fn blocked(&self, _config: Option<&[u8]>) -> bool {
+        false
+    }
+
+    /// 登录命令的程序名。
+    fn program(&self) -> &'static str;
+
+    /// 让登录命令把登录写进临时家目录 `dir`（参数、环境变量）。返回要不要开着标准输入。
+    fn login_command(&self, command: &mut Command, dir: &Path) -> bool;
+
+    /// 登录命令跑完以后临时家目录里的登录（读完删掉钥匙串里的临时那条）。
+    fn read_login(&self, dir: &Path, keychain: &Keychain) -> Option<Vec<u8>>;
+
+    /// 取消、出错时收拾临时家目录以外的（钥匙串里的临时那条）。
+    fn forget_login(&self, _dir: &Path, _keychain: &Keychain) {}
 }
+
+/// 这个 agent 的官方登录存在哪；没有官方账号的（Pi、OpenCode）是 `None`。唯一按 agent 挑的地方。
+pub(crate) fn storage(kind: AgentKind) -> Option<&'static dyn Storage> {
+    match kind {
+        AgentKind::Codex => Some(&files::CODEX),
+        AgentKind::GrokBuild => Some(&files::GROK),
+        AgentKind::ClaudeCode => Some(&claude::Claude),
+        AgentKind::Pi | AgentKind::Opencode => None,
+    }
+}
+
+/// 同一个 agent 的账号操作（切、加、改名、删，快照里存回登录）在这个进程里一个一个来：存下的登录、钥匙串都在引擎的锁外读写，
+/// 靠它不交错（比如删账号和存回它的新令牌同时进行）。先拿它再拿引擎的锁。
+fn serial(kind: AgentKind) -> MutexGuard<'static, ()> {
+    static SERIAL: [Mutex<()>; AgentKind::ALL.len()] =
+        [const { Mutex::new(()) }; AgentKind::ALL.len()];
+    let n = AgentKind::ALL
+        .iter()
+        .position(|known| *known == kind)
+        .expect("every kind is in ALL");
+    SERIAL[n].lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 能存多个账号的这个 agent 的 [`Storage`]；不能的报 [`AccountError::Unsupported`]。
+fn storable(kind: AgentKind) -> Result<&'static dyn Storage, AccountError> {
+    storage(kind)
+        .filter(|store| store.storable())
+        .ok_or(AccountError::Unsupported)
+}
+
+/// 登录文件里认出来的：是谁，和整份登录（Claude Code 的令牌在钥匙串里，没有）。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Found {
+    identity: Identity,
+    login: Option<Vec<u8>>,
+}
+
+/// 认出一份登录是谁的；没有登录（Codex 只有 API Key 的也算）是 `None`。
+pub fn identify(kind: AgentKind, login: &[u8]) -> Option<Identity> {
+    identify_with(storage(kind)?, login)
+}
+
+fn identify_with(store: &dyn Storage, login: &[u8]) -> Option<Identity> {
+    store.identify(&serde_json::from_slice(login).ok()?)
+}
+
+/// 现在登着的那份登录（额度查询用）；没有、读不了是 `None`。
+pub(crate) fn live_login(home: &Path, kind: AgentKind) -> Option<Vec<u8>> {
+    let store = storage(kind)?;
+    let file = fsx::read_optional(&store.live_file(home).path).ok()?;
+    store.read_live(home, file.as_deref()).ok()?
+}
+
+/// 存下的一个账号的登录（和登录文件一个格式），查这个账号的额度用。
+pub fn stored_login(
+    data: &DataDir,
+    home: &Path,
+    kind: AgentKind,
+    id: &str,
+) -> Result<Vec<u8>, AccountError> {
+    let store = storage(kind).ok_or(AccountError::Unsupported)?;
+    store
+        .read_stored(data, home, id)?
+        .ok_or(AccountError::Missing)
+}
+
+// ── 存下的账号 ───────────────────────────────────────
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Book {
@@ -309,20 +323,11 @@ fn private_dir(dir: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// 存下的登录放在哪（Claude Code 的在钥匙串里，出错时报这个路径）。
 fn login_path(data: &DataDir, kind: AgentKind, id: &str) -> PathBuf {
     data.account_logins()
         .join(kind.id())
         .join(format!("{id}.json"))
-}
-
-/// 存下的一个账号的登录（和登录文件一个格式），查这个账号的额度用。
-pub fn stored_login(data: &DataDir, kind: AgentKind, id: &str) -> Result<Vec<u8>, AccountError> {
-    let path = login_path(data, kind, id);
-    match fs::read(&path) {
-        Ok(bytes) => Ok(bytes),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(AccountError::Missing),
-        Err(err) => Err(io_error(&path)(err).into()),
-    }
 }
 
 /// 存下的全部账号，先存的在前。
@@ -341,54 +346,60 @@ enum Keep {
     Fresh,
 }
 
-/// 存下的一个账号的登录：Codex、Grok 是 `accounts/<agent>/<id>.json`，Claude Code 的在钥匙串里（[`claude::STORE`]）。
-fn read_stored(
-    data: &DataDir,
-    home: &Path,
-    kind: AgentKind,
-    id: &str,
-) -> Result<Option<Vec<u8>>, EngineError> {
-    let path = login_path(data, kind, id);
-    if kind == AgentKind::ClaudeCode {
-        return claude::read_stored(&Keychain::for_home(home), id).map_err(io_error(&path));
-    }
-    fsx::read_optional(&path).map_err(io_error(&path))
-}
-
-fn write_stored(
-    data: &DataDir,
-    home: &Path,
-    kind: AgentKind,
-    id: &str,
-    bytes: &[u8],
-) -> Result<(), EngineError> {
-    let path = login_path(data, kind, id);
-    if kind == AgentKind::ClaudeCode {
-        return claude::write_stored(&Keychain::for_home(home), id, bytes).map_err(io_error(&path));
-    }
-    private_dir(&data.account_logins())?;
-    let dir = path.parent().expect("login path has a parent");
-    private_dir(dir)?;
-    fsx::write_atomic(&path, bytes, Mode::Private).map_err(io_error(&path))
-}
-
-/// 把一份登录存进它的账号，返回写了没有（存着的登录、`accounts.json` 有一样变了）。调用的人拿着引擎的锁。
+/// 把一份登录存进它的账号，返回写了没有（存着的登录、`accounts.json` 有一样变了）。调的时候拿着这个 agent 的 `serial`。
+/// 存着的登录在引擎的锁外读写；`accounts.json` 要改的时候才拿锁，在锁里重读一次再改。
 fn keep(
-    data: &DataDir,
+    engine: &Engine,
+    store: &dyn Storage,
     home: &Path,
-    kind: AgentKind,
     identity: &Identity,
-    bytes: &[u8],
+    login: &[u8],
     how: Keep,
 ) -> Result<bool, EngineError> {
-    let mut book = load(data)?;
-    let mut changed = false;
+    let data = engine.data();
+    let kind = store.kind();
+    let book = load(data)?;
+    let account = book
+        .accounts
+        .iter()
+        .find(|account| account.agent == kind && account.id == identity.id);
+    if account.is_none() && how == Keep::Known {
+        return Ok(false);
+    }
+    let stored = store.read_stored(data, home, &identity.id)?;
+    let replace = replaces(store, identity, stored.as_deref(), login, how);
+    if replace {
+        store.write_stored(data, home, &identity.id, login)?;
+    }
+    let profile = account.is_none_or(|account| profile_changed(account, identity));
+    if profile {
+        let _lock = engine.lock()?;
+        let mut book = load(data)?;
+        if enter(&mut book, kind, identity, how) {
+            save(data, &book)?;
+        }
+    }
+    Ok(replace || profile)
+}
+
+/// 邮箱、套餐和存着的不一样（登录里没有的不算）。
+fn profile_changed(account: &Account, identity: &Identity) -> bool {
+    [
+        (&account.email, &identity.email),
+        (&account.plan, &identity.plan),
+    ]
+    .into_iter()
+    .any(|(field, value)| value.is_some() && field != value)
+}
+
+/// 把 `identity` 记进 `book`：没存过的加上（[`Keep::Known`] 不加），存过的换上新的邮箱、套餐。返回改了没有。
+fn enter(book: &mut Book, kind: AgentKind, identity: &Identity, how: Keep) -> bool {
     match book
         .accounts
         .iter_mut()
         .find(|account| account.agent == kind && account.id == identity.id)
     {
-        None if how == Keep::Known => return Ok(false),
+        None if how == Keep::Known => false,
         None => {
             book.accounts.push(Account {
                 id: identity.id.clone(),
@@ -399,47 +410,37 @@ fn keep(
                 name: None,
                 note: None,
             });
-            changed = true;
+            true
         }
         Some(account) => {
-            for (field, value) in [
-                (&mut account.email, &identity.email),
-                (&mut account.plan, &identity.plan),
-            ] {
-                if value.is_some() && field != value {
-                    field.clone_from(value);
-                    changed = true;
-                }
+            let changed = profile_changed(account, identity);
+            if identity.email.is_some() {
+                account.email.clone_from(&identity.email);
             }
+            if identity.plan.is_some() {
+                account.plan.clone_from(&identity.plan);
+            }
+            changed
         }
     }
-    let stored = read_stored(data, home, kind, &identity.id)?;
-    let replace = replaces(kind, identity, stored.as_deref(), bytes, how);
-    if replace {
-        write_stored(data, home, kind, &identity.id, bytes)?;
-    }
-    if changed {
-        save(data, &book)?;
-    }
-    Ok(replace || changed)
 }
 
-/// 存着的登录 `stored` 要不要换成 `bytes`（是 `identity` 的）：一样的不换，旧的不换（刚登录的除外）。
+/// 存着的登录 `stored` 要不要换成 `login`（是 `identity` 的）：一样的不换，旧的不换（刚登录的除外）。
 fn replaces(
-    kind: AgentKind,
+    store: &dyn Storage,
     identity: &Identity,
     stored: Option<&[u8]>,
-    bytes: &[u8],
+    login: &[u8],
     how: Keep,
 ) -> bool {
     match stored {
         None => true,
-        Some(old) if old == bytes => false,
+        Some(old) if old == login => false,
         _ if how == Keep::Fresh => true,
         // 分不出新旧时信登录文件：那是 agent 最后写的。
         Some(old) => match (
             identity.fresh,
-            identify(kind, old).and_then(|old| old.fresh),
+            identify_with(store, old).and_then(|old| old.fresh),
         ) {
             (Some(new), Some(old)) => new >= old,
             (None, Some(_)) => false,
@@ -448,126 +449,113 @@ fn replaces(
     }
 }
 
-/// 登录文件里认出来的登录：是谁，和文件原样的内容（Claude Code 的令牌在钥匙串里，没有内容）。
-struct Found {
-    identity: Identity,
-    bytes: Option<Vec<u8>>,
-}
-
-/// Codex、Grok 的登录文件里是谁；没有文件、认不出是 `None`。
-fn read_login(home: &Path, kind: AgentKind) -> Result<Option<Found>, AccountError> {
-    let file = login_file(home, kind).ok_or(AccountError::Unsupported)?;
-    let bytes = fsx::read_optional(&file.path).map_err(io_error(&file.path))?;
-    Ok(found_in(kind, bytes))
-}
-
-/// [`read_login`]，文件已经读好了。
-fn found_in(kind: AgentKind, bytes: Option<Vec<u8>>) -> Option<Found> {
-    let bytes = bytes?;
-    identify(kind, &bytes).map(|identity| Found {
-        identity,
-        bytes: Some(bytes),
-    })
-}
-
-/// 登录文件里认出来的是存过的账号，就把文件里的登录存回去（比存着的新才存；没存过的不存）。`accounts` 是读好的存下的账号。
-/// 没有要存的（一样，或者存着的更新）时不拿锁、不再读 `accounts.json`。第二项是存回去了没有（存了的话 `accounts.json` 里的邮箱、套餐可能变了）。
+/// 登录文件里认出来的是存过的账号，就把文件里的登录存回去（比存着的新才存；没存过的不存）。`book` 是读好的存下的账号：
+/// 先拿它看要不要存（大多数时候不用，`accounts.json` 就只读快照开头那一次），要存才拿 `serial`、经 `keep` 再读一次
+/// （这期间可能删了）。第二项是存回去了没有（存了的话 `accounts.json` 里的邮箱、套餐可能变了）。
 fn sync_found(
     engine: &Engine,
+    store: &dyn Storage,
     home: &Path,
-    kind: AgentKind,
-    accounts: &[Account],
+    book: &[Account],
     found: Found,
 ) -> Result<(Live, bool), AccountError> {
-    let Found { identity, bytes } = found;
-    let Some(account) = accounts
+    let Found { identity, login } = found;
+    let kind = store.kind();
+    let Some(account) = book
         .iter()
         .find(|account| account.agent == kind && account.id == identity.id)
     else {
         return Ok((Live::Unknown(identity), false));
     };
-    let Some(bytes) = bytes else {
+    let Some(login) = login else {
         return Ok((Live::Known(identity.id), false));
     };
-    let data = engine.data();
-    let profile_changed = [
-        (&account.email, &identity.email),
-        (&account.plan, &identity.plan),
-    ]
-    .into_iter()
-    .any(|(field, value)| value.is_some() && field != value);
-    let stored = read_stored(data, home, kind, &identity.id)?;
-    let differs =
-        profile_changed || replaces(kind, &identity, stored.as_deref(), &bytes, Keep::Known);
-    let mut kept = false;
-    if differs {
-        let _lock = engine.lock()?;
-        kept = keep(data, home, kind, &identity, &bytes, Keep::Known)?;
-    }
+    let stored = store.read_stored(engine.data(), home, &identity.id)?;
+    let kept = if replaces(store, &identity, stored.as_deref(), &login, Keep::Known)
+        || profile_changed(account, &identity)
+    {
+        let _serial = serial(kind);
+        keep(engine, store, home, &identity, &login, Keep::Known)?
+    } else {
+        false
+    };
     Ok((Live::Known(identity.id), kept))
 }
+
+// ── 快照 ─────────────────────────────────────────────
 
 /// 一次快照里的官方账号（[`crate::status`]）。
 #[derive(Debug, Default)]
 pub struct Accounts {
     /// 存下的全部账号，先存的在前。
     pub list: Vec<Account>,
-    /// 装了的、能存多个账号的 agent 的登录文件现在是谁。
+    /// 装了的、有官方账号的 agent 的登录文件现在是谁。
     pub live: HashMap<AgentKind, Live>,
     /// Codex 的登录存在钥匙串里（`config.toml` 的 `cli_auth_credentials_store` 不是 `file`）：切不了。
     pub blocked: HashSet<AgentKind>,
-    /// Claude Code 登着的官方账号的资料。存不了多个 Claude 账号（不是 macOS）时界面用它。
-    pub claude: Option<Profile>,
-    /// `accounts.json` 读不了、登录存不回去的原因（有好几个时是最后一个）。
+    /// `accounts.json`、登录文件读不了、登录存不回去的原因（有好几个时是最后一个）。
     pub error: Option<AccountError>,
 }
 
-/// 读官方账号：每个装了的、能存多个账号的 agent 的登录文件现在是谁；是存过的账号，顺带把 agent 新换的令牌存回去。
-/// `installed` 是装了的 agent；`codex` 是读好的 Codex `config.toml`（看登录是不是在钥匙串里）和 `auth.json`（登录文件）。
-/// `accounts.json`、`~/.claude.json` 各读一次。Claude Code 的只看 `~/.claude.json` 是谁，不读钥匙串：
-/// 它的令牌在切走的时候存（[`switch`]）。
+/// 快照已经读好的一个 agent 的文件（[`crate::status`]），读官方账号时不再读一遍。
+pub(crate) struct Read<'a> {
+    pub kind: AgentKind,
+    /// agent 的配置文件（看 Codex 的登录在不在钥匙串里）。
+    pub config: Option<&'a [u8]>,
+    /// 读过的登录文件和读的结果（Codex 的 `auth.json`，补丁也要看）。
+    pub login: Option<(&'a Path, &'a io::Result<Option<Vec<u8>>>)>,
+}
+
+/// 读官方账号：每个装了的、有官方账号的 agent 的登录文件现在是谁；是存过的账号，顺带把 agent 新换的令牌存回去。
+/// `installed` 是装了的 agent，`read` 是快照已经读好的文件。`accounts.json`、每个登录文件各读一次。
+/// Claude Code 的只看 `~/.claude.json` 是谁，不读钥匙串：它的令牌在切走的时候存（[`switch`]）。
 pub(crate) fn read_all(
     engine: &Engine,
     home: &Path,
     installed: &[AgentKind],
-    codex: Disk,
+    read: &[Read],
 ) -> Accounts {
     let mut accounts = Accounts::default();
-    let claude = installed
-        .contains(&AgentKind::ClaudeCode)
-        .then(|| claude::read_account(home))
-        .flatten();
-    accounts.claude = claude.as_ref().and_then(profile_of);
     let book = list(engine.data());
     let mut saved = false;
-    for kind in SUPPORTED {
-        if !supported(kind) || !installed.contains(&kind) {
+    for kind in AgentKind::ALL {
+        let Some(store) = storage(kind).filter(|_| installed.contains(&kind)) else {
+            continue;
+        };
+        let read = read.iter().find(|read| read.kind == kind);
+        if store.blocked(read.and_then(|read| read.config)) {
+            accounts.blocked.insert(kind);
             continue;
         }
-        if kind == AgentKind::Codex && codex_blocked(codex.config) {
-            accounts.blocked.insert(kind);
+        let file = store.live_file(home).path;
+        let bytes = match read
+            .and_then(|read| read.login)
+            .filter(|(path, _)| *path == file)
+        {
+            Some((_, Ok(bytes))) => Ok(bytes.as_deref().map(<[u8]>::to_vec)),
+            Some((_, Err(err))) => Err(io::Error::new(err.kind(), err.to_string())),
+            None => fsx::read_optional(&file),
+        };
+        // 读不了：不知道登的是谁（不是「未登录」），原因记下来。
+        let found = match bytes {
+            Ok(bytes) => bytes.as_deref().and_then(|bytes| store.in_file(bytes)),
+            Err(source) => {
+                accounts.error = Some(io_error(&file)(source).into());
+                continue;
+            }
+        };
+        if !store.storable() {
+            let live = found.map_or(Live::LoggedOut, |found| Live::ViewOnly(found.identity));
+            accounts.live.insert(kind, live);
             continue;
         }
         let Ok(book) = &book else {
             continue;
         };
-        let found = match kind {
-            AgentKind::ClaudeCode => {
-                Ok(claude
-                    .as_ref()
-                    .and_then(claude::live_identity)
-                    .map(|identity| Found {
-                        identity,
-                        bytes: None,
-                    }))
-            }
-            AgentKind::Codex => Ok(found_in(kind, codex.login.map(<[u8]>::to_vec))),
-            _ => read_login(home, kind),
-        };
-        let live = found.and_then(|found| match found {
+        let live = match found {
             None => Ok((Live::LoggedOut, false)),
-            Some(found) => sync_found(engine, home, kind, book, found),
-        });
+            Some(found) => sync_found(engine, store, home, book, found),
+        };
         match live {
             Ok((live, kept)) => {
                 saved |= kept;
@@ -585,101 +573,139 @@ pub(crate) fn read_all(
     accounts
 }
 
-/// 切到一个存下的账号：先把登录文件现在的内容存好（没存过的账号存成新账号），再写入这个账号的登录。
+// ── 切、加、改名、删 ─────────────────────────────────
+
+/// 写登录文件时发现它在读完以后变了（agent 刚换了令牌、换了人），最多从头再来几次。
+const ATTEMPTS: usize = 3;
+
+/// 切到一个存下的账号：先把登着的存好（没存过的账号存成新账号），再写入这个账号的登录。
+/// 钥匙串在锁外读写；锁里只写登录文件。登录整份在文件里的，文件在这期间变了就从头再来（先存好变了以后的）；
+/// 有一半在钥匙串里的，先核对登录文件改得了（解析不了就停，钥匙串不动），钥匙串换了以后文件一定跟着换，令牌和人才对得上；
+/// 文件还是没写成就把钥匙串换回原来的令牌。
 pub fn switch(
     engine: &Engine,
     home: &Path,
     kind: AgentKind,
     id: &str,
 ) -> Result<Outcome, AccountError> {
-    if kind == AgentKind::ClaudeCode && supported(kind) {
-        return switch_claude(engine, home, id);
-    }
-    let file = login_file(home, kind).ok_or(AccountError::Unsupported)?;
-    let data = engine.data().clone();
-    let path = login_path(&data, kind, id);
-    if !path.is_file() {
-        return Err(AccountError::Missing);
-    }
-    let outcome = engine.write_login(&file, &mut |live| {
-        if let Some(live) = live
-            && let Some(identity) = identify(kind, live)
-        {
-            keep(&data, home, kind, &identity, live, Keep::Any)?;
-        }
-        // 要切的就是现在这个：上面可能刚把更新的登录存进去。
-        fs::read(&path).map_err(io_error(&path))
-    })?;
-    Ok(outcome)
+    switch_with(engine, storable(kind)?, home, id)
 }
 
-/// Claude Code 的切换：在改 `~/.claude.json` 的锁里读出现在登着的（钥匙串加 `oauthAccount`）存好，再换成要切的。
-fn switch_claude(engine: &Engine, home: &Path, id: &str) -> Result<Outcome, AccountError> {
-    let kind = AgentKind::ClaudeCode;
-    let data = engine.data().clone();
-    if read_stored(&data, home, kind, id)?.is_none() {
+fn switch_with(
+    engine: &Engine,
+    store: &dyn Storage,
+    home: &Path,
+    id: &str,
+) -> Result<Outcome, AccountError> {
+    let _serial = serial(store.kind());
+    let data = engine.data();
+    let file = store.live_file(home);
+    if store.read_stored(data, home, id)?.is_none() {
         return Err(AccountError::Missing);
     }
-    let keychain = Keychain::for_home(home);
-    let outcome = engine.write_login(&claude::profile_file(home), &mut |pre| {
-        if let Some(live) = claude::read_live(pre, home, &keychain)?
-            && let Some(identity) = identify(kind, &live)
+    for _ in 0..ATTEMPTS {
+        let pre = fsx::read_optional(&file.path).map_err(io_error(&file.path))?;
+        let live = store.read_live(home, pre.as_deref())?;
+        if let Some(live) = &live
+            && let Some(identity) = identify_with(store, live)
         {
-            keep(&data, home, kind, &identity, &live, Keep::Any)?;
+            keep(engine, store, home, &identity, live, Keep::Any)?;
         }
-        let path = login_path(&data, kind, id);
-        let login = read_stored(&data, home, kind, id)?
-            .ok_or_else(|| io_error(&path)(io::ErrorKind::NotFound.into()))?;
-        claude::put_live(home, &keychain, pre, &login)
-    })?;
-    Ok(outcome)
+        // 要切的就是登着的这个：上面可能刚把更新的登录存进去，所以在这之后读。
+        let login = store
+            .read_stored(data, home, id)?
+            .ok_or(AccountError::Missing)?;
+        switch_secret(store, home, pre.as_deref(), &login)?;
+        let mut moved = false;
+        let written = engine.write_login(&file, &mut |now| {
+            if !store.secret() && now != pre.as_deref() {
+                moved = true;
+                return Err(conflict(&file));
+            }
+            store.put_file(home, now, &login)
+        });
+        match written {
+            Err(_) if moved => continue,
+            Err(err) => {
+                restore_secret(store, home, live.as_deref());
+                return Err(err.into());
+            }
+            Ok(outcome) => return Ok(outcome),
+        }
+    }
+    Err(conflict(&file).into())
+}
+
+/// 换钥匙串那一半之前先在内存里改一遍登录文件：改不了（解析不了）就报错，钥匙串不动。
+fn switch_secret(
+    store: &dyn Storage,
+    home: &Path,
+    file: Option<&[u8]>,
+    login: &[u8],
+) -> Result<(), EngineError> {
+    if store.secret() {
+        store.put_file(home, file, login)?;
+        store.put_secret(home, login)?;
+    }
+    Ok(())
+}
+
+/// 钥匙串换了、登录文件没写成：换回原来的令牌（原来没有整份登录的换不回去，报的错里会说文件没写成）。
+fn restore_secret(store: &dyn Storage, home: &Path, live: Option<&[u8]>) {
+    if store.secret()
+        && let Some(live) = live
+    {
+        let _ = store.put_secret(home, live);
+    }
+}
+
+fn conflict(file: &LiveFile) -> EngineError {
+    EngineError::Conflict {
+        path: file.path.clone(),
+    }
 }
 
 /// 存下一次登录（[`Login::wait`] 读到的）。重新登录存过的账号就换掉它存着的登录；
-/// agent 现在没有登录，或者登着的就是这个账号，也写进登录文件。
+/// agent 现在没有登录，或者登着的就是这个账号，也写进 agent 的登录。
 pub fn add(
     engine: &Engine,
     home: &Path,
     kind: AgentKind,
-    bytes: &[u8],
+    login: &[u8],
 ) -> Result<Account, AccountError> {
-    if !supported(kind) {
-        return Err(AccountError::Unsupported);
-    }
-    let identity = identify(kind, bytes).ok_or(AccountError::Unrecognized)?;
+    let store = storable(kind)?;
+    let identity = identify_with(store, login).ok_or(AccountError::Unrecognized)?;
+    let _serial = serial(kind);
     let data = engine.data();
-    {
-        let _lock = engine.lock()?;
-        keep(data, home, kind, &identity, bytes, Keep::Fresh)?;
-    }
-    if kind == AgentKind::ClaudeCode {
-        let keychain = Keychain::for_home(home);
-        engine.write_login(&claude::profile_file(home), &mut |pre| {
-            let other = claude::read_live(pre, home, &keychain)?
-                .and_then(|live| identify(kind, &live))
-                .is_some_and(|live| live.id != identity.id);
-            match pre.filter(|_| other) {
-                Some(pre) => Ok(pre.to_vec()),
-                None => claude::put_live(home, &keychain, pre, bytes),
+    keep(engine, store, home, &identity, login, Keep::Fresh)?;
+    let other = |live: Option<Identity>| live.is_some_and(|live| live.id != identity.id);
+    let file = store.live_file(home);
+    let pre = fsx::read_optional(&file.path).map_err(io_error(&file.path))?;
+    let live = store.read_live(home, pre.as_deref())?;
+    if !other(live.as_deref().and_then(|live| identify_with(store, live))) {
+        switch_secret(store, home, pre.as_deref(), login)?;
+        let written = engine.write_login(&file, &mut |now| {
+            // 这期间登了别人：不动。钥匙串已经换了的一定写（同 `switch_with`）。
+            let taken = !store.secret()
+                && now.is_some_and(|now| other(store.in_file(now).map(|found| found.identity)));
+            match now {
+                Some(now) if taken => Ok(now.to_vec()),
+                _ => store.put_file(home, now, login),
             }
-        })?;
-        return load(data)?
-            .accounts
-            .into_iter()
-            .find(|account| account.agent == kind && account.id == identity.id)
-            .ok_or(AccountError::Missing);
+        });
+        if let Err(err) = written {
+            restore_secret(store, home, live.as_deref());
+            return Err(err.into());
+        }
     }
-    let file = login_file(home, kind).ok_or(AccountError::Unsupported)?;
-    engine.write_login(&file, &mut |live| match live
-        .filter(|live| identify(kind, live).is_some_and(|live| live.id != identity.id))
-    {
-        Some(other) => Ok(other.to_vec()),
-        None => Ok(bytes.to_vec()),
-    })?;
+    find(data, kind, &identity.id)
+}
+
+fn find(data: &DataDir, kind: AgentKind, id: &str) -> Result<Account, AccountError> {
     load(data)?
         .accounts
         .into_iter()
-        .find(|account| account.agent == kind && account.id == identity.id)
+        .find(|account| account.agent == kind && account.id == id)
         .ok_or(AccountError::Missing)
 }
 
@@ -692,30 +718,27 @@ pub fn label(
     name: &str,
     note: &str,
 ) -> Result<Account, AccountError> {
+    let store = storable(kind)?;
+    let _serial = serial(kind);
     let data = engine.data();
-    let _lock = engine.lock()?;
-    let mut book = load(data)?;
-    if !book
+    if !load(data)?
         .accounts
         .iter()
         .any(|account| account.agent == kind && account.id == id)
     {
-        let bytes = if kind == AgentKind::ClaudeCode && supported(kind) {
-            let profile = claude::profile_file(home).path;
-            let pre = fsx::read_optional(&profile).map_err(io_error(&profile))?;
-            claude::read_live(pre.as_deref(), home, &Keychain::for_home(home))?
-        } else {
-            let file = login_file(home, kind).ok_or(AccountError::Unsupported)?;
-            fsx::read_optional(&file.path).map_err(io_error(&file.path))?
-        }
-        .ok_or(AccountError::Missing)?;
-        let identity = identify(kind, &bytes).ok_or(AccountError::Missing)?;
+        let file = store.live_file(home).path;
+        let pre = fsx::read_optional(&file).map_err(io_error(&file))?;
+        let live = store
+            .read_live(home, pre.as_deref())?
+            .ok_or(AccountError::Missing)?;
+        let identity = identify_with(store, &live).ok_or(AccountError::Missing)?;
         if identity.id != id {
             return Err(AccountError::Missing);
         }
-        keep(data, home, kind, &identity, &bytes, Keep::Any)?;
-        book = load(data)?;
+        keep(engine, store, home, &identity, &live, Keep::Any)?;
     }
+    let _lock = engine.lock()?;
+    let mut book = load(data)?;
     let account = book
         .accounts
         .iter_mut()
@@ -734,8 +757,10 @@ pub fn label(
 
 /// 删掉一个存下的账号。agent 的登录文件不动：正在用的账号删了也还登着。
 pub fn remove(engine: &Engine, home: &Path, kind: AgentKind, id: &str) -> Result<(), AccountError> {
+    let store = storable(kind)?;
+    let _serial = serial(kind);
     let data = engine.data();
-    let removed = {
+    {
         let _lock = engine.lock()?;
         let mut book = load(data)?;
         let before = book.accounts.len();
@@ -745,328 +770,21 @@ pub fn remove(engine: &Engine, home: &Path, kind: AgentKind, id: &str) -> Result
             return Err(AccountError::Missing);
         }
         save(data, &book)?;
-        let path = login_path(data, kind, id);
-        if kind == AgentKind::ClaudeCode {
-            claude::delete_stored(&Keychain::for_home(home), id).map_err(io_error(&path))
-        } else {
-            match fs::remove_file(&path) {
-                Err(err) if err.kind() != io::ErrorKind::NotFound => Err(io_error(&path)(err)),
-                _ => Ok(()),
-            }
-        }
-    };
+    }
+    let removed = store.delete_stored(data, home, id);
     // 这个账号的额度查询设置不留（同 `apply::delete_provider`）。`set_check` 自己拿锁，放在锁外面。
     let _ = engine.set_check(&CheckKey::Account(kind, id.to_string()), Check::default());
     Ok(removed?)
 }
 
-/// agent 的命令行程序。
-pub fn program(home: &Path, kind: AgentKind) -> Result<PathBuf, AccountError> {
-    let name = match kind {
-        AgentKind::Codex => "codex",
-        AgentKind::GrokBuild => "grok",
-        AgentKind::ClaudeCode if supported(kind) => "claude",
-        _ => return Err(AccountError::Unsupported),
-    };
-    crate::program::find(home, name).ok_or(AccountError::NoProgram(name))
-}
-
-/// 输出最多留多少字。
-const OUTPUT_LIMIT: usize = 16 * 1024;
-
-/// 登录最多等多久。浏览器那边放着不管，登录命令会一直等下去；过了这么久就停掉它。
-const LOGIN_DEADLINE: Duration = Duration::from_secs(15 * 60);
-
-/// 一次在跑的登录：agent 的 `login` 命令，家目录指到 confdeck 数据目录下的一个临时目录。
-/// 命令自己打开浏览器；打不开时它会把登录地址打出来（[`LoginHandle::url`]）。
-///
-/// 临时目录（和 Claude Code 存在钥匙串里的那条临时令牌）谁来收拾：登录完、取消、出错时 `Login` 丢掉时收拾；
-/// 应用退出时等不到登录命令退出，调 [`LoginHandle::abandon`]；应用被强退、崩了的，下次启动时 [`clean_stale_logins`] 收拾。
-pub struct Login {
-    handle: LoginHandle,
-    /// Claude Code 的登录命令也等标准输入（贴授权码），开着别关。
-    _stdin: Option<ChildStdin>,
-}
-
-/// 在别的线程里看登录到哪了、取消它。
-#[derive(Clone)]
-pub struct LoginHandle {
-    child: Arc<Mutex<Child>>,
-    output: Arc<Mutex<String>>,
-    scratch: Arc<Scratch>,
-}
-
-/// 登录用的临时家目录。
-struct Scratch {
-    kind: AgentKind,
-    dir: PathBuf,
-    /// Claude Code 登录时存令牌的钥匙串（见 [`claude`]）。
-    keychain: Keychain,
-}
-
-impl Scratch {
-    /// 登录命令存令牌用的钥匙串：目录里有 `.keychain` 的是假的（测试用的登录命令写在那），没有的是系统钥匙串
-    /// （真的 `claude`，只在 macOS）。用假的时 [`Login::start`] 先建好 `.keychain`，启动时收拾残留
-    /// （[`clean_stale_logins`]）按同一条规则就知道当初用的是哪个。
-    fn keychain(dir: &Path) -> Keychain {
-        let fake = dir.join(".keychain");
-        if cfg!(target_os = "macos") && !fake.exists() {
-            Keychain::System
-        } else {
-            Keychain::Fake(fake)
-        }
-    }
-
-    /// 删掉临时目录；Claude Code 的连同登录命令可能已经存下的那条临时令牌。
-    fn clean(&self) {
-        if self.kind == AgentKind::ClaudeCode {
-            claude::forget_login(&self.dir, &self.keychain);
-        }
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// 临时目录的名字：`.login-<agent>-<进程号>-<第几次>`。进程号用来认出哪些是已经不在的进程留下的（[`clean_stale_logins`]）。
-fn scratch_name(kind: AgentKind, pid: u32, run: usize) -> String {
-    format!(".login-{}-{pid}-{run}", kind.id())
-}
-
-/// [`scratch_name`] 反过来：哪个 agent、哪个进程的。
-fn parse_scratch_name(name: &str) -> Option<(AgentKind, u32)> {
-    let (rest, run) = name.strip_prefix(".login-")?.rsplit_once('-')?;
-    run.parse::<usize>().ok()?;
-    let (kind, pid) = rest.rsplit_once('-')?;
-    let kind = AgentKind::ALL.into_iter().find(|k| k.id() == kind)?;
-    Some((kind, pid.parse().ok()?))
-}
-
-/// 启动时收拾上次没收拾完的登录（应用被强退、崩了）：跑登录的那个进程已经不在的临时目录删掉，
-/// Claude Code 的连同它可能存下的那条临时令牌。别的 confdeck 进程正在跑的登录不动。
-pub fn clean_stale_logins(data: &DataDir) {
-    let logins = data.account_logins();
-    let Ok(entries) = fs::read_dir(&logins) else {
-        return;
-    };
-    // 登录时用的是解开链接的路径（Claude Code 按它算钥匙串的服务名）。只解开上一层：
-    // 临时目录本身是链接的不跟过去（删的会是链接指着的地方），也不是 confdeck 建的，不管。
-    let logins = fs::canonicalize(&logins).unwrap_or(logins);
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let Some((kind, pid)) = entry.file_name().to_str().and_then(parse_scratch_name) else {
-            continue;
-        };
-        if pid == std::process::id() || process_alive(pid) {
-            continue;
-        }
-        let dir = logins.join(entry.file_name());
-        Scratch {
-            kind,
-            keychain: Scratch::keychain(&dir),
-            dir,
-        }
-        .clean();
-    }
-}
-
-/// 这个进程号还有进程在（`kill -0`，不发信号）。`kill` 起不来时当它还在：宁可留着目录，也不删别人正在用的。
-fn process_alive(pid: u32) -> bool {
-    Command::new("/bin/kill")
-        .args(["-0", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_or(true, |status| status.success())
-}
-
-impl Login {
-    /// 跑 `program`（[`program`] 找到的，测试时可以换成别的）的登录命令。
-    pub fn start(program: &Path, data: &DataDir, kind: AgentKind) -> Result<Self, AccountError> {
-        static RUNS: AtomicUsize = AtomicUsize::new(0);
-        let run = RUNS.fetch_add(1, Ordering::Relaxed);
-        let dir = data
-            .account_logins()
-            .join(scratch_name(kind, std::process::id(), run));
-        let _ = fs::remove_dir_all(&dir);
-        private_dir(&data.account_logins())?;
-        private_dir(&dir)?;
-        // Claude Code 按目录的写法算钥匙串的服务名，用解开链接的路径，两边算的一样。
-        let dir = fs::canonicalize(&dir).unwrap_or(dir);
-        // 真的 `claude` 把令牌存进系统钥匙串（临时的一条，读完就删）；测试用的假命令写文件，先建好它的位置。
-        let real =
-            cfg!(target_os = "macos") && program.file_name().is_some_and(|name| name == "claude");
-        if !real {
-            private_dir(&dir.join(".keychain"))?;
-        }
-        let keychain = Scratch::keychain(&dir);
-        let mut command = Command::new(program);
-        let mut stdin = Stdio::null();
-        match kind {
-            // 临时家目录里没有 config.toml，写明存文件，免得存进钥匙串。
-            AgentKind::Codex => command
-                .args(["login", "-c", "cli_auth_credentials_store=\"file\""])
-                .env("CODEX_HOME", &dir),
-            AgentKind::GrokBuild => command.args(["login", "--oauth"]).env("GROK_HOME", &dir),
-            AgentKind::ClaudeCode if supported(kind) => {
-                stdin = Stdio::piped();
-                command
-                    .args(["auth", "login", "--claudeai"])
-                    .env("CLAUDE_CONFIG_DIR", &dir)
-                    .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", &dir)
-            }
-            _ => return Err(AccountError::Unsupported),
-        };
-        let mut child = command
-            .stdin(stdin)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(io_error(program))?;
-        let input = child.stdin.take();
-        let output = Arc::new(Mutex::new(String::new()));
-        let streams: [Option<Box<dyn Read + Send>>; 2] = [
-            child
-                .stdout
-                .take()
-                .map(|s| Box::new(s) as Box<dyn Read + Send>),
-            child
-                .stderr
-                .take()
-                .map(|s| Box::new(s) as Box<dyn Read + Send>),
-        ];
-        for stream in streams.into_iter().flatten() {
-            let output = output.clone();
-            thread::spawn(move || {
-                for line in BufReader::new(stream).lines() {
-                    let Ok(line) = line else {
-                        break;
-                    };
-                    let mut output = output.lock().unwrap_or_else(PoisonError::into_inner);
-                    if output.len() < OUTPUT_LIMIT {
-                        output.push_str(&line);
-                        output.push('\n');
-                    }
-                }
-            });
-        }
-        Ok(Self {
-            handle: LoginHandle {
-                child: Arc::new(Mutex::new(child)),
-                output,
-                scratch: Arc::new(Scratch {
-                    kind,
-                    dir,
-                    keychain,
-                }),
-            },
-            _stdin: input,
-        })
-    }
-
-    pub fn handle(&self) -> LoginHandle {
-        self.handle.clone()
-    }
-
-    /// 等命令退出（会一直等到登录完、被取消，最多 15 分钟，放后台线程），读出临时目录里的登录文件，删掉临时目录。
-    pub fn wait(self) -> Result<Vec<u8>, AccountError> {
-        self.wait_for(LOGIN_DEADLINE)
-    }
-
-    fn wait_for(self, deadline: Duration) -> Result<Vec<u8>, AccountError> {
-        let started = Instant::now();
-        let scratch = &self.handle.scratch;
-        let status = loop {
-            let done = self
-                .handle
-                .child
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .try_wait()
-                .map_err(io_error(&scratch.dir))?;
-            if let Some(status) = done {
-                break status;
-            }
-            if started.elapsed() >= deadline {
-                self.handle.cancel();
-                return Err(AccountError::LoginTimedOut);
-            }
-            thread::sleep(Duration::from_millis(200));
-        };
-        // 读输出的线程可能还差最后几行。
-        thread::sleep(Duration::from_millis(50));
-        let auth = if scratch.kind == AgentKind::ClaudeCode {
-            claude::read_login(&scratch.dir, &scratch.keychain)
-        } else {
-            fs::read(scratch.dir.join("auth.json")).ok()
-        };
-        match auth.filter(|bytes| identify(scratch.kind, bytes).is_some()) {
-            Some(bytes) => Ok(bytes),
-            None => {
-                let tail = self.handle.tail(4);
-                Err(AccountError::Login(if tail.is_empty() {
-                    status.to_string()
-                } else {
-                    tail
-                }))
-            }
-        }
-    }
-}
-
-impl Drop for Login {
-    fn drop(&mut self) {
-        self.handle.cancel();
-        self.handle.scratch.clean();
-    }
-}
-
-impl LoginHandle {
-    /// 命令打出来的第一个网址：浏览器没打开时让人自己点。网址可能包在终端的超链接转义里（Claude Code），转义字符不要。
-    pub fn url(&self) -> Option<String> {
-        let output = self.output.lock().unwrap_or_else(PoisonError::into_inner);
-        let start = output.find("https://")?;
-        let url: String = output[start..]
-            .chars()
-            .take_while(|ch| !ch.is_whitespace() && !ch.is_control())
-            .collect();
-        Some(url)
-    }
-
-    /// 停掉登录命令；已经退出了就什么也不做。
-    pub fn cancel(&self) {
-        let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
-        if matches!(child.try_wait(), Ok(None)) {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    /// 应用要退出了：停掉登录命令，当场删掉临时目录（等 [`Login::wait`] 那边收拾就来不及了）。
-    pub fn abandon(&self) {
-        self.cancel();
-        self.scratch.clean();
-    }
-
-    /// 输出的最后几行。
-    fn tail(&self, lines: usize) -> String {
-        let output = self.output.lock().unwrap_or_else(PoisonError::into_inner);
-        let all: Vec<&str> = output
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        all[all.len().saturating_sub(lines)..].join("\n")
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
+
     use serde_json::json;
 
     use super::*;
 
-    fn b64(bytes: &[u8]) -> String {
+    pub(crate) fn b64(bytes: &[u8]) -> String {
         const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut out = String::new();
         for chunk in bytes.chunks(3) {
@@ -1099,13 +817,13 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    struct Setup {
+    pub(crate) struct Setup {
         _dir: tempfile::TempDir,
-        home: PathBuf,
-        engine: Engine,
+        pub(crate) home: PathBuf,
+        pub(crate) engine: Engine,
     }
 
-    fn setup() -> Setup {
+    pub(crate) fn setup() -> Setup {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let engine = Engine::new(DataDir::new(dir.path().join("data")));
@@ -1131,19 +849,21 @@ pub(crate) mod tests {
         }
     }
 
-    fn id_of(bytes: &[u8]) -> String {
+    pub(crate) fn id_of(bytes: &[u8]) -> String {
         identify(AgentKind::Codex, bytes).unwrap().id
     }
 
     /// 快照读官方账号的那一步（`read_all`），Codex 的两个文件照快照那样先读好。
     fn read(s: &Setup, kind: AgentKind) -> Accounts {
         let config = fs::read(s.home.join(".codex/config.toml")).ok();
-        let auth = s.auth();
-        let codex = Disk {
+        let path = s.home.join(".codex/auth.json");
+        let auth = fsx::read_optional(&path);
+        let codex = Read {
+            kind: AgentKind::Codex,
             config: config.as_deref(),
-            login: auth.as_deref(),
+            login: Some((&path, &auth)),
         };
-        read_all(&s.engine, &s.home, &[kind], codex)
+        read_all(&s.engine, &s.home, &[kind], &[codex])
     }
 
     /// 登录文件现在是谁（[`read`]）。
@@ -1151,14 +871,6 @@ pub(crate) mod tests {
         let mut accounts = read(s, kind);
         assert!(accounts.error.is_none(), "{:?}", accounts.error);
         accounts.live.remove(&kind).expect("the agent is read")
-    }
-
-    #[test]
-    fn base64url_decodes_without_padding() {
-        assert_eq!(base64url("aGk").unwrap(), b"hi");
-        assert_eq!(base64url("aGVsbG8_").unwrap(), b"hello?");
-        assert_eq!(base64url(&b64(b"any bytes")).unwrap(), b"any bytes");
-        assert_eq!(base64url("a!b"), None);
     }
 
     #[test]
@@ -1180,7 +892,7 @@ pub(crate) mod tests {
         );
 
         let grok = json!({
-            "https://auth.x.ai::client": {"user_id": "u1", "team_id": "t1", "email": "g@example.com", "expires_at": "2026-10-13T00:00:00Z"},
+            "https://auth.x.ai::client": {"user_id": "u1", "team_id": "t1", "email": "g@example.com", "expires_at": "2026-10-13T00:00:00Z", "key": "k"},
         });
         let grok = identify(AgentKind::GrokBuild, grok.to_string().as_bytes()).unwrap();
         assert_eq!(grok.email.as_deref(), Some("g@example.com"));
@@ -1237,21 +949,21 @@ pub(crate) mod tests {
         assert_eq!(s.stored(&id_of(&bob)), bob_latest);
         // 这时存着的和文件不一样，但什么都没存回去：不算「存了」，不用重读 `accounts.json`。
         let book = list(s.engine.data()).unwrap();
-        let found = found_in(AgentKind::Codex, s.auth()).unwrap();
-        let (_, kept) = sync_found(&s.engine, &s.home, AgentKind::Codex, &book, found).unwrap();
+        let found = files::CODEX.in_file(&s.auth().unwrap()).unwrap();
+        let (_, kept) = sync_found(&s.engine, &files::CODEX, &s.home, &book, found).unwrap();
         assert!(!kept);
-        // 拿锁之前就看出不用存：和 `keep` 用的是同一个判断。
+        // 不用存：和 `keep` 用的是同一个判断。
         let stored = s.stored(&id_of(&bob));
         let identity = identify(AgentKind::Codex, &bob).unwrap();
         assert!(!replaces(
-            AgentKind::Codex,
+            &files::CODEX,
             &identity,
             Some(&stored),
             &bob,
             Keep::Known
         ));
         assert!(replaces(
-            AgentKind::Codex,
+            &files::CODEX,
             &identity,
             Some(&stored),
             &bob,
@@ -1384,126 +1096,32 @@ pub(crate) mod tests {
         assert!(!blocked(AgentKind::GrokBuild));
     }
 
-    #[cfg(unix)]
+    /// 快照只看 `~/.claude.json` 是谁，不读钥匙串。存不了多个账号时（不是 macOS）是 `ViewOnly`。
     #[test]
-    fn login_runs_the_agent_command_in_a_scratch_home() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn claude_live_reads_the_profile_not_the_token() {
         let s = setup();
-        let auth = String::from_utf8(codex_auth("alice", "ws", 0)).unwrap();
-        let script = s.home.join("fake-codex");
-        fs::create_dir_all(&s.home).unwrap();
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho \"$1 $2 $3\" >&2\necho 'open https://auth.example/login?x=1 to continue'\nsleep 0.3\ncat > \"$CODEX_HOME/auth.json\" <<'EOF'\n{auth}\nEOF\n"
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let login = Login::start(&script, s.engine.data(), AgentKind::Codex).unwrap();
-        let handle = login.handle();
-        let dir = login.handle.scratch.dir.clone();
-        let bytes = login.wait().unwrap();
-        assert_eq!(id_of(&bytes), id_of(auth.as_bytes()));
-        assert_eq!(
-            handle.url().as_deref(),
-            Some("https://auth.example/login?x=1")
-        );
-        assert!(
-            handle
-                .tail(5)
-                .contains("login -c cli_auth_credentials_store=\"file\"")
-        );
-        assert!(!dir.exists());
-
-        // 取消：命令被停掉，没有登录文件。
-        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
-        let login = Login::start(&script, s.engine.data(), AgentKind::Codex).unwrap();
-        login.handle().cancel();
-        assert!(matches!(login.wait(), Err(AccountError::Login(_))));
-
-        // 等太久：停掉命令，报超时。
-        let login = Login::start(&script, s.engine.data(), AgentKind::Codex).unwrap();
-        let handle = login.handle();
-        assert!(matches!(
-            login.wait_for(Duration::from_millis(300)),
-            Err(AccountError::LoginTimedOut)
-        ));
-        assert!(!matches!(handle.child.lock().unwrap().try_wait(), Ok(None)));
-        assert!(!handle.scratch.dir.exists());
-
-        // 应用退出：命令停掉，临时目录当场删掉（`wait` 那边还没轮到）。
-        let login = Login::start(&script, s.engine.data(), AgentKind::Codex).unwrap();
-        let handle = login.handle();
-        handle.abandon();
-        assert!(!matches!(handle.child.lock().unwrap().try_wait(), Ok(None)));
-        assert!(!handle.scratch.dir.exists());
-        drop(login);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stale_logins_are_cleaned_at_startup() {
-        let s = setup();
-        let logins = s.engine.data().account_logins();
-        // 一个已经退出的进程号。
-        let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
-        gone.wait().unwrap();
-        // 一个还在跑的。
-        let mut running = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let dirs = [
-            scratch_name(AgentKind::Codex, gone.id(), 0),
-            scratch_name(AgentKind::ClaudeCode, gone.id(), 1),
-            scratch_name(AgentKind::GrokBuild, running.id(), 0),
-            scratch_name(AgentKind::Codex, std::process::id(), 0),
-            "codex".to_string(),
-        ];
-        for dir in &dirs {
-            fs::create_dir_all(logins.join(dir).join(".keychain")).unwrap();
-        }
-        // 名字像临时目录的链接：不跟过去删它指着的目录。
-        let elsewhere = s.home.join("elsewhere");
-        fs::create_dir_all(&elsewhere).unwrap();
-        let link = logins.join(scratch_name(AgentKind::Codex, gone.id(), 9));
-        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
-        assert_eq!(
-            parse_scratch_name(&dirs[1]),
-            Some((AgentKind::ClaudeCode, gone.id()))
-        );
-        clean_stale_logins(s.engine.data());
-        let left: Vec<bool> = dirs.iter().map(|dir| logins.join(dir).exists()).collect();
-        assert_eq!(left, [false, false, true, true, true]);
-        assert!(elsewhere.exists() && link.exists());
-        running.kill().unwrap();
-        running.wait().unwrap();
-    }
-
-    #[test]
-    fn claude_profile_reads_the_account_not_the_login() {
-        let s = setup();
-        let profile = || read(&s, AgentKind::ClaudeCode).claude;
-        assert_eq!(profile(), None);
+        let kind = AgentKind::ClaudeCode;
+        assert_eq!(live(&s, kind), Live::LoggedOut);
         fs::create_dir_all(&s.home).unwrap();
         fs::write(
             s.home.join(".claude.json"),
-            r#"{"numStartups": 3, "oauthAccount": {"emailAddress": " a@example.com ", "organizationType": "claude_max"}}"#,
+            r#"{"numStartups": 3, "oauthAccount": {"accountUuid": "u", "emailAddress": " a@example.com ", "organizationType": "claude_max"}}"#,
         )
         .unwrap();
-        assert_eq!(
-            profile(),
-            Some(Profile {
-                email: Some("a@example.com".into()),
-                plan: Some("max".into())
-            })
-        );
+        let identity = match live(&s, kind) {
+            Live::Unknown(identity) if supported(kind) => identity,
+            Live::ViewOnly(identity) if !supported(kind) => identity,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(identity.email.as_deref(), Some("a@example.com"));
+        assert_eq!(identity.plan.as_deref(), Some("max"));
         fs::write(s.home.join(".claude.json"), r#"{"numStartups": 3}"#).unwrap();
-        assert_eq!(profile(), None);
+        assert_eq!(live(&s, kind), Live::LoggedOut);
     }
 
     /// Claude Code 的一份登录（[`claude::bundle`] 拼的样子）：`user` 决定是谁，`refresh` 是第几次换的令牌。
     #[cfg(target_os = "macos")]
-    fn claude_login(user: &str, refresh: i64) -> (Value, Value) {
+    pub(crate) fn claude_login(user: &str, refresh: i64) -> (Value, Value) {
         (
             json!({"accountUuid": format!("uuid-{user}"), "organizationUuid": "org", "emailAddress": format!("{user}@example.com"), "organizationType": "claude_max"}),
             json!({"accessToken": format!("at-{user}-{refresh}"), "refreshToken": format!("rt-{user}-{refresh}"), "expiresAt": 1000 + refresh, "scopes": ["user:inference"]}),
@@ -1659,56 +1277,357 @@ pub(crate) mod tests {
         );
     }
 
+    // ── 每种存储方式跑同一组 ─────────────────────────
+
+    /// 一份登录：`user` 决定是谁，`refresh` 是第几次换的令牌（越大越新）。
+    fn login_of(kind: AgentKind, user: &str, refresh: u32) -> Vec<u8> {
+        match kind {
+            AgentKind::Codex => codex_auth(user, "ws", refresh),
+            AgentKind::GrokBuild => json!({
+                "https://auth.x.ai::client": {"user_id": user, "team_id": "t", "email": format!("{user}@example.com"),
+                    "key": format!("k-{user}-{refresh}"), "expires_at": format!("2026-10-{:02}T00:00:00Z", 1 + refresh)},
+            })
+            .to_string()
+            .into_bytes(),
+            AgentKind::ClaudeCode => claude::bundle(
+                &json!({"accountUuid": format!("uuid-{user}"), "organizationUuid": "org", "emailAddress": format!("{user}@example.com")}),
+                &json!({"accessToken": format!("at-{user}-{refresh}"), "expiresAt": 1000 + i64::from(refresh)}),
+            )
+            .unwrap(),
+            other => unreachable!("{other} has no official login"),
+        }
+    }
+
+    /// agent 自己登录、换了令牌：照它的存储方式写进登录文件（和钥匙串）。
+    fn log_in(s: &Setup, store: &dyn Storage, login: &[u8]) {
+        store.put_secret(&s.home, login).unwrap();
+        let file = store.live_file(&s.home).path;
+        let pre = fsx::read_optional(&file).unwrap();
+        let next = store.put_file(&s.home, pre.as_deref(), login).unwrap();
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, next).unwrap();
+    }
+
+    fn logged_in(s: &Setup, store: &dyn Storage) -> Option<Vec<u8>> {
+        let file = fsx::read_optional(&store.live_file(&s.home).path).unwrap();
+        store.read_live(&s.home, file.as_deref()).unwrap()
+    }
+
+    #[test]
+    fn every_storage_switches_and_keeps_what_it_replaced() {
+        for kind in AgentKind::ALL.into_iter().filter(|kind| supported(*kind)) {
+            let s = setup();
+            let store = storage(kind).unwrap();
+            let id = |login: &[u8]| identify(kind, login).unwrap().id;
+            let stored = |id: &str| store.read_stored(s.engine.data(), &s.home, id).unwrap();
+            let login = |user: &str, refresh: u32| login_of(kind, user, refresh);
+            let (alice, bob) = (login("alice", 0), login("bob", 0));
+
+            // 没人登着时加 alice：登录文件也写上。
+            add(&s.engine, &s.home, kind, &alice).unwrap();
+            assert_eq!(logged_in(&s, store).unwrap(), alice, "{kind}");
+            assert_eq!(live(&s, kind), Live::Known(id(&alice)), "{kind}");
+            // 加 bob：登着的是别人，登录文件不动。
+            let added = add(&s.engine, &s.home, kind, &bob).unwrap();
+            assert_eq!(added.id, id(&bob), "{kind}");
+            assert_eq!(logged_in(&s, store).unwrap(), alice, "{kind}");
+            // agent 给 alice 换了令牌：读快照时存回去（令牌在钥匙串里的读快照时不读，切走时才存）。
+            log_in(&s, store, &login("alice", 1));
+            assert_eq!(live(&s, kind), Live::Known(id(&alice)), "{kind}");
+            let kept = if store.secret() { 0 } else { 1 };
+            assert_eq!(stored(&id(&alice)).unwrap(), login("alice", kept), "{kind}");
+            // 重新登录登着的 alice：存着的换掉，登录文件也换。
+            let alice = login("alice", 2);
+            add(&s.engine, &s.home, kind, &alice).unwrap();
+            assert_eq!(stored(&id(&alice)).unwrap(), alice, "{kind}");
+            assert_eq!(logged_in(&s, store).unwrap(), alice, "{kind}");
+            // 切到 bob：alice 存下来。
+            switch(&s.engine, &s.home, kind, &id(&bob)).unwrap();
+            assert_eq!(logged_in(&s, store).unwrap(), bob, "{kind}");
+            assert_eq!(stored(&id(&alice)).unwrap(), alice, "{kind}");
+            assert_eq!(live(&s, kind), Live::Known(id(&bob)), "{kind}");
+            // agent 给 bob 换了令牌：切走时存下新的，切回来用新的。
+            let bob_later = login("bob", 1);
+            log_in(&s, store, &bob_later);
+            switch(&s.engine, &s.home, kind, &id(&alice)).unwrap();
+            assert_eq!(logged_in(&s, store).unwrap(), alice, "{kind}");
+            assert_eq!(stored(&id(&bob)).unwrap(), bob_later, "{kind}");
+            switch(&s.engine, &s.home, kind, &id(&bob)).unwrap();
+            assert_eq!(logged_in(&s, store).unwrap(), bob_later, "{kind}");
+            // 起名字、删掉：登着的不动，存下的那份删掉，登着的成了没存过的。
+            label(&s.engine, &s.home, kind, &id(&alice), "工作号", "").unwrap();
+            remove(&s.engine, &s.home, kind, &id(&bob)).unwrap();
+            assert_eq!(stored(&id(&bob)), None, "{kind}");
+            assert_eq!(logged_in(&s, store).unwrap(), bob_later, "{kind}");
+            assert!(
+                matches!(live(&s, kind), Live::Unknown(found) if found.id == id(&bob)),
+                "{kind}"
+            );
+            let book = list(s.engine.data()).unwrap();
+            assert_eq!(book.len(), 1, "{kind}");
+            assert_eq!(book[0].name.as_deref(), Some("工作号"), "{kind}");
+            assert!(matches!(
+                switch(&s.engine, &s.home, kind, &id(&bob)),
+                Err(AccountError::Missing)
+            ));
+        }
+    }
+
+    /// 插进去的一步：第几次，家目录。
+    type Then = dyn Fn(usize, &Path) + Sync;
+
+    /// 包一层存储方式：读登录（`read_live`）、换钥匙串（`put_secret`）以后跑一下，模拟 agent 这时候改了登录。
+    struct Hooked {
+        inner: &'static dyn Storage,
+        reads: std::sync::atomic::AtomicUsize,
+        after_read: Box<Then>,
+        after_secret: Box<Then>,
+    }
+
+    impl Hooked {
+        fn after_read(
+            inner: &'static dyn Storage,
+            then: impl Fn(usize, &Path) + Sync + 'static,
+        ) -> Self {
+            Self {
+                inner,
+                reads: Default::default(),
+                after_read: Box::new(then),
+                after_secret: Box::new(|_, _| ()),
+            }
+        }
+
+        fn after_secret(
+            inner: &'static dyn Storage,
+            then: impl Fn(usize, &Path) + Sync + 'static,
+        ) -> Self {
+            Self {
+                after_read: Box::new(|_, _| ()),
+                after_secret: Box::new(then),
+                ..Self::after_read(inner, |_, _| ())
+            }
+        }
+    }
+
+    impl Storage for Hooked {
+        fn kind(&self) -> AgentKind {
+            self.inner.kind()
+        }
+        fn storable(&self) -> bool {
+            self.inner.storable()
+        }
+        fn identify(&self, login: &Value) -> Option<Identity> {
+            self.inner.identify(login)
+        }
+        fn live_file(&self, home: &Path) -> LiveFile {
+            self.inner.live_file(home)
+        }
+        fn in_file(&self, file: &[u8]) -> Option<Found> {
+            self.inner.in_file(file)
+        }
+        fn read_live(
+            &self,
+            home: &Path,
+            file: Option<&[u8]>,
+        ) -> Result<Option<Vec<u8>>, EngineError> {
+            let live = self.inner.read_live(home, file);
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.after_read)(n, home);
+            live
+        }
+        fn secret(&self) -> bool {
+            self.inner.secret()
+        }
+        fn put_secret(&self, home: &Path, login: &[u8]) -> Result<(), EngineError> {
+            self.inner.put_secret(home, login)?;
+            (self.after_secret)(0, home);
+            Ok(())
+        }
+        fn put_file(
+            &self,
+            home: &Path,
+            file: Option<&[u8]>,
+            login: &[u8],
+        ) -> Result<Vec<u8>, EngineError> {
+            self.inner.put_file(home, file, login)
+        }
+        fn read_stored(
+            &self,
+            data: &DataDir,
+            home: &Path,
+            id: &str,
+        ) -> Result<Option<Vec<u8>>, EngineError> {
+            self.inner.read_stored(data, home, id)
+        }
+        fn write_stored(
+            &self,
+            data: &DataDir,
+            home: &Path,
+            id: &str,
+            login: &[u8],
+        ) -> Result<(), EngineError> {
+            self.inner.write_stored(data, home, id, login)
+        }
+        fn delete_stored(&self, data: &DataDir, home: &Path, id: &str) -> Result<(), EngineError> {
+            self.inner.delete_stored(data, home, id)
+        }
+        fn blocked(&self, config: Option<&[u8]>) -> bool {
+            self.inner.blocked(config)
+        }
+        fn program(&self) -> &'static str {
+            self.inner.program()
+        }
+        fn login_command(&self, command: &mut Command, dir: &Path) -> bool {
+            self.inner.login_command(command, dir)
+        }
+        fn read_login(&self, dir: &Path, keychain: &Keychain) -> Option<Vec<u8>> {
+            self.inner.read_login(dir, keychain)
+        }
+        fn forget_login(&self, dir: &Path, keychain: &Keychain) {
+            self.inner.forget_login(dir, keychain)
+        }
+    }
+
+    /// 读完登录文件、写之前 agent 换了令牌：从头再来，换下来的是新令牌。
+    #[test]
+    fn a_login_that_changes_while_switching_is_kept() {
+        let s = setup();
+        let (alice, alice_later, bob) = (
+            codex_auth("alice", "ws", 0),
+            codex_auth("alice", "ws", 1),
+            codex_auth("bob", "ws", 0),
+        );
+        s.set_auth(&alice);
+        add(&s.engine, &s.home, AgentKind::Codex, &bob).unwrap();
+        let later = alice_later.clone();
+        let store = Hooked::after_read(&files::CODEX, move |n, home| {
+            if n == 0 {
+                fs::write(home.join(".codex/auth.json"), &later).unwrap();
+            }
+        });
+        switch_with(&s.engine, &store, &s.home, &id_of(&bob)).unwrap();
+        assert_eq!(s.auth().unwrap(), bob);
+        assert_eq!(s.stored(&id_of(&alice)), alice_later);
+    }
+
+    /// agent 一直在改登录文件：试几次就不试了，报冲突，登录文件留着 agent 最后写的。
+    #[test]
+    fn switching_gives_up_when_the_login_keeps_changing() {
+        let s = setup();
+        let bob = codex_auth("bob", "ws", 0);
+        s.set_auth(&codex_auth("alice", "ws", 0));
+        add(&s.engine, &s.home, AgentKind::Codex, &bob).unwrap();
+        let store = Hooked::after_read(&files::CODEX, |n, home| {
+            let later = codex_auth("alice", "ws", n as u32 + 1);
+            fs::write(home.join(".codex/auth.json"), later).unwrap();
+        });
+        assert!(matches!(
+            switch_with(&s.engine, &store, &s.home, &id_of(&bob)),
+            Err(AccountError::Engine(EngineError::Conflict { .. }))
+        ));
+        assert_eq!(
+            s.auth().unwrap(),
+            codex_auth("alice", "ws", ATTEMPTS as u32)
+        );
+    }
+
+    /// Claude Code：读完登录、换了钥匙串以后 `~/.claude.json` 又被改了（agent 改了邮箱）。文件照样换，令牌和人对得上，
+    /// 不会把要切的那个的令牌存到原来那个人名下。
     #[cfg(target_os = "macos")]
     #[test]
-    fn claude_login_runs_in_a_scratch_config_dir() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn claude_token_and_profile_stay_together_while_switching() {
         let s = setup();
-        let (alice, alice_token) = claude_login("alice", 0);
-        let profile = json!({"oauthAccount": alice}).to_string();
-        let secure = json!({"claudeAiOauth": alice_token}).to_string();
-        // 照 Claude Code：令牌存进服务名带目录 hash 的那一条（这里是假钥匙串的文件），`oauthAccount` 写进配置目录。
-        let script = s.home.join("fake-claude");
-        fs::create_dir_all(&s.home).unwrap();
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 echo \"$1 $2 $3\" >&2\n\
-                 [ \"$CLAUDE_SECURESTORAGE_CONFIG_DIR\" = \"$CLAUDE_CONFIG_DIR\" ] && echo same-dir >&2\n\
-                 [ -p /dev/stdin ] && echo stdin-open >&2\n\
-                 printf 'visit: \\033]8;;https://claude.example/oauth?code=1\\033\\\\https://claude.example/oauth?code=1\\033]8;;\\033\\\\\\n'\n\
-                 sleep 0.3\n\
-                 hash=$(printf %s \"$CLAUDE_SECURESTORAGE_CONFIG_DIR\" | shasum -a 256 | cut -c1-8)\n\
-                 item=\"$CLAUDE_CONFIG_DIR/.keychain/Claude Code-credentials-$hash\"\n\
-                 mkdir -p \"$item\"\n\
-                 printf '%s' '{secure}' > \"$item/$USER\"\n\
-                 printf '%s' '{profile}' > \"$CLAUDE_CONFIG_DIR/.claude.json\"\n"
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let kind = AgentKind::ClaudeCode;
+        let store = storage(kind).unwrap();
+        let id = |login: &[u8]| identify(kind, login).unwrap().id;
+        let (alice, bob) = (login_of(kind, "alice", 0), login_of(kind, "bob", 0));
+        log_in(&s, store, &alice);
+        add(&s.engine, &s.home, kind, &bob).unwrap();
+        let hooked = Hooked::after_read(store, |n, home| {
+            if n == 0 {
+                let path = home.join(".claude.json");
+                let mut profile: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                profile["oauthAccount"]["emailAddress"] = json!("alice@new.example");
+                fs::write(&path, serde_json::to_vec(&profile).unwrap()).unwrap();
+            }
+        });
+        switch_with(&s.engine, &hooked, &s.home, &id(&bob)).unwrap();
+        assert_eq!(logged_in(&s, store).unwrap(), bob);
+        switch(&s.engine, &s.home, kind, &id(&alice)).unwrap();
+        assert_eq!(logged_in(&s, store).unwrap(), alice);
+    }
 
-        let login = Login::start(&script, s.engine.data(), AgentKind::ClaudeCode).unwrap();
-        let handle = login.handle();
-        let dir = login.handle.scratch.dir.clone();
-        let bytes = login.wait().unwrap();
-        assert_eq!(bytes, claude::bundle(&alice, &alice_token).unwrap());
-        assert_eq!(
-            handle.url().as_deref(),
-            Some("https://claude.example/oauth?code=1")
-        );
-        let tail = handle.tail(5);
-        assert!(tail.contains("auth login --claudeai"), "{tail}");
-        assert!(tail.contains("same-dir"), "{tail}");
-        assert!(tail.contains("stdin-open"), "{tail}");
-        assert!(!dir.exists());
+    /// Claude Code 钥匙串里那条的令牌。
+    #[cfg(target_os = "macos")]
+    fn claude_token(s: &Setup) -> Value {
+        let keychain = Keychain::for_home(&s.home);
+        let secure = keychain.read(claude::SERVICE, &claude::user()).unwrap();
+        serde_json::from_slice::<Value>(&secure.unwrap()).unwrap()["claudeAiOauth"].clone()
+    }
 
-        // 没写出登录就退出了：报错，带最后几行。
-        fs::write(&script, "#!/bin/sh\necho 'Login failed' >&2\nexit 1\n").unwrap();
-        let login = Login::start(&script, s.engine.data(), AgentKind::ClaudeCode).unwrap();
-        assert!(
-            matches!(login.wait(), Err(AccountError::Login(tail)) if tail.contains("Login failed"))
-        );
+    /// Claude Code：`~/.claude.json` 解析不了时切不了，钥匙串里的令牌也不动
+    /// （不然令牌换成了要切的、文件还是原来的人，原来的令牌也没存下）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_keeps_the_token_when_the_profile_is_broken() {
+        let s = setup();
+        let kind = AgentKind::ClaudeCode;
+        let store = storage(kind).unwrap();
+        log_in(&s, store, &login_of(kind, "alice", 0));
+        let bob = add(&s.engine, &s.home, kind, &login_of(kind, "bob", 0)).unwrap();
+        let token = claude_token(&s);
+        fs::write(store.live_file(&s.home).path, "{ nope").unwrap();
+        assert!(switch(&s.engine, &s.home, kind, &bob.id).is_err());
+        assert_eq!(claude_token(&s), token);
+        let carol = login_of(kind, "carol", 0);
+        assert!(add(&s.engine, &s.home, kind, &carol).is_err());
+        assert_eq!(claude_token(&s), token);
+    }
+
+    /// Claude Code：钥匙串换了以后登录文件没写成（这期间被改坏了）：令牌换回原来的。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_puts_the_token_back_when_the_profile_is_not_written() {
+        let s = setup();
+        let kind = AgentKind::ClaudeCode;
+        let store = storage(kind).unwrap();
+        log_in(&s, store, &login_of(kind, "alice", 0));
+        let bob = add(&s.engine, &s.home, kind, &login_of(kind, "bob", 0)).unwrap();
+        let token = claude_token(&s);
+        let hooked = Hooked::after_secret(store, |_, home| {
+            fs::write(home.join(".claude.json"), "{ nope").unwrap();
+        });
+        assert!(switch_with(&s.engine, &hooked, &s.home, &bob.id).is_err());
+        assert_eq!(claude_token(&s), token);
+    }
+
+    /// Claude Code：`~/.claude.json` 里是别人，钥匙串里却没有令牌（只有一半，不算登着）。加账号时两样都换成新登录的。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_adding_over_half_a_login_writes_both_halves() {
+        let s = setup();
+        let kind = AgentKind::ClaudeCode;
+        let store = storage(kind).unwrap();
+        let (carol, alice) = (login_of(kind, "carol", 0), login_of(kind, "alice", 0));
+        let file = store.live_file(&s.home).path;
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, store.put_file(&s.home, None, &carol).unwrap()).unwrap();
+        assert_eq!(logged_in(&s, store), None);
+        let added = add(&s.engine, &s.home, kind, &alice).unwrap();
+        assert_eq!(logged_in(&s, store).unwrap(), alice);
+        assert_eq!(live(&s, kind), Live::Known(added.id));
+    }
+
+    /// 登录文件读不了：不知道登的是谁（不是「未登录」），原因记下来。
+    #[test]
+    fn an_unreadable_login_file_is_an_error() {
+        for kind in [AgentKind::GrokBuild, AgentKind::ClaudeCode] {
+            let s = setup();
+            // 路径是个目录：读的时候报错。
+            fs::create_dir_all(storage(kind).unwrap().live_file(&s.home).path).unwrap();
+            let accounts = read(&s, kind);
+            assert!(accounts.error.is_some(), "{kind}");
+            assert!(!accounts.live.contains_key(&kind), "{kind}");
+        }
     }
 }
