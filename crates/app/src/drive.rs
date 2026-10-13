@@ -9,6 +9,7 @@
 //! click 402 25      在窗口坐标（单位是点）处左键单击
 //! move 402 25       把鼠标移过去（触发悬停）
 //! scroll 480 300 -120   在窗口坐标处滚动：第三个数是纵向的像素差，负数往下看
+//! bench 480 300 -20 60  滚 60 次、每次同步画一帧，打出每帧耗时（查滚动卡不卡）
 //! key escape        按一个键，写法同 GPUI 的快捷键：down、enter、cmd-a
 //! type deep         逐字输入
 //! shot tabs         当前窗口截图，存成 tabs.png
@@ -171,6 +172,36 @@ fn run(cmd: &str, arg: &str, target: Target, shots: &Path, cx: &mut App) -> anyh
                 );
             }
             "click" => click(point_arg(arg)?, window, cx),
+            // 测滚动一帧要多久：`bench x y dy n` 在 (x, y) 滚 n 次，每次滚完同步画一帧，打出每帧的耗时。
+            "bench" => {
+                let mut parts = arg.split_whitespace();
+                let mut num = || -> anyhow::Result<f32> {
+                    Ok(parts.next().context("expected `x y dy n`")?.parse()?)
+                };
+                let (x, y, dy, n) = (num()?, num()?, num()?, num()? as usize);
+                let mut frames = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let start = std::time::Instant::now();
+                    window.dispatch_event(
+                        PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position: point(px(x), px(y)),
+                            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                            modifiers: Modifiers::default(),
+                            touch_phase: TouchPhase::Moved,
+                        }),
+                        cx,
+                    );
+                    window.draw(cx).clear(cx);
+                    frames.push(start.elapsed().as_secs_f64() * 1000.);
+                }
+                frames.sort_by(f64::total_cmp);
+                let avg = frames.iter().sum::<f64>() / frames.len().max(1) as f64;
+                eprintln!(
+                    "bench: {n} frames, avg {avg:.1} ms, median {:.1} ms, max {:.1} ms",
+                    frames.get(n / 2).copied().unwrap_or_default(),
+                    frames.last().copied().unwrap_or_default()
+                );
+            }
             "key" => {
                 window.dispatch_keystroke(Keystroke::parse(arg)?, cx);
             }

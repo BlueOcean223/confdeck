@@ -51,3 +51,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # 设置页显示「跟随系统」现在走的是哪个代理：和 reqwest 用的是同一个函数。
 hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"] }
 http = "1"
+
+# 调试构建里依赖也优化：不优化时 GPUI 的布局（taffy）一帧要 8～10 毫秒，滚动明显卡；优化后约 1 毫秒（10-13 测的）。
+# 只管依赖，自己的几个 crate 照常不优化，改完重编还是快的。
+[profile.dev.package."*"]
+opt-level = 2
