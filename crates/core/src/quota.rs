@@ -49,7 +49,7 @@ pub enum Span {
     FiveHours,
     Week,
     Month,
-    /// 只算一个模型的周限额（Claude 的 Opus、Sonnet）。
+    /// 只算一个模型的周限额（Claude 的 Fable，老账号还有 Opus、Sonnet）。
     WeekOf(String),
     /// 别的长度（Codex 的 `window_minutes`）。
     Minutes(u32),
@@ -448,9 +448,16 @@ pub fn claude(http: &Http, home: &Path, keychain: bool) -> Result<Quota, QuotaEr
 #[cfg(target_os = "macos")]
 fn claude_keychain() -> Option<String> {
     // Claude Code 自己用 `security` 写进去，`security` 在这一条的信任列表里，读的时候不弹窗。
+    // 按 Claude Code 写的账户名找（同 CCometixLine），名字下别的条目不会混进来。
     let output = std::process::Command::new("security")
         .args([
             "find-generic-password",
+            "-a",
+            &keychain_user(
+                std::env::var("USER")
+                    .or_else(|_| std::env::var("LOGNAME"))
+                    .ok(),
+            ),
             "-s",
             "Claude Code-credentials",
             "-w",
@@ -470,15 +477,32 @@ fn claude_keychain() -> Option<String> {
     None
 }
 
-/// Claude 的用量：顶层的 `five_hour`、`seven_day`、`seven_day_opus`、`seven_day_sonnet` 带 0–100 的 `utilization`
-/// 和 `resets_at`；新版另有 `limits[]`，`kind` 是 `weekly_scoped` 的按 `scope.model.display_name` 是哪个模型的周限额，
-/// 用 `percent`，同一个模型的盖掉顶层那条。别的键这里不认识，不画。
+/// Claude Code 写钥匙串用的账户名：`USER`，只含字母、数字和 `._-` 才用，不然是 `claude-code-user`。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn keychain_user(user: Option<String>) -> String {
+    user.filter(|user| {
+        !user.is_empty()
+            && user
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    })
+    .unwrap_or_else(|| "claude-code-user".to_string())
+}
+
+/// Claude 的用量：顶层的 `five_hour`、`seven_day`、`seven_day_fable`、`seven_day_opus`、`seven_day_sonnet` 带 0–100 的
+/// `utilization` 和 `resets_at`；新版另有 `limits[]`，`kind` 是 `weekly_scoped` 的按 `scope.model.display_name` 是哪个模型的
+/// 周限额（现在是 Fable），用 `percent`，同一个模型的盖掉顶层那条，同一个模型写了两条的用第一条（同 fork）。
+/// 别的键这里不认识，不画。`five_hour`、`seven_day` 一个都没有的回答不算数（中转回的错误体）；只缺一个的，
+/// 缺的那个是刚重置过、还没用（Claude Code 重置后就不报那个窗口），写 0%（同 CCometixLine）。
 fn parse_claude(body: &Value) -> Result<Quota, QuotaError> {
-    const KEYS: [&str; 6] = [
+    const KEYS: [&str; 9] = [
         "five_hour",
         "seven_day",
+        "seven_day_fable",
         "seven_day_opus",
         "seven_day_sonnet",
+        "seven_day_oauth_apps",
+        "cinder_cove",
         "extra_usage",
         "limits",
     ];
@@ -488,24 +512,40 @@ fn parse_claude(body: &Value) -> Result<Quota, QuotaError> {
     {
         return Err(unknown(body));
     }
-    let mut windows: Vec<Window> = [
-        ("five_hour", Span::FiveHours),
-        ("seven_day", Span::Week),
-        ("seven_day_opus", Span::WeekOf("Opus".into())),
-        ("seven_day_sonnet", Span::WeekOf("Sonnet".into())),
-    ]
-    .into_iter()
-    .filter_map(|(key, span)| {
-        let window = &body[key];
-        Some(Window {
+    let used = |key: &str| number(&body[key]["utilization"]);
+    if used("five_hour").is_none() && used("seven_day").is_none() {
+        return Err(unknown(body));
+    }
+    let mut windows: Vec<Window> = [("five_hour", Span::FiveHours), ("seven_day", Span::Week)]
+        .into_iter()
+        .map(|(key, span)| Window {
             span,
-            used: number(&window["utilization"])?,
-            resets_at: time(&window["resets_at"]),
+            used: used(key).unwrap_or(0.),
+            resets_at: used(key).and_then(|_| time(&body[key]["resets_at"])),
         })
-    })
-    .collect();
+        .collect();
+    windows.extend(
+        [
+            ("seven_day_fable", Span::WeekOf("Fable".into())),
+            ("seven_day_opus", Span::WeekOf("Opus".into())),
+            ("seven_day_sonnet", Span::WeekOf("Sonnet".into())),
+        ]
+        .into_iter()
+        .filter_map(|(key, span)| {
+            Some(Window {
+                span,
+                used: used(key)?,
+                resets_at: time(&body[key]["resets_at"]),
+            })
+        }),
+    );
+    let mut scoped: Vec<Span> = Vec::new();
     for limit in body["limits"].as_array().into_iter().flatten() {
-        let weekly = limit["kind"] == "weekly_scoped" && limit["group"] == "weekly";
+        // CCometixLine 见过的回答没有 `group`。
+        let weekly = limit["kind"] == "weekly_scoped"
+            && limit["group"]
+                .as_str()
+                .is_none_or(|group| group == "weekly");
         // 某个使用场景的子限额不算整个模型的。
         if !weekly || !limit["scope"]["surface"].is_null() {
             continue;
@@ -516,12 +556,19 @@ fn parse_claude(body: &Value) -> Result<Quota, QuotaError> {
         let Some(used) = number(&limit["percent"]).filter(|p| p.is_finite() && *p >= 0.) else {
             continue;
         };
-        let mut name = model.trim().to_string();
-        if let Some(first) = name.get(..1) {
-            name = first.to_uppercase() + &name[1..];
+        // 「 fAbLe 」也是 Fable。
+        let model = model.trim().to_lowercase();
+        let mut chars = model.chars();
+        let Some(first) = chars.next() else {
+            continue;
+        };
+        let span = Span::WeekOf(first.to_uppercase().chain(chars).collect());
+        if scoped.contains(&span) {
+            continue;
         }
+        scoped.push(span.clone());
         let window = Window {
-            span: Span::WeekOf(name),
+            span,
             used,
             resets_at: time(&limit["resets_at"]),
         };
@@ -643,8 +690,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Plan, QuotaError, Span, Window, codex, parse_claude, parse_grok, parse_kimi, parse_minimax,
-        parse_opencode_go, parse_zhipu, plan_of,
+        Plan, QuotaError, Span, Window, codex, keychain_user, parse_claude, parse_grok, parse_kimi,
+        parse_minimax, parse_opencode_go, parse_zhipu, plan_of,
     };
     use crate::provider::{Protocol, Provider};
     use crate::usage::Limit;
@@ -799,15 +846,80 @@ mod tests {
                 {"kind": "weekly_scoped", "group": "weekly", "percent": 9.0,
                  "scope": {"model": {"display_name": "opus"}}, "resets_at": "2026-10-15T00:00:00+00:00"},
                 {"kind": "weekly_scoped", "group": "weekly", "percent": 70.0,
-                 "scope": {"model": {"display_name": "Fable"}, "surface": "web"}}]});
+                 "scope": {"model": {"display_name": "Fable"}, "surface": "web"}},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 37.5,
+                 "scope": {"model": {"display_name": "  fAbLe "}}, "resets_at": null},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 90.0,
+                 "scope": {"model": {"display_name": "Fable"}}}]});
         let quota = parse_claude(&body).unwrap();
         let spans: Vec<&Span> = quota.windows.iter().map(|w| &w.span).collect();
         assert_eq!(
             spans,
-            [&Span::FiveHours, &Span::Week, &Span::WeekOf("Opus".into())]
+            [
+                &Span::FiveHours,
+                &Span::Week,
+                &Span::WeekOf("Opus".into()),
+                &Span::WeekOf("Fable".into())
+            ]
         );
         assert_eq!(quota.windows[2].used, 9.);
-        assert!(parse_claude(&json!({"error": "x"})).is_err());
+        assert_eq!(quota.windows[3].used, 37.5);
+        // 顶层的 seven_day_fable 也认。
+        let quota = parse_claude(&json!({"seven_day": {"utilization": 41.0},
+            "seven_day_fable": {"utilization": 12.0}}))
+        .unwrap();
+        assert_eq!(quota.windows[2].span, Span::WeekOf("Fable".into()));
+    }
+
+    /// CCometixLine 测试里的回答：`five_hour` 是 null，`limits[]` 没有 `group`，混着别的形状。
+    #[test]
+    fn claude_missing_window_counts_as_unused() {
+        let body = json!({"five_hour": null,
+            "seven_day": {"utilization": 41.0, "resets_at": "2026-10-08T14:00:00+00:00"},
+            "limits": [
+                {"kind": "weekly_scoped", "scope": {"model": null}, "percent": 5.0},
+                "unexpected",
+                {"kind": "daily", "scope": {"model": {"display_name": "Fable"}}, "percent": 80.0},
+                {"kind": "weekly_scoped", "scope": {"model": {"display_name": "Fable"}},
+                 "percent": 12.4, "resets_at": 1_791_468_000}]});
+        let quota = parse_claude(&body).unwrap();
+        assert_eq!(
+            quota.windows,
+            [
+                Window {
+                    span: Span::FiveHours,
+                    used: 0.,
+                    resets_at: None
+                },
+                Window {
+                    span: Span::Week,
+                    used: 41.,
+                    resets_at: Some(1_791_468_000_000)
+                },
+                Window {
+                    span: Span::WeekOf("Fable".into()),
+                    used: 12.4,
+                    resets_at: Some(1_791_468_000_000)
+                }
+            ]
+        );
+        // 两个窗口都没有的不算数。
+        for body in [
+            json!({}),
+            json!({"error": {"type": "rate_limit_error"}}),
+            json!({"five_hour": null, "seven_day": {"utilization": null}}),
+        ] {
+            assert!(parse_claude(&body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn keychain_user_follows_claude_code() {
+        assert_eq!(keychain_user(Some("alice".into())), "alice");
+        assert_eq!(keychain_user(Some("a.b_c-1".into())), "a.b_c-1");
+        assert_eq!(keychain_user(Some("张三".into())), "claude-code-user");
+        assert_eq!(keychain_user(Some(String::new())), "claude-code-user");
+        assert_eq!(keychain_user(None), "claude-code-user");
     }
 
     #[test]

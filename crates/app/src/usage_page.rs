@@ -612,11 +612,15 @@ fn window_cells(cells: Vec<Div>) -> Div {
     rows
 }
 
-/// 一个窗口：名字和用了百分之几、进度条、多久后重置（悬停说几点）。
+/// 一个窗口：名字和用了百分之几、进度条、多久后重置（悬停说几点）。查过以后已经过了重置时间的算 0%，
+/// 不等下次查（同 CCometixLine）。
 fn quota_window(t: &Theme, id: &str, w: &quota::Window, now: i64) -> Div {
-    let used = w.used.max(0.);
-    let full = used >= 100.;
     let reset = w.resets_at.filter(|at| *at > now);
+    let used = match w.resets_at {
+        Some(_) if reset.is_none() => 0.,
+        _ => w.used.max(0.),
+    };
+    let full = used >= 100.;
     let cell = div()
         .id(ElementId::Name(format!("quota-{id}").into()))
         .v_flex()
@@ -660,7 +664,7 @@ fn quota_window(t: &Theme, id: &str, w: &quota::Window, now: i64) -> Div {
                 .text_color(t.faint)
                 .children(reset.map(|at| until_text(at - now))),
         );
-    // 格子里只写百分比（「每周 · Opus」和「已用 12%」并排放不下），悬停说全。
+    // 格子里只写百分比（「每周 · Fable」和「已用 12%」并排放不下），悬停说全。
     let mut tip = t!("usage.quota_used", percent = format!("{used:.0}")).to_string();
     if let Some(at) = reset.and_then(|at| Local.timestamp_millis_opt(at).earliest()) {
         let when = if rust_i18n::locale().starts_with("zh") {
