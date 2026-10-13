@@ -94,10 +94,16 @@ pub fn perform_close(window: &Window, cx: &App) {
 }
 
 /// 把 `hide` 藏起来的窗口挪到 `origin`（和 GPUI 开窗口时一样，以主屏左上角为原点）、
-/// 内容高 `height`，显示出来并成为 key 窗口。窗口还是透明的：里面还是上次藏起来时那一帧，
-/// 等 GPUI 按现在的状态画完一帧再 `reveal`。
-pub fn show_at(window: &Window, origin: Point<Pixels>, height: f64, cx: &App) {
-    let Some(ns_window) = ns_window(window) else {
+/// 内容高 `height`，显示出来并成为 key 窗口。
+///
+/// 窗口这时还是透明的，里面是上次藏起来时那一帧：`reveal` 为真时马上同步画一帧（走 GPUI 的 `displayLayer:`），
+/// 画完再变回不透明。不等 GPUI 的下一帧：透明的窗口刚拿出来，系统要过一会儿才算它看得见，
+/// 在那之前 GPUI 的 display link 不跑，面板有时要等很久才出来（10-13 用户发现）。
+pub fn show_at(window: &Window, origin: Point<Pixels>, height: f64, reveal: bool, cx: &App) {
+    let Some(view) = gpui_view(window) else {
+        return;
+    };
+    let Some(ns_window) = view.window() else {
         return;
     };
     cx.foreground_executor()
@@ -123,6 +129,22 @@ pub fn show_at(window: &Window, origin: Point<Pixels>, height: f64, cx: &App) {
             );
             ns_window.setFrame_display(next, true);
             ns_window.makeKeyAndOrderFront(None);
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "panel: {} ordered front, occluded={}",
+                crate::panel::ms(),
+                !ns_window
+                    .occlusionState()
+                    .contains(objc2_app_kit::NSWindowOcclusionState::Visible)
+            );
+            if reveal {
+                view.setNeedsDisplay(true);
+                view.displayIfNeeded();
+                ns_window.setAlphaValue(1.);
+                ns_window.invalidateShadow();
+                #[cfg(debug_assertions)]
+                eprintln!("panel: {} revealed", crate::panel::ms());
+            }
         })
         .detach();
 }
@@ -162,6 +184,8 @@ pub fn stay_behind_on_activation(window: &Window, cx: &App) {
     let Some(above) = window_above(ns_window.windowNumber()) else {
         return;
     };
+    #[cfg(debug_assertions)]
+    eprintln!("panel: {} main window stays below window {above}", crate::panel::ms());
     // SAFETY: AppKit 的通知名常量。
     let name = unsafe { NSApplicationDidBecomeActiveNotification };
     once(
@@ -171,6 +195,31 @@ pub fn stay_behind_on_activation(window: &Window, cx: &App) {
         cx.foreground_executor(),
         cx.background_executor(),
         move || ns_window.orderWindow_relativeTo(NSWindowOrderingMode::Below, above),
+    );
+}
+
+/// confdeck 不在前台。
+pub fn in_background() -> bool {
+    MainThreadMarker::new().is_some_and(|mtm| !NSApplication::sharedApplication(mtm).isActive())
+}
+
+/// 应用激活完成以后（`didBecomeActive` 的下一轮）跑 `f`；[`ACTIVATION_WAIT`] 内没激活也跑。
+/// 从后台打开面板时用：面板在激活之前拿到焦点的话，激活时系统把焦点还给主窗口，面板一失焦就关了。
+pub fn after_activation(cx: &App, f: impl FnOnce(&mut App) + 'static) {
+    let async_cx = cx.to_async();
+    let later = cx.foreground_executor().clone();
+    // SAFETY: AppKit 的通知名常量。
+    let name = unsafe { NSApplicationDidBecomeActiveNotification };
+    once(
+        name,
+        ACTIVATION_WAIT,
+        true,
+        cx.foreground_executor(),
+        cx.background_executor(),
+        move || {
+            // 通知回调里不开窗口：下一轮再开。
+            later.spawn(async move { async_cx.update(f) }).detach();
+        },
     );
 }
 
@@ -208,6 +257,8 @@ pub fn hide_and_hand_back(window: &Window, back: OtherApp, cx: &App) {
             let taken = app.keyWindow().is_some_and(|key| {
                 Retained::as_ptr(&key) != Retained::as_ptr(&ns_window) && key.canBecomeMainWindow()
             });
+            #[cfg(debug_assertions)]
+            eprintln!("panel: {} hand back? active={} taken={taken}", crate::panel::ms(), app.isActive());
             if !app.isActive() || taken {
                 ns_window.makeFirstResponder(None);
                 ns_window.orderOut(None);
@@ -253,6 +304,8 @@ fn once(
     let block = RcBlock::new({
         let (f, observer) = (f.clone(), observer.clone());
         move |_: NonNull<NSNotification>| {
+            #[cfg(debug_assertions)]
+            eprintln!("panel: {} notified", crate::panel::ms());
             remove_observer(&observer);
             if let Some(f) = f.borrow_mut().take() {
                 f();
@@ -275,6 +328,10 @@ fn once(
             timer.await;
             remove_observer(&observer);
             let f = f.borrow_mut().take();
+            #[cfg(debug_assertions)]
+            if f.is_some() {
+                eprintln!("panel: {} timed out", crate::panel::ms());
+            }
             if on_timeout && let Some(f) = f {
                 f();
             }
@@ -321,14 +378,6 @@ pub fn hush(window: &Window) {
     if let Some(ns_window) = ns_window(window) {
         ns_window.setAlphaValue(0.);
         ns_window.setIgnoresMouseEvents(true);
-    }
-}
-
-/// `show_at` 之后，GPUI 画好新的一帧了，窗口变回不透明。
-pub fn reveal(window: &Window) {
-    if let Some(ns_window) = ns_window(window) {
-        ns_window.setAlphaValue(1.);
-        ns_window.invalidateShadow();
     }
 }
 

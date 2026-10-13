@@ -28,15 +28,37 @@ const ROW: f32 = 40.;
 const ROW_WITH_READING: f32 = 52.;
 const LINKS: f32 = 20.;
 
+/// 打开面板之前在前台的应用（macOS），关面板时把前台还给它。
+#[cfg(target_os = "macos")]
+type ReturnTo = Option<crate::mac::OtherApp>;
+#[cfg(not(target_os = "macos"))]
+type ReturnTo = ();
+
+/// 调试构建里把面板的开关、焦点变化打到标准错误，查「点了图标面板不出来」这类问题。
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        eprintln!("panel: {} {}", crate::panel::ms(), format_args!($($arg)*));
+    };
+}
+
+/// 调试日志的时间戳：毫秒，只留后五位，看两行之间隔了多久。
+#[cfg(debug_assertions)]
+pub(crate) fn ms() -> u128 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    now.map_or(0, |d| d.as_millis() % 100_000)
+}
+
 /// 面板窗口第一次打开时建好，之后关掉只是藏起来（`mac::hide`），下次打开再显示，不销毁。
 #[derive(Default)]
 struct PanelState {
     handle: Option<WindowHandle<Panel>>,
     shown: bool,
+    /// 从后台打开、在等应用激活完成（`mac::after_activation`）。
+    opening: bool,
     closed_at: Option<Instant>,
     /// 从后台打开时原来在前台的应用：关面板时把前台还给它（`close`）。
-    #[cfg(target_os = "macos")]
-    return_to: Option<crate::mac::OtherApp>,
+    return_to: ReturnTo,
 }
 
 impl Global for PanelState {}
@@ -57,11 +79,12 @@ pub fn handle(cx: &App) -> Option<AnyWindowHandle> {
 /// 面板开着就关掉，关着就在 `icon`（托盘图标在屏幕上的位置）下方打开。
 pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     let state = cx.default_global::<PanelState>();
-    let (handle, shown) = (state.handle, state.shown);
+    let (handle, shown, opening) = (state.handle, state.shown, state.opening);
     // 面板开着时点托盘图标，面板会先因失焦关掉，紧接着才收到这次点击；这次就不再打开。
     let just_closed = state
         .closed_at
         .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
+    trace!("toggle: shown={shown} opening={opening} just_closed={just_closed}");
 
     if shown {
         if let Some(handle) = handle {
@@ -69,7 +92,7 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
         }
         return;
     }
-    if just_closed {
+    if just_closed || opening {
         return;
     }
 
@@ -81,11 +104,38 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     // gpui 为绕开 Cocoa 的一个问题会立刻收走面板刚拿到的焦点，接着 AppKit 抛异常崩溃。
     // 激活会把开着的主窗口一起带到前面：先安排好让它留在原位。
     #[cfg(target_os = "macos")]
-    let return_to = (!crate::quiet())
-        .then(crate::mac::frontmost_other)
-        .flatten();
+    let (return_to, background) = if crate::quiet() {
+        (None, false)
+    } else {
+        (crate::mac::frontmost_other(), crate::mac::in_background())
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (return_to, background) = ((), false);
     main_window::stay_behind(cx);
     crate::activate(cx);
+    // 激活是异步的：从后台打开时等激活完成再显示。面板先拿到焦点的话，激活时系统把焦点还给主窗口，
+    // 面板一失焦就关了，主窗口还会闪一下（10-13 用户发现）。
+    if background {
+        cx.global_mut::<PanelState>().opening = true;
+        #[cfg(target_os = "macos")]
+        crate::mac::after_activation(cx, move |cx| show(origin, height, store, return_to, cx));
+    } else {
+        show(origin, height, store, return_to, cx);
+    }
+}
+
+/// 在 `origin` 显示面板：第一次建窗口，之后把藏起来的那个挪过来。
+fn show(
+    origin: Point<Pixels>,
+    height: f32,
+    store: Entity<Store>,
+    return_to: ReturnTo,
+    cx: &mut App,
+) {
+    let state = cx.default_global::<PanelState>();
+    state.opening = false;
+    let handle = state.handle;
+    trace!("show");
     if let Some(handle) = handle
         && handle
             .update(cx, |panel, window, cx| panel.reopen(origin, window, cx))
@@ -93,10 +143,7 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     {
         let state = cx.global_mut::<PanelState>();
         state.shown = true;
-        #[cfg(target_os = "macos")]
-        {
-            state.return_to = return_to;
-        }
+        state.return_to = return_to;
         return;
     }
 
@@ -122,10 +169,7 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
             let state = cx.global_mut::<PanelState>();
             state.handle = Some(handle);
             state.shown = true;
-            #[cfg(target_os = "macos")]
-            {
-                state.return_to = return_to;
-            }
+            state.return_to = return_to;
         }
         Err(err) => eprintln!("failed to open panel: {err:#}"),
     }
@@ -211,6 +255,7 @@ impl Panel {
             cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
             // 失焦就关。跑 drive 脚本时应用不在前台（`crate::quiet`），焦点怎么变都和面板无关，只按脚本关。
             cx.observe_window_activation(window, |_, window, cx| {
+                trace!("active={}", window.is_window_active());
                 if !window.is_window_active() && !crate::quiet() {
                     close(window, cx);
                 }
@@ -234,20 +279,9 @@ impl Panel {
         self.status = None;
         self.height = base_height(self.store.read(cx));
         self.focus_handle.focus(window, cx);
+        // 跑 drive 脚本时窗口一直透明（`crate::quiet`）。
         #[cfg(target_os = "macos")]
-        {
-            crate::mac::show_at(window, origin, self.height as f64, cx);
-            // 排在 `show_at` 的任务后面：窗口显示出来以后，等画完下一帧再变回不透明。
-            if !crate::quiet() {
-                cx.spawn_in(window, async move |_, cx| {
-                    cx.update(|window, _| {
-                        window.on_next_frame(|window, _| crate::mac::reveal(window))
-                    })
-                    .ok();
-                })
-                .detach();
-            }
-        }
+        crate::mac::show_at(window, origin, self.height as f64, !crate::quiet(), cx);
         cx.notify();
     }
 
@@ -498,6 +532,8 @@ fn close(window: &mut Window, cx: &mut App) {
     state.closed_at = Some(Instant::now());
     #[cfg(target_os = "macos")]
     let return_to = state.return_to.take();
+    #[cfg(target_os = "macos")]
+    trace!("close: hand back={}", return_to.is_some());
     window.blur(cx);
     #[cfg(target_os = "macos")]
     match return_to {
@@ -508,10 +544,7 @@ fn close(window: &mut Window, cx: &mut App) {
 
 /// 关掉面板、接着打开主窗口：不把前台还回去。
 fn close_for_main(window: &mut Window, cx: &mut App) {
-    #[cfg(target_os = "macos")]
-    {
-        cx.default_global::<PanelState>().return_to = None;
-    }
+    cx.default_global::<PanelState>().return_to = Default::default();
     close(window, cx);
 }
 
