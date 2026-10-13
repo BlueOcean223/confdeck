@@ -55,7 +55,7 @@ impl SessionsPage {
                 }
             }),
         ];
-        store.update(cx, |store, cx| store.refresh_usage(false, cx));
+        store.update(cx, |store, cx| store.refresh_usage(cx));
         Self {
             store,
             search,

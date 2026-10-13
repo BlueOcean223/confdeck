@@ -10,6 +10,7 @@ use rust_i18n::t;
 use crate::data::{Notice, NoticeKind, Store};
 use crate::main_window;
 use crate::picker::{Picker, PickerEvent};
+use crate::quota_view;
 use crate::theme::Theme;
 use crate::ui;
 
@@ -23,6 +24,8 @@ const PADDING: f32 = 12.;
 const GAP: f32 = 10.;
 const HEADER: f32 = 30.;
 const ROW: f32 = 40.;
+/// 名字下面多一行额度的行（选的那家能查额度、余额时）。
+const ROW_WITH_READING: f32 = 52.;
 const LINKS: f32 = 20.;
 
 /// 面板窗口第一次打开时建好，之后关掉只是藏起来（`mac::hide`），下次打开再显示，不销毁。
@@ -67,6 +70,8 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
         return;
     }
 
+    // 选的那家的额度、余额：5 分钟内查过的不再查。
+    store.update(cx, |store, cx| store.refresh_remote(false, cx));
     let height = base_height(store.read(cx));
     let origin = point(icon.center().x - px(WIDTH / 2.), icon.bottom() + px(OFFSET));
     // 和 Wails 一样先激活应用再显示面板。不激活的话，应用在后台、主窗口又开着时，
@@ -118,15 +123,32 @@ fn shown_agents(store: &Store) -> Vec<usize> {
         .collect()
 }
 
+/// 一个 agent 那一行的高度：选的那家能查额度、余额时名字下面多一行。
+fn row_height(store: &Store, agent: usize) -> f32 {
+    if store.selection_reading(agent).is_some() {
+        ROW_WITH_READING
+    } else {
+        ROW
+    }
+}
+
 /// 不开选择器时的面板高度：顶栏、每个 agent 一行、底部一行链接。
 fn base_height(store: &Store) -> f32 {
-    let rows = shown_agents(store).len() as f32;
-    PADDING * 2. + HEADER + GAP + rows * ROW + GAP + LINKS
+    let rows: f32 = shown_agents(store)
+        .into_iter()
+        .map(|agent| row_height(store, agent))
+        .sum();
+    PADDING * 2. + HEADER + GAP + rows + GAP + LINKS
 }
 
 /// 第 `n` 行底边到窗口顶部的距离。
-fn row_bottom(n: usize) -> f32 {
-    PADDING + HEADER + GAP + (n as f32 + 1.) * ROW
+fn row_bottom(store: &Store, n: usize) -> f32 {
+    let rows: f32 = shown_agents(store)
+        .into_iter()
+        .take(n + 1)
+        .map(|agent| row_height(store, agent))
+        .sum();
+    PADDING + HEADER + GAP + rows
 }
 
 struct OpenPicker {
@@ -213,11 +235,12 @@ impl Panel {
 
     /// 窗口高度跟着内容走：平时刚好装下列表；开着选择器时往下长，刚好装下选择器。
     fn fit_height(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let base = base_height(self.store.read(cx));
+        let store = self.store.read(cx);
+        let base = base_height(store);
         let height = match &self.picker {
             Some(open) => {
                 let picker = open.picker.read(cx).height(cx);
-                base.max(row_bottom(open.row) + 4. + picker + PADDING)
+                base.max(row_bottom(store, open.row) + 4. + picker + PADDING)
             }
             None => base,
         };
@@ -357,16 +380,26 @@ impl Panel {
         let agent = &store.agents[i];
         let open = self.picker.as_ref().is_some_and(|p| p.agent == i);
         let (logos, label) = store.pill(i);
+        let reading = store.selection_reading(i);
 
         ui::row(t, true, n == 0)
+            .h(px(row_height(store, i)))
             .child(ui::logo(agent.logo, 18., t, window, cx))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .font_weight(FontWeight::MEDIUM)
-                    .truncate()
-                    .child(agent.name),
+                    .v_flex()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .truncate()
+                            .child(agent.name),
+                    )
+                    .children(
+                        reading.map(|reading| quota_view::line(t, &format!("panel-{i}"), &reading)),
+                    ),
             )
             // 宽度随内容，靠右对齐；名字太长时截断（magpie 面板里的下拉框也是这样）。
             .child(
@@ -472,7 +505,7 @@ impl Render for Panel {
             deferred(
                 div()
                     .absolute()
-                    .top(px(row_bottom(open.row) + 4.))
+                    .top(px(row_bottom(store, open.row) + 4.))
                     .left(px(8.))
                     .w(px(WIDTH - 16.))
                     .on_mouse_down_out(cx.listener(move |this, _, window, cx| {

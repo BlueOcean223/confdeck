@@ -293,6 +293,16 @@ fn login_path(data: &DataDir, kind: AgentKind, id: &str) -> PathBuf {
         .join(format!("{id}.json"))
 }
 
+/// 存下的一个账号的登录（和登录文件一个格式），查这个账号的额度用。
+pub fn stored_login(data: &DataDir, kind: AgentKind, id: &str) -> Result<Vec<u8>, AccountError> {
+    let path = login_path(data, kind, id);
+    match fs::read(&path) {
+        Ok(bytes) => Ok(bytes),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(AccountError::Missing),
+        Err(err) => Err(io_error(&path)(err).into()),
+    }
+}
+
 /// 存下的全部账号，先存的在前。
 pub fn list(data: &DataDir) -> Result<Vec<Account>, AccountError> {
     Ok(load(data)?.accounts)

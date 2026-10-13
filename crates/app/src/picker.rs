@@ -364,7 +364,8 @@ impl Picker {
             rows.push(Row::Now);
             rows.extend(now.actions.iter().map(|&action| Row::Action(action)));
         }
-        let default_keywords = matches(&t!("picker.default_keywords"));
+        let default_keywords =
+            matches(&t!("picker.default_keywords")) || matches(&crate::official::name(agent.kind));
         let default_rows: Vec<Row> = if self.multi {
             Vec::new()
         } else if self.accounts.is_empty() {
@@ -560,9 +561,12 @@ impl Picker {
                 (data::logo(provider), provider.name.clone().into(), sub)
             }
             None => (
-                agent.logo,
-                t!("common.default").into(),
-                t!("picker.default_hint", agent = agent.name).into(),
+                crate::official::logo(store, self.agent),
+                crate::official::name(agent.kind),
+                match store.official_email(self.agent) {
+                    Some(email) => email.into(),
+                    None => t!("picker.default_hint", agent = agent.name).into(),
+                },
             ),
         };
         let disabled = reason.is_some();
@@ -644,7 +648,13 @@ impl Picker {
                 }
             }))
             .on_click(cx.listener(move |this, _, _, cx| this.activate(Pick::Account(i), cx)))
-            .child(ui::logo(agent.logo, 16., t, window, cx))
+            .child(ui::logo(
+                crate::official::logo(store, self.agent),
+                16.,
+                t,
+                window,
+                cx,
+            ))
             .child(
                 div()
                     .h_flex()

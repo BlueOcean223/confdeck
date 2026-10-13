@@ -924,45 +924,6 @@ usage:
   bar_empty:
     en: "%{when} · nothing"
     zh-CN: "%{when} · 没有调用"
-  quota_expired:
-    en: Login expired
-    zh-CN: 登录过期
-  quota_none:
-    en: No plan
-    zh-CN: 没有套餐
-  quota_used:
-    en: "%{percent}% used"
-    zh-CN: "已用 %{percent}%"
-  quota_resets_at:
-    en: "resets %{when}"
-    zh-CN: "%{when} 重置"
-  span_5h:
-    en: 5 hours
-    zh-CN: 5 小时
-  span_week:
-    en: Weekly
-    zh-CN: 每周
-  span_month:
-    en: Monthly
-    zh-CN: 每月
-  span_days:
-    en: "%{count} days"
-    zh-CN: "%{count} 天"
-  span_hours:
-    en: "%{count} hours"
-    zh-CN: "%{count} 小时"
-  span_period:
-    en: Credits
-    zh-CN: 额度
-  resets_minutes:
-    en: "resets in %{count}m"
-    zh-CN: "%{count} 分钟后重置"
-  resets_hours:
-    en: "resets in %{count}h"
-    zh-CN: "%{count} 小时后重置"
-  resets_days:
-    en: "resets in %{count}d"
-    zh-CN: "%{count} 天后重置"
   bars:
     en: Bars
     zh-CN: 柱状图
@@ -1000,7 +961,42 @@ usage:
   unknown:
     en: Unknown
     zh-CN: 未知
-  # 余额卡。
+
+quota:
+  # 供应商页、官方卡片、菜单栏里的额度和余额。
+  span_5h:
+    en: 5 hours
+    zh-CN: 5 小时
+  span_week:
+    en: Weekly
+    zh-CN: 每周
+  span_month:
+    en: Monthly
+    zh-CN: 每月
+  span_days:
+    en: "%{count} days"
+    zh-CN: "%{count} 天"
+  span_hours:
+    en: "%{count} hours"
+    zh-CN: "%{count} 小时"
+  span_period:
+    en: Credits
+    zh-CN: 额度
+  used:
+    en: "%{percent}% used"
+    zh-CN: "已用 %{percent}%"
+  resets_at:
+    en: "resets %{when}"
+    zh-CN: "%{when} 重置"
+  in_minutes:
+    en: "in %{count}m"
+    zh-CN: "%{count} 分钟后"
+  in_hours:
+    en: "in %{count}h"
+    zh-CN: "%{count} 小时后"
+  in_days:
+    en: "in %{count}d"
+    zh-CN: "%{count} 天后"
   balance:
     en: Balance
     zh-CN: 余额
@@ -1008,12 +1004,31 @@ usage:
   spent:
     en: Used
     zh-CN: 已用
-  balance_auth:
+  expired:
+    en: Login expired
+    zh-CN: 登录过期
+  key_rejected:
     en: Key rejected
     zh-CN: Key 不对
-  balance_unknown:
+  none:
+    en: No plan
+    zh-CN: 没有套餐
+  signed_out:
+    en: Signed out
+    zh-CN: 未登录
+  unknown:
     en: Unrecognized response
     zh-CN: 返回的内容认不出
+
+official:
+  # 官方登录当成一家供应商：「Anthropic 官方」。
+  name:
+    en: "%{vendor} Official"
+    zh-CN: "%{vendor} 官方"
+  # 官方卡片里登着、但认不出是谁的登录。
+  this_login:
+    en: Current login
+    zh-CN: 现在的登录
 
 sessions:
   search:

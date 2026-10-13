@@ -4,15 +4,16 @@
 //! - 汇总一次算好四个时间段和热力图，切时间段不用等。算完把请求丢掉，只留汇总。
 //! - 会话页的会话列表也从这里来：扫的时候顺带记下的（core 的 `session`），文件已经不在的不要。
 //! - 价格用 models.dev 时只读磁盘上的缓存，不联网（供应商页拉列表、补全时会下）。
-//! - 余额（core 的 `balance`）和订阅额度（core 的 `quota`）：能查的每家一个后台任务，同时查；5 分钟内不重查，
-//!   点刷新按钮才重查。重查时先留着上次的数，查回来再换。
-//! - Claude 官方的额度跑 Claude Code 自己的 `/usage`：只在家目录是真的时跑（debug 构建用 `CONFDECK_HOME` 指到别处时不跑，
-//!   不然查的是本机用户的账号）。
+//! - 余额（core 的 `balance`）和订阅额度（core 的 `quota`）：打开供应商页、菜单栏面板时查（10-13 起画在那两处，
+//!   不在用量页），能查的每家一个后台任务，同时查；5 分钟内不重查，供应商页点刷新按钮才重查。重查时先留着上次的数，
+//!   查回来再换。存下的官方账号也各查各的（`QuotaOf::Account`）。
+//! - Claude 官方的额度先不查（10-13 用户还没想好怎么查），官方那一行的额度一栏空着。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use confdeck_core::account::{self, Live};
 use confdeck_core::agent::AgentKind;
 use confdeck_core::balance::{self, Balance, BalanceError};
 use confdeck_core::current::Current;
@@ -55,6 +56,8 @@ pub enum QuotaOf {
     Agent(AgentKind),
     /// 套餐（供应商 ID）。
     Provider(String),
+    /// 存下的一个官方账号（不是登着的那个，登着的算 `Agent`）。
+    Account(AgentKind, String),
 }
 
 /// 后台查一家额度。
@@ -82,9 +85,8 @@ impl Loaded {
 }
 
 impl Store {
-    /// 扫新加的会话记录、重算汇总，查余额和额度。正在扫就不再扫；`force` 时余额和额度不管上次是什么时候查的都重查。
-    pub fn refresh_usage(&mut self, force: bool, cx: &mut Context<Self>) {
-        self.refresh_remote(force, cx);
+    /// 扫新加的会话记录、重算汇总。正在扫就不再扫。
+    pub fn refresh_usage(&mut self, cx: &mut Context<Self>) {
         if self.usage.scanning {
             return;
         }
@@ -201,12 +203,7 @@ impl Store {
     fn refresh_quotas(&mut self, cx: &mut Context<Self>) {
         let proxy = self.proxy();
         let home = self.home.clone();
-        // 测试时家目录指到别处，Claude Code 查的却是本机用户的登录，不跑。
-        let real_home = std::env::home_dir().as_ref() == Some(&home);
-        let claude = real_home
-            .then(|| confdeck_core::program::find(&home, "claude"))
-            .flatten();
-        let child_proxy = proxy.for_child();
+        // Claude 官方的额度先不查（10-13 用户说还没想好怎么做）。
         let mut jobs: Vec<(QuotaOf, QuotaJob)> = Vec::new();
         for agent in &self.agents {
             if !agent.installed {
@@ -214,20 +211,6 @@ impl Store {
             }
             let home = home.clone();
             match agent.kind {
-                AgentKind::ClaudeCode => {
-                    let claude = claude.clone();
-                    let child_proxy = child_proxy.clone();
-                    jobs.push((
-                        QuotaOf::Agent(agent.kind),
-                        Box::new(move |_| match claude {
-                            Some(program) => {
-                                quota::claude(&program, &home, child_proxy.as_deref())
-                            }
-                            None if real_home => Err(QuotaError::NoProgram("claude")),
-                            None => Err(QuotaError::NotLoggedIn),
-                        }),
-                    ))
-                }
                 AgentKind::Codex => jobs.push((
                     QuotaOf::Agent(agent.kind),
                     Box::new(move |http| quota::codex(http, &home)),
@@ -238,6 +221,30 @@ impl Store {
                 )),
                 _ => {}
             }
+        }
+        // 存下的官方账号各查各的：用存着的登录。登着的那个上面已经查了。
+        for account in &self.accounts.list {
+            let kind = account.agent;
+            let installed = self.agents.iter().any(|a| a.kind == kind && a.installed);
+            let live =
+                matches!(self.live_account(kind), Some(Live::Known(id)) if *id == account.id);
+            if !installed || live || self.account_blocked(kind) {
+                continue;
+            }
+            let data = self.engine.data().clone();
+            let id = account.id.clone();
+            jobs.push((
+                QuotaOf::Account(kind, id.clone()),
+                Box::new(move |http| {
+                    let login = account::stored_login(&data, kind, &id)
+                        .map_err(|_| QuotaError::NotLoggedIn)?;
+                    match kind {
+                        AgentKind::Codex => quota::codex_login(http, &login),
+                        AgentKind::GrokBuild => quota::grok_login(http, &login),
+                        _ => Err(QuotaError::NotLoggedIn),
+                    }
+                }),
+            ));
         }
         for provider in self.providers.iter().filter(|p| quota::plan_supported(p)) {
             let provider = provider.clone();
@@ -304,12 +311,7 @@ impl Store {
 
 /// 官方登录是哪家的预设（名字、图标用）。
 pub fn vendor(agent: AgentKind) -> Option<&'static str> {
-    match agent {
-        AgentKind::ClaudeCode => Some("anthropic"),
-        AgentKind::Codex => Some("openai"),
-        AgentKind::GrokBuild => Some("xai"),
-        AgentKind::Pi | AgentKind::Opencode => None,
-    }
+    crate::official::vendor(agent).map(|(preset, _)| preset)
 }
 
 /// 截图用的假余额（debug 构建）：`CONFDECK_BALANCES` 指一个 JSON 文件，
@@ -348,9 +350,14 @@ fn fake_quota(of: &QuotaOf) -> Option<Result<Quota, QuotaError>> {
     use confdeck_core::quota::{Span, Window};
     let path = std::env::var_os("CONFDECK_QUOTAS")?;
     let all: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let account;
     let key = match of {
         QuotaOf::Agent(agent) => agent.id(),
         QuotaOf::Provider(id) => id.as_str(),
+        QuotaOf::Account(_, id) => {
+            account = format!("account:{id}");
+            account.as_str()
+        }
     };
     let fake = all.get(key)?;
     std::thread::sleep(Duration::from_millis(300));

@@ -3,7 +3,7 @@
 //!
 //! - 每次 `Store::reload` 都 `sync` 一遍：登录文件是存过的账号，就把 agent 新换的令牌存回去。
 //! - 加账号：在后台跑 agent 自己的 `login` 命令（家目录指到临时目录），它自己开浏览器；登录完存下来。
-//! - 选择器里选一个账号：这个 agent 不在「默认」就先切回默认，再换登录文件。
+//! - 选择器或官方卡片里选一个账号：这个 agent 不在「默认」就先切回默认，再换登录文件。
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -28,6 +28,8 @@ pub(crate) struct AccountState {
     pub logins: HashMap<AgentKind, Pending>,
     /// `accounts.json` 读不了的原因。
     pub error: Option<String>,
+    /// Claude Code 登着的官方账号的资料（邮箱、套餐）。它存不了多个账号。
+    pub claude: Option<account::Profile>,
 }
 
 /// 一次正在跑的登录。
@@ -70,6 +72,13 @@ impl Store {
         self.accounts.live = live;
         self.accounts.blocked = blocked;
         self.accounts.error = error;
+        let claude = self
+            .agents
+            .iter()
+            .any(|a| a.kind == AgentKind::ClaudeCode && a.installed);
+        self.accounts.claude = claude
+            .then(|| account::claude_profile(&self.home))
+            .flatten();
     }
 
     /// 这个 agent 存下的账号。

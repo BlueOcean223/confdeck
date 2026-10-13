@@ -1010,11 +1010,14 @@ impl Store {
                 }
                 // 配置文件解析不了：不能冒充「默认」，选一家时的报错会说明哪一行坏了。
                 None if agent.selectable() => (vec![agent.logo], t!("pill.unreadable").into()),
-                // 存过几个官方账号：写现在登的是哪个。
-                _ => match self.live_email(index) {
-                    Some(email) => (vec![agent.logo], email.into()),
-                    None => (vec![agent.logo], t!("common.default").into()),
-                },
+                // 官方登录写成一家供应商（「Anthropic 官方」，厂商的图标）；存过几个官方账号时写现在登的是哪个。
+                _ => {
+                    let logo = crate::official::logo(self, index);
+                    match self.live_email(index) {
+                        Some(email) => (vec![logo], email.into()),
+                        None => (vec![logo], crate::official::name(agent.kind)),
+                    }
+                }
             },
             Selection::Multi(enabled) if enabled.is_empty() => {
                 (vec![agent.logo], t!("multi.none").into())

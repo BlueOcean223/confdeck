@@ -1,4 +1,4 @@
-//! 供应商账户里还有多少钱（用量页顶上那排卡片）。照 fork 的 `balance.rs`（ccs-lite），加了 Kimi 开放平台。
+//! 供应商账户里还有多少钱（供应商页每行的余额）。照 fork 的 `balance.rs`（ccs-lite），加了 Kimi 开放平台。
 //!
 //! 按接口地址认是哪家，用这家供应商的 Key 查。套餐（Coding Plan、Token Plan）的额度不在这里，那是另一种接口。
 //!
