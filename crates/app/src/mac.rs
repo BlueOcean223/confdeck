@@ -1,11 +1,24 @@
 //! GPUI 没提供、只能直接调 AppKit 的窗口操作。
 
-use gpui_kit::{App, Pixels, Point, Window};
+use std::cell::RefCell;
+use std::ptr::NonNull;
+use std::rc::Rc;
+use std::time::Duration;
+
+use block2::RcBlock;
+use gpui_kit::{App, BackgroundExecutor, ForegroundExecutor, Pixels, Point, Window};
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{Message, msg_send};
-use objc2_app_kit::{NSScreen, NSView, NSWindow};
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationOptions, NSApplicationDidBecomeActiveNotification,
+    NSApplicationDidResignActiveNotification, NSRunningApplication, NSScreen, NSView, NSWindow,
+    NSWindowOrderingMode, NSWorkspace,
+};
+use objc2_foundation::{
+    MainThreadMarker, NSArray, NSDictionary, NSNotification, NSNotificationCenter,
+    NSNotificationName, NSNumber, NSPoint, NSRect, NSSize, NSString,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 fn ns_window(window: &Window) -> Option<Retained<NSWindow>> {
@@ -112,6 +125,195 @@ pub fn show_at(window: &Window, origin: Point<Pixels>, height: f64, cx: &App) {
             ns_window.makeKeyAndOrderFront(None);
         })
         .detach();
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    /// 返回的 CFArray 和 NSArray 免费桥接，调用方负责释放。
+    fn CGWindowListCopyWindowInfo(
+        option: u32,
+        relative_to_window: u32,
+    ) -> *mut NSArray<NSDictionary<NSString, AnyObject>>;
+}
+
+/// 等激活等多久：过了还没激活（系统没让）就不管了，免得以后哪次激活时把主窗口错放到后面。
+const ACTIVATION_WAIT: Duration = Duration::from_secs(1);
+/// 把前台还给别的应用以后，等 confdeck 退到后台最多等多久，到了照样收起面板。比 `panel::toggle` 里
+/// 「刚关又点」的 300 毫秒短：再打开面板时，上一次延后的收起一定已经做完。
+const HAND_BACK_WAIT: Duration = Duration::from_millis(250);
+
+/// 应用在后台时打开面板要先激活应用（notes/panel-focus-crash.md），而激活会把开着的主窗口一起提到前面
+/// （默认带上 main 和 key 窗口）。激活之前记下压在主窗口上面、离它最近的别的应用的窗口，
+/// 在 `didBecomeActive` 通知里（和提窗口是同一轮事件）把主窗口放回它下面。
+/// 应用已在前台、主窗口没显示或最小化、上面没有别的窗口时什么也不做。要在激活之前调。
+pub fn stay_behind_on_activation(window: &Window, cx: &App) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    if NSApplication::sharedApplication(mtm).isActive() {
+        return;
+    }
+    let Some(ns_window) = ns_window(window) else {
+        return;
+    };
+    if !ns_window.isVisible() || ns_window.isMiniaturized() {
+        return;
+    }
+    let Some(above) = window_above(ns_window.windowNumber()) else {
+        return;
+    };
+    // SAFETY: AppKit 的通知名常量。
+    let name = unsafe { NSApplicationDidBecomeActiveNotification };
+    once(
+        name,
+        ACTIVATION_WAIT,
+        false,
+        cx.foreground_executor(),
+        cx.background_executor(),
+        move || ns_window.orderWindow_relativeTo(NSWindowOrderingMode::Below, above),
+    );
+}
+
+/// 打开面板之前在前台的那个应用，关面板时把前台还给它。
+pub struct OtherApp(Retained<NSRunningApplication>);
+
+/// confdeck 在后台时，现在在前台的应用；confdeck 自己在前台时是 `None`。
+pub fn frontmost_other() -> Option<OtherApp> {
+    let mtm = MainThreadMarker::new()?;
+    if NSApplication::sharedApplication(mtm).isActive() {
+        return None;
+    }
+    let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    (app.processIdentifier() as u32 != std::process::id()).then_some(OtherApp(app))
+}
+
+/// 收起从后台打开的面板：马上变透明，下一轮看焦点去了哪。
+/// - 还在 confdeck、又没有别的窗口接手（按了 Esc、点了托盘图标）：把前台还给 `back`，等 confdeck 退到后台
+///   （`didResignActive`，最多 [`HAND_BACK_WAIT`]）再 `orderOut`。不等的话 AppKit 把焦点交给主窗口、把它提到前面。
+/// - 用户点了主窗口或者别的应用：照常收起。
+pub fn hide_and_hand_back(window: &Window, back: OtherApp, cx: &App) {
+    let Some(ns_window) = ns_window(window) else {
+        return;
+    };
+    ns_window.setAlphaValue(0.);
+    let foreground = cx.foreground_executor().clone();
+    let background = cx.background_executor().clone();
+    cx.foreground_executor()
+        .spawn(async move {
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let app = NSApplication::sharedApplication(mtm);
+            // 点托盘图标时 key 可能短暂落在状态栏的窗口上（也是 confdeck 进程的），那个不算接手。
+            let taken = app.keyWindow().is_some_and(|key| {
+                Retained::as_ptr(&key) != Retained::as_ptr(&ns_window) && key.canBecomeMainWindow()
+            });
+            if !app.isActive() || taken {
+                ns_window.makeFirstResponder(None);
+                ns_window.orderOut(None);
+                return;
+            }
+            let later = foreground.clone();
+            // SAFETY: AppKit 的通知名常量。
+            let name = unsafe { NSApplicationDidResignActiveNotification };
+            once(
+                name,
+                HAND_BACK_WAIT,
+                true,
+                &foreground,
+                &background,
+                move || {
+                    // 不在通知回调里同步改窗口（第一次崩溃的教训）：下一轮再收起。
+                    later
+                        .spawn(async move {
+                            ns_window.makeFirstResponder(None);
+                            ns_window.orderOut(None);
+                        })
+                        .detach();
+                },
+            );
+            back.0
+                .activateWithOptions(NSApplicationActivationOptions::empty());
+        })
+        .detach();
+}
+
+/// 下一次发 `name` 通知时跑一次 `f`（在主线程上、发通知的那一刻同步跑），然后撤掉观察者。
+/// `wait` 内没发：`on_timeout` 为真时到点照样跑 `f`，否则不跑；观察者都撤掉。
+fn once(
+    name: &NSNotificationName,
+    wait: Duration,
+    on_timeout: bool,
+    foreground: &ForegroundExecutor,
+    background: &BackgroundExecutor,
+    f: impl FnOnce() + 'static,
+) {
+    let f = Rc::new(RefCell::new(Some(f)));
+    let observer: Rc<RefCell<Option<Observer>>> = Rc::default();
+    let block = RcBlock::new({
+        let (f, observer) = (f.clone(), observer.clone());
+        move |_: NonNull<NSNotification>| {
+            remove_observer(&observer);
+            if let Some(f) = f.borrow_mut().take() {
+                f();
+            }
+        }
+    });
+    // SAFETY: 不给队列，回调在发通知的线程（主线程）上同步跑。
+    let token = unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(name),
+            None,
+            None,
+            &block,
+        )
+    };
+    *observer.borrow_mut() = Some(token);
+    let timer = background.timer(wait);
+    foreground
+        .spawn(async move {
+            timer.await;
+            remove_observer(&observer);
+            let f = f.borrow_mut().take();
+            if on_timeout && let Some(f) = f {
+                f();
+            }
+        })
+        .detach();
+}
+
+type Observer = Retained<ProtocolObject<dyn NSObjectProtocol>>;
+
+fn remove_observer(observer: &RefCell<Option<Observer>>) {
+    if let Some(token) = observer.borrow_mut().take() {
+        // SAFETY: `token` 是 `addObserverForName…` 返回的那个。
+        unsafe { NSNotificationCenter::defaultCenter().removeObserver(token.as_ref()) };
+    }
+}
+
+/// 压在 `number` 这个窗口上面、离它最近的别的应用的普通窗口（层级 0）的编号。
+fn window_above(number: isize) -> Option<isize> {
+    const ON_SCREEN_ABOVE_WINDOW: u32 = 1 << 1;
+    const EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
+    let number = u32::try_from(number).ok()?;
+    // SAFETY: Copy 规则，返回的数组归我们，交给 `Retained` 释放；拿不到是空指针。
+    let list = unsafe {
+        Retained::from_raw(CGWindowListCopyWindowInfo(
+            ON_SCREEN_ABOVE_WINDOW | EXCLUDE_DESKTOP_ELEMENTS,
+            number,
+        ))
+    }?;
+    let me = std::process::id() as isize;
+    let int = |entry: &NSDictionary<NSString, AnyObject>, key: &str| {
+        let value = entry.objectForKey(&NSString::from_str(key))?;
+        Some(value.downcast::<NSNumber>().ok()?.integerValue())
+    };
+    // 从前往后排，最后一个就是紧挨在它上面的。
+    list.iter()
+        .filter(|entry| int(entry, "kCGWindowLayer") == Some(0))
+        .filter(|entry| int(entry, "kCGWindowOwnerPID") != Some(me))
+        .filter_map(|entry| int(&entry, "kCGWindowNumber"))
+        .last()
 }
 
 /// 跑 `drive` 脚本时的窗口（`crate::quiet`）：全透明、鼠标穿过去，不挡着正在用电脑的人。

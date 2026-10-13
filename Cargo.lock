@@ -1115,6 +1115,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "block2 0.6.2",
  "chrono",
  "confdeck-core",
  "gpui-component",

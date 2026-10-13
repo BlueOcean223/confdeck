@@ -23,6 +23,8 @@ resvg = { version = "0.46", default-features = false }
 # 解码 PNG 品牌图标、按显示尺寸缩小。版本要和 gpui 用的一致（RenderImage 收的是它的 Frame）。
 image = { version = "0.25", default-features = false, features = ["png"] }
 objc2 = "0.6"
+# 给 NSNotificationCenter 传回调（面板打开时主窗口留在原位，`mac::stay_behind_on_activation`）。和 objc2 0.6 配套的版本。
+block2 = "0.6"
 objc2-app-kit = { version = "0.3.2", features = ["NSScreen", "NSView", "NSWindow", "NSResponder", "NSApplication", "NSAppearance"] }
 objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
 raw-window-handle = "0.6"

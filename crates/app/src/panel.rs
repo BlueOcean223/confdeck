@@ -34,6 +34,9 @@ struct PanelState {
     handle: Option<WindowHandle<Panel>>,
     shown: bool,
     closed_at: Option<Instant>,
+    /// 从后台打开时原来在前台的应用：关面板时把前台还给它（`close`）。
+    #[cfg(target_os = "macos")]
+    return_to: Option<crate::mac::OtherApp>,
 }
 
 impl Global for PanelState {}
@@ -76,13 +79,24 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     let origin = point(icon.center().x - px(WIDTH / 2.), icon.bottom() + px(OFFSET));
     // 和 Wails 一样先激活应用再显示面板。不激活的话，应用在后台、主窗口又开着时，
     // gpui 为绕开 Cocoa 的一个问题会立刻收走面板刚拿到的焦点，接着 AppKit 抛异常崩溃。
+    // 激活会把开着的主窗口一起带到前面：先安排好让它留在原位。
+    #[cfg(target_os = "macos")]
+    let return_to = (!crate::quiet())
+        .then(crate::mac::frontmost_other)
+        .flatten();
+    main_window::stay_behind(cx);
     crate::activate(cx);
     if let Some(handle) = handle
         && handle
             .update(cx, |panel, window, cx| panel.reopen(origin, window, cx))
             .is_ok()
     {
-        cx.global_mut::<PanelState>().shown = true;
+        let state = cx.global_mut::<PanelState>();
+        state.shown = true;
+        #[cfg(target_os = "macos")]
+        {
+            state.return_to = return_to;
+        }
         return;
     }
 
@@ -108,6 +122,10 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
             let state = cx.global_mut::<PanelState>();
             state.handle = Some(handle);
             state.shown = true;
+            #[cfg(target_os = "macos")]
+            {
+                state.return_to = return_to;
+            }
         }
         Err(err) => eprintln!("failed to open panel: {err:#}"),
     }
@@ -287,7 +305,7 @@ impl Panel {
                         // 表单在主窗口里：关掉面板，打开主窗口盖上预先填好的表单。
                         PickerEvent::SaveAs(draft) => {
                             let draft = draft.clone();
-                            close(window, cx);
+                            close_for_main(window, cx);
                             main_window::show_draft(this.store.clone(), agent, draft, cx);
                             return;
                         }
@@ -360,7 +378,7 @@ impl Panel {
             .child(
                 ui::icon_button("open-main", t, "square-arrow-out-up-right").on_click(cx.listener(
                     move |_, _, window, cx| {
-                        close(window, cx);
+                        close_for_main(window, cx);
                         main_window::show(store.clone(), cx);
                     },
                 )),
@@ -470,6 +488,7 @@ impl Panel {
 
 /// 关掉面板：只藏起来，不销毁窗口（`mac::hide` 说了为什么）。失焦回调里也会调到，
 /// 所以真正 `orderOut` 放在下一轮主线程任务（notes/panel-focus-crash.md）。
+/// 从后台打开的（Esc、再点托盘图标关掉时）把前台还给原来的应用，不然 AppKit 把焦点交给主窗口、把它提到前面。
 fn close(window: &mut Window, cx: &mut App) {
     let state = cx.default_global::<PanelState>();
     if !state.shown {
@@ -477,9 +496,23 @@ fn close(window: &mut Window, cx: &mut App) {
     }
     state.shown = false;
     state.closed_at = Some(Instant::now());
+    #[cfg(target_os = "macos")]
+    let return_to = state.return_to.take();
     window.blur(cx);
     #[cfg(target_os = "macos")]
-    crate::mac::hide(window, cx);
+    match return_to {
+        Some(app) => crate::mac::hide_and_hand_back(window, app, cx),
+        None => crate::mac::hide(window, cx),
+    }
+}
+
+/// 关掉面板、接着打开主窗口：不把前台还回去。
+fn close_for_main(window: &mut Window, cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    {
+        cx.default_global::<PanelState>().return_to = None;
+    }
+    close(window, cx);
 }
 
 impl Render for Panel {
@@ -549,7 +582,7 @@ impl Render for Panel {
                                 ui::text_button("open", &t)
                                     .child(t!("panel.open"))
                                     .on_click(move |_, window, cx| {
-                                        close(window, cx);
+                                        close_for_main(window, cx);
                                         main_window::show(open_store.clone(), cx);
                                     }),
                             )

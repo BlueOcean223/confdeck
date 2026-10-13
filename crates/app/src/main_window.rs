@@ -66,6 +66,22 @@ pub fn handle(cx: &App) -> Option<AnyWindowHandle> {
     cx.try_global::<MainWindowHandle>().and_then(|h| h.window)
 }
 
+/// 打开面板前调：应用在后台时，打开面板要激活应用，激活会把开着的主窗口一起带到前面，这里让它留在原位。
+pub fn stay_behind(cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    if !crate::quiet()
+        && let Some(handle) = cx.try_global::<MainWindowHandle>().and_then(|h| h.window)
+    {
+        handle
+            .update(cx, |_, window, cx| {
+                crate::mac::stay_behind_on_activation(window, cx)
+            })
+            .ok();
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = cx;
+}
+
 /// 有主窗口就提到前台，没有就新开一个。
 pub fn show(store: Entity<Store>, cx: &mut App) {
     crate::activate(cx);
