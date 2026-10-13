@@ -18,6 +18,7 @@ mod official;
 mod panel;
 mod picker;
 mod quota_view;
+mod readings;
 mod sessions_page;
 mod settings_page;
 mod theme;

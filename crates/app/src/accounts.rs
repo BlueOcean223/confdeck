@@ -208,11 +208,13 @@ impl Store {
                 // 新加的账号还没有额度读数，不查的话一直是占位条，要等下一次刷新（10-13 用户截图里看到的）。
                 // 按读回来的账号查：新账号要在列表里，登录文件现在是谁也要是新的。
                 store.reload_then(cx, move |store, cx| {
-                    if let Some(id) = added {
-                        store.check_one(&CheckKey::Account(kind, id), cx);
-                    }
                     let live = store.live_target(kind);
-                    store.check_one(&live, cx);
+                    store.readings.update(cx, |readings, cx| {
+                        if let Some(id) = added {
+                            readings.check_one(&CheckKey::Account(kind, id), cx);
+                        }
+                        readings.check_one(&live, cx);
+                    });
                 });
                 let notice = match result {
                     Ok(account) => Notice::ok(t!(
@@ -269,7 +271,9 @@ impl Store {
         // 额度跟着账号走（Grok 联网查的是登录文件里的账号）：按换上的快照查。
         self.after_snapshot(move |store, cx| {
             let live = store.live_target(kind);
-            store.check_one(&live, cx);
+            store
+                .readings
+                .update(cx, |readings, cx| readings.check_one(&live, cx));
         });
         self.run(
             move |engine, home| {

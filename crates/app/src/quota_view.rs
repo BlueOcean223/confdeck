@@ -1,22 +1,18 @@
 //! 额度和余额怎么画（10-13 从用量页挪出来，用户说它们属于供应商）：供应商页每一行（官方的和各家的）、官方卡片里的账号、
-//! 菜单栏面板里每个 agent 选的那家。查在 `usage.rs`（`check_due` 等），这里只读 `Store::usage`。
+//! 菜单栏面板里每个 agent 选的那家。查和存在 `readings.rs`，这里只画它给的 [`Reading`]。
 //! 供应商页上能查的每一行，读数后面一个圆形箭头：点了重查这一个，查着的时候转（10-13 用户：显示了的也要能手动刷新）。
 //! 关掉查询的那一格空着、没有箭头；不自动查、还没查过的只有箭头。
 
 use chrono::{Local, TimeZone as _};
-use confdeck_core::agent::AgentKind;
-use confdeck_core::balance::{self, Balance, BalanceError, Currency};
-use confdeck_core::provider::Provider;
-use confdeck_core::quota::{self, CheckKey, Quota, QuotaError, Span, Window};
-use confdeck_core::status::AgentStatus;
+use confdeck_core::balance::{Balance, BalanceError, Currency};
+use confdeck_core::quota::{CheckKey, Quota, QuotaError, Span, Window};
 use gpui_kit::component::*;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::Store;
+use crate::readings::Readings;
 use crate::theme::Theme;
 use crate::ui;
-use crate::usage::QuotaOf;
 
 /// 一家的读数：查的是谁、在不在查、查到了什么。
 pub struct Reading<'a> {
@@ -53,120 +49,9 @@ const ARROW_GAP: f32 = 6.;
 /// 供应商页额度那一栏的宽度：三个窗口加箭头。
 pub const COLUMN: f32 = METERS + ARROW_GAP + ARROW;
 
-impl Store {
-    /// 这家供应商的套餐额度或余额；两样都查不了、也没自己配查法的是 `None`。
-    pub fn provider_reading(&self, provider: &Provider) -> Option<Reading<'_>> {
-        let target = CheckKey::Provider(provider.id.clone());
-        let custom = self.custom_query(provider).is_some();
-        if !custom && quota::plan_supported(provider) {
-            return Some(self.quota_reading(target, &QuotaOf::Provider(provider.id.clone())));
-        }
-        if custom || balance::supported(provider) {
-            let shown = if self.check_of(&target).off {
-                Shown::Off
-            } else {
-                match self.usage.balances.get(&provider.id) {
-                    Some(Ok(found)) => Shown::Balance(found),
-                    Some(Err(err)) => Shown::BalanceFailed(err),
-                    None => self.pending(&target),
-                }
-            };
-            return Some(self.reading(target, shown));
-        }
-        None
-    }
-
-    /// 认得这家的查法（套餐额度、余额）：「额度查询」卡片里有没有「内置」。
-    pub fn built_in(&self, provider: &Provider) -> bool {
-        quota::plan_supported(provider) || balance::supported(provider)
-    }
-
-    /// 「⋯」里有没有「额度查询」：供应商都有（认不出的可以自己配），Claude 官方没有。
-    pub fn checkable(&self, target: &CheckKey) -> bool {
-        match target {
-            CheckKey::Provider(_) => true,
-            CheckKey::Account(kind, _) | CheckKey::Login(kind) => *kind != AgentKind::ClaudeCode,
-        }
-    }
-
-    /// 官方登录（登录文件里那个账号）的额度。Claude 官方先不查（10-13 用户说先不做），是 `None`。
-    pub fn official_reading(&self, kind: AgentKind) -> Option<Reading<'_>> {
-        (kind != AgentKind::ClaudeCode)
-            .then(|| self.quota_reading(self.live_target(kind), &QuotaOf::Agent(kind)))
-    }
-
-    /// 存下的一个官方账号（不是登着的那个）的额度。Claude 的同上，是 `None`。
-    pub fn account_reading(&self, kind: AgentKind, id: &str) -> Option<Reading<'_>> {
-        (kind != AgentKind::ClaudeCode).then(|| {
-            self.quota_reading(
-                CheckKey::Account(kind, id.to_string()),
-                &QuotaOf::Account(kind, id.to_string()),
-            )
-        })
-    }
-
-    /// 「额度查询」卡片里那一家的读数。
-    pub fn reading_of(&self, target: &CheckKey) -> Option<Reading<'_>> {
-        match target {
-            CheckKey::Provider(id) => self
-                .providers
-                .iter()
-                .find(|p| &p.id == id)
-                .and_then(|p| self.provider_reading(p)),
-            CheckKey::Account(kind, _) if self.in_use(target) => self.official_reading(*kind),
-            CheckKey::Account(kind, id) => self.account_reading(*kind, id),
-            CheckKey::Login(kind) => self.official_reading(*kind),
-        }
-    }
-
-    /// 这个 agent 现在选的那家：单选的、选的是列表里的哪家或者官方登录时才有。
-    pub fn selection_reading(&self, agent: usize) -> Option<Reading<'_>> {
-        let row = &self.agents[agent];
-        match &row.status {
-            AgentStatus::Provider { .. } => {
-                self.provider_reading(&self.providers[self.picked(agent)?])
-            }
-            AgentStatus::Official => self.official_reading(row.kind),
-            _ => None,
-        }
-        // 面板里关掉的、没查过的不写那一行。
-        .filter(|reading| !matches!(reading.shown, Shown::Off | Shown::Unchecked))
-    }
-
-    fn quota_reading(&self, target: CheckKey, of: &QuotaOf) -> Reading<'_> {
-        let shown = if self.check_of(&target).off {
-            Shown::Off
-        } else {
-            match self.usage.quotas.get(of) {
-                Some(Ok(found)) => Shown::Quota(found),
-                Some(Err(err)) => Shown::QuotaFailed(err),
-                None => self.pending(&target),
-            }
-        };
-        self.reading(target, shown)
-    }
-
-    fn reading<'a>(&self, of: CheckKey, shown: Shown<'a>) -> Reading<'a> {
-        Reading {
-            checking: self.checking_target(&of),
-            of,
-            shown,
-        }
-    }
-
-    /// 还没有读数：到点会自动查的是占位条，不自动查的只有箭头。
-    fn pending(&self, target: &CheckKey) -> Shown<'static> {
-        if self.check_of(target).every(self.in_use(target)) > 0 {
-            Shown::Waiting
-        } else {
-            Shown::Unchecked
-        }
-    }
-}
-
 /// 供应商页一行右边的那一块：读数（[`meters`]），后面一个圆形箭头。宽度是 [`COLUMN`]，各行的格子、箭头上下对齐。
-/// 箭头点了经 `store` 重查这一个。关掉查询的整栏空着。
-pub fn cells(t: &Theme, id: &str, reading: &Reading, store: &Entity<Store>) -> Div {
+/// 箭头点了经 `readings` 重查这一个。关掉查询的整栏空着。
+pub fn cells(t: &Theme, id: &str, reading: &Reading, readings: &Entity<Readings>) -> Div {
     let column = div()
         .flex_none()
         .w(px(COLUMN))
@@ -178,7 +63,7 @@ pub fn cells(t: &Theme, id: &str, reading: &Reading, store: &Entity<Store>) -> D
     }
     column
         .child(meters(t, id, &reading.shown))
-        .child(refresh(t, id, reading, store))
+        .child(refresh(t, id, reading, readings))
 }
 
 /// 读数：每个窗口一格（名字和百分比、细进度条，悬停说几点重置），或者「余额 ¥86.40」，或者一句状态。宽度是三个窗口。
@@ -213,8 +98,8 @@ pub fn meters(t: &Theme, id: &str, shown: &Shown) -> Div {
 }
 
 /// 圆形箭头：点了重查这一个，查着的时候转。
-fn refresh(t: &Theme, id: &str, reading: &Reading, store: &Entity<Store>) -> Stateful<Div> {
-    let store = store.clone();
+fn refresh(t: &Theme, id: &str, reading: &Reading, readings: &Entity<Readings>) -> Stateful<Div> {
+    let readings = readings.clone();
     let target = reading.of.clone();
     let checking = reading.checking;
     div()
@@ -232,7 +117,7 @@ fn refresh(t: &Theme, id: &str, reading: &Reading, store: &Entity<Store>) -> Sta
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             if !checking {
-                store.update(cx, |store, cx| store.check_one(&target, cx));
+                readings.update(cx, |readings, cx| readings.check_one(&target, cx));
             }
         })
         .child(ui::spinning(

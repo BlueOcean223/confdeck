@@ -4,7 +4,7 @@
 //! - **测连通**的结果按地址记（[`NetState::reach`]），供应商列表和编辑器共用：编辑器里改了地址，新地址自然没有结果。
 //! - **models.dev** 下过、读过一次就留在进程里，留到内容满一天（同磁盘缓存的期限，按缓存文件的修改时间算，见 core 的 `models_dev`），
 //!   过了下次用时重读（缓存也过期了就重下）。
-//! - 每次联网现建一个客户端（core 的 `Http::new`），代理设置改了下一次就生效。
+//! - 联网共用一个客户端（[`NetState::http`]，core 的 `SharedHttp`），代理设置改了下一次就重建；设置页试代理的那次现建一个。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,7 +15,7 @@ use confdeck_core::apply;
 use confdeck_core::data::DataDir;
 use confdeck_core::fsx::{self, Mode};
 use confdeck_core::models_dev::{self, ModelsDev};
-use confdeck_core::net::{Http, NetError, Proxy, Unreachable};
+use confdeck_core::net::{Http, NetError, Proxy, SharedHttp, Unreachable};
 use confdeck_core::provider::{Model, Provider};
 use confdeck_core::remote;
 use confdeck_core::store::StoreError;
@@ -33,6 +33,8 @@ use crate::write::{Done, Report};
 pub struct NetState {
     /// 地址 → 测连通的结果。
     reach: HashMap<String, Reach>,
+    /// 共用的客户端：额度查询、测连通、拉模型列表都用它，代理设置变了才重建（试代理的那次除外）。
+    pub(crate) http: SharedHttp,
     /// 读进来的 models.dev 和它的内容是什么时候的（磁盘缓存的修改时间）。用量页也用（只读磁盘上的缓存，不联网）。
     models_dev: Option<Fresh>,
 }
@@ -99,7 +101,10 @@ impl Store {
     /// 改出站代理（存在 `state.json`）。存不了报错。
     pub fn set_proxy(&mut self, proxy: Proxy, cx: &mut Context<Self>) {
         match self.engine.set_proxy(proxy) {
-            Ok(local) => self.set_local(local),
+            Ok(local) => {
+                self.set_local(local);
+                self.plan_readings(cx);
+            }
             Err(err) => self.announce(
                 &[Notice::err(t!(
                     "net.proxy_not_saved",
@@ -182,8 +187,9 @@ impl Store {
                 self.net.reach.insert(url.clone(), Reach::Checking);
             }
             let proxy = proxy.clone();
+            let http = self.net.http.clone();
             let task = cx.background_executor().spawn(async move {
-                match Http::new(&proxy) {
+                match http.get(&proxy) {
                     Ok(http) => remote::check(&http, &provider)
                         .into_iter()
                         .map(|reach| (reach.url, reach.result))
@@ -217,10 +223,11 @@ impl Store {
         cx: &mut Context<Self>,
     ) -> Task<Result<Vec<Model>, NetError>> {
         let proxy = self.proxy();
+        let http = self.net.http.clone();
         let data = self.engine.data().clone();
         let cached = self.net.models_dev();
         let task = cx.background_executor().spawn(async move {
-            let http = Http::new(&proxy)?;
+            let http = http.get(&proxy)?;
             let mut models = remote::list_models(&http, &provider)?;
             // models.dev 下不下来也不要紧，列表照样给。
             let (dev, fresh) = models_dev_or_load(cached, &data, || models_dev::load(&data, &http));
@@ -247,11 +254,12 @@ impl Store {
         cx: &mut Context<Self>,
     ) -> Task<Result<(Vec<Model>, usize), NetError>> {
         let proxy = self.proxy();
+        let http = self.net.http.clone();
         let data = self.engine.data().clone();
         let cached = self.net.models_dev();
         let task = cx.background_executor().spawn(async move {
             let (dev, fresh) = models_dev_or_load(cached, &data, || {
-                models_dev::load(&data, &Http::new(&proxy)?)
+                models_dev::load(&data, &*http.get(&proxy)?)
             });
             let dev = dev?;
             let mut models = provider.models.clone();

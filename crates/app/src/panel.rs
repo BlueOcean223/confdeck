@@ -10,7 +10,8 @@ use rust_i18n::t;
 use crate::data::{Notice, NoticeKind, Store};
 use crate::main_window;
 use crate::picker::{Picker, PickerEvent};
-use crate::quota_view;
+use crate::quota_view::{self, Reading, Shown};
+use crate::readings::Readings;
 use crate::theme::Theme;
 use crate::ui;
 
@@ -97,8 +98,9 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     }
 
     // 选的那家的额度、余额：到点了的查。
-    store.update(cx, |store, cx| store.check_due(cx));
-    let height = base_height(store.read(cx));
+    let readings = store.read(cx).readings.clone();
+    readings.update(cx, |readings, cx| readings.check_due(cx));
+    let height = base_height(store.read(cx), readings.read(cx));
     let origin = point(icon.center().x - px(WIDTH / 2.), icon.bottom() + px(OFFSET));
     // 和 Wails 一样先激活应用再显示面板。不激活的话，应用在后台、主窗口又开着时，
     // gpui 为绕开 Cocoa 的一个问题会立刻收走面板刚拿到的焦点，接着 AppKit 抛异常崩溃。
@@ -185,9 +187,16 @@ fn shown_agents(store: &Store) -> Vec<usize> {
         .collect()
 }
 
+/// 这个 agent 现在选的那家的读数，写在名字下面：关掉的、没查过的不写。
+fn selection<'a>(store: &Store, readings: &'a Readings, agent: usize) -> Option<Reading<'a>> {
+    readings
+        .of(&store.selection_key(agent)?)
+        .filter(|reading| !matches!(reading.shown, Shown::Off | Shown::Unchecked))
+}
+
 /// 一个 agent 那一行的高度：选的那家能查额度、余额时名字下面多一行。
-fn row_height(store: &Store, agent: usize) -> f32 {
-    if store.selection_reading(agent).is_some() {
+fn row_height(store: &Store, readings: &Readings, agent: usize) -> f32 {
+    if selection(store, readings, agent).is_some() {
         ROW_WITH_READING
     } else {
         ROW
@@ -195,20 +204,20 @@ fn row_height(store: &Store, agent: usize) -> f32 {
 }
 
 /// 不开选择器时的面板高度：顶栏、每个 agent 一行、底部一行链接。
-fn base_height(store: &Store) -> f32 {
+fn base_height(store: &Store, readings: &Readings) -> f32 {
     let rows: f32 = shown_agents(store)
         .into_iter()
-        .map(|agent| row_height(store, agent))
+        .map(|agent| row_height(store, readings, agent))
         .sum();
     PADDING * 2. + HEADER + GAP + rows + GAP + LINKS
 }
 
 /// 第 `n` 行底边到窗口顶部的距离。
-fn row_bottom(store: &Store, n: usize) -> f32 {
+fn row_bottom(store: &Store, readings: &Readings, n: usize) -> f32 {
     let rows: f32 = shown_agents(store)
         .into_iter()
         .take(n + 1)
-        .map(|agent| row_height(store, agent))
+        .map(|agent| row_height(store, readings, agent))
         .sum();
     PADDING + HEADER + GAP + rows
 }
@@ -246,9 +255,15 @@ impl Panel {
             // 第一帧画完后形状才确定，再按圆角重算一次阴影。
             window.on_next_frame(|window, _| crate::mac::round_corners(window, 12.));
         }
-        let height = base_height(store.read(cx));
+        let readings = store.read(cx).readings.clone();
+        let height = base_height(store.read(cx), readings.read(cx));
         let _subscriptions = vec![
             cx.observe_in(&store, window, |this, _, window, cx| {
+                this.fit_height(window, cx);
+                cx.notify();
+            }),
+            // 读数查回来，选的那家名字下面多一行或少一行。
+            cx.observe_in(&readings, window, |this, _, window, cx| {
                 this.fit_height(window, cx);
                 cx.notify();
             }),
@@ -281,7 +296,8 @@ impl Panel {
         self.picker = None;
         self.just_closed = None;
         self.status = None;
-        self.height = base_height(self.store.read(cx));
+        let store = self.store.read(cx);
+        self.height = base_height(store, store.readings.read(cx));
         self.focus_handle.focus(window, cx);
         // 跑 drive 脚本时窗口一直透明（`crate::quiet`）。
         #[cfg(target_os = "macos")]
@@ -292,11 +308,12 @@ impl Panel {
     /// 窗口高度跟着内容走：平时刚好装下列表；开着选择器时往下长，刚好装下选择器。
     fn fit_height(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
-        let base = base_height(store);
+        let readings = store.readings.read(cx);
+        let base = base_height(store, readings);
         let height = match &self.picker {
             Some(open) => {
                 let picker = open.picker.read(cx).height(cx);
-                base.max(row_bottom(store, open.row) + 4. + picker + PADDING)
+                base.max(row_bottom(store, readings, open.row) + 4. + picker + PADDING)
             }
             None => base,
         };
@@ -405,10 +422,11 @@ impl Panel {
         let agent = &store.agents[i];
         let open = self.picker.as_ref().is_some_and(|p| p.agent == i);
         let (logos, label) = store.pill(i);
-        let reading = store.selection_reading(i);
+        let readings = store.readings.read(cx);
+        let reading = selection(store, readings, i);
 
         ui::row(t, true, n == 0)
-            .h(px(row_height(store, i)))
+            .h(px(row_height(store, readings, i)))
             .child(ui::logo(agent.logo, 18., t, window, cx))
             .child(
                 div()
@@ -547,7 +565,7 @@ impl Render for Panel {
             deferred(
                 div()
                     .absolute()
-                    .top(px(row_bottom(store, open.row) + 4.))
+                    .top(px(row_bottom(store, store.readings.read(cx), open.row) + 4.))
                     .left(px(8.))
                     .w(px(WIDTH - 16.))
                     .on_mouse_down_out(cx.listener(move |this, _, window, cx| {

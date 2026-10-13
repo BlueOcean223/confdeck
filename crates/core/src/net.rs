@@ -2,10 +2,12 @@
 //! 设置页选的出站代理在这里生效（decisions「功能范围」：默认跟随系统代理，可以单独设置）。
 //! agent 自己发的请求不归这里管，它们照自己的环境变量走。
 //!
-//! 全是阻塞调用，界面放在后台线程上跑。每次操作现建一个客户端（[`Http::new`]）：「跟随系统」时代理是
-//! 建客户端那一刻读的，confdeck 开着的时候在 Clash 里开关系统代理，下一次操作就跟上了。
+//! 全是阻塞调用，界面放在后台线程上跑。客户端几次操作共用一个（[`SharedHttp`]，arch-perf R3）：每个阻塞客户端带一个线程、
+//! 一个运行时和连接池，一次查询建一个太费。代理设置变了才重建；「跟随系统」时每次取用都看一眼系统现在的代理，
+//! confdeck 开着的时候在 Clash 里开关系统代理，下一次操作就跟上了。
 
 use std::io;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -120,7 +122,7 @@ pub enum NetError {
     Parse { detail: String },
 }
 
-/// 一次操作用的客户端，按设置的代理建。
+/// 按设置的代理建的客户端。平时从 [`SharedHttp`] 取；试一个还没存的代理时现建一个。
 pub struct Http {
     client: reqwest::blocking::Client,
     /// 走了代理：连接被拒绝说明是代理没开（Clash 退了、系统代理还指着 7890 是常见情况）。
@@ -239,6 +241,41 @@ impl Http {
                 body: redact(&String::from_utf8_lossy(&body), secrets),
             })
         }
+    }
+}
+
+/// 共用的客户端：代理设置没变（「跟随系统」时系统现在的代理也没变）就一直用这一个，变了重建。可以在几个线程里同时取。
+#[derive(Clone, Default)]
+pub struct SharedHttp(Arc<Mutex<Option<Built>>>);
+
+struct Built {
+    proxy: Proxy,
+    /// 「跟随系统」时建的那一刻系统的代理。
+    system: Option<String>,
+    http: Arc<Http>,
+}
+
+impl SharedHttp {
+    pub fn get(&self, proxy: &Proxy) -> Result<Arc<Http>, NetError> {
+        let system = match proxy.mode {
+            ProxyMode::System => system_proxy(),
+            _ => None,
+        };
+        // 建的时候也拿着锁：几个查询同时取，只建一个。
+        let mut built = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(built) = &*built
+            && built.proxy == *proxy
+            && built.system == system
+        {
+            return Ok(built.http.clone());
+        }
+        let http = Arc::new(Http::new(proxy)?);
+        *built = Some(Built {
+            proxy: proxy.clone(),
+            system,
+            http: http.clone(),
+        });
+        Ok(http)
     }
 }
 
@@ -413,6 +450,47 @@ pub(crate) mod tests {
             url: String::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn the_shared_client_is_rebuilt_only_when_the_proxy_changes() {
+        let shared = SharedHttp::default();
+        let direct = Proxy {
+            mode: ProxyMode::Direct,
+            url: String::new(),
+        };
+        let first = shared.get(&direct).unwrap();
+        assert!(Arc::ptr_eq(&first, &shared.get(&direct).unwrap()));
+        let custom = Proxy {
+            mode: ProxyMode::Custom,
+            url: "127.0.0.1:7890".into(),
+        };
+        let second = shared.get(&custom).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&second, &shared.get(&custom).unwrap()));
+        // 建不了的（地址不对）报错，下次还是试着建。
+        let bad = Proxy {
+            mode: ProxyMode::Custom,
+            url: "ftp://x".into(),
+        };
+        assert!(shared.get(&bad).is_err());
+        assert!(Arc::ptr_eq(&second, &shared.get(&custom).unwrap()));
+    }
+
+    #[test]
+    fn checks_that_start_together_share_one_client() {
+        let shared = SharedHttp::default();
+        let direct = Proxy {
+            mode: ProxyMode::Direct,
+            url: String::new(),
+        };
+        let clients: Vec<Arc<Http>> = std::thread::scope(|scope| {
+            let started: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| shared.get(&direct).unwrap()))
+                .collect();
+            started.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert!(clients.iter().all(|http| Arc::ptr_eq(http, &clients[0])));
     }
 
     #[test]

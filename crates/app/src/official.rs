@@ -9,6 +9,7 @@
 use confdeck_core::account::{self, Live};
 use confdeck_core::agent::AgentKind;
 use confdeck_core::quota::{CheckKey, QuotaError};
+use confdeck_core::readings;
 use confdeck_core::status::AgentStatus;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::*;
@@ -18,6 +19,7 @@ use rust_i18n::t;
 
 use crate::data::{self, Logo, Store};
 use crate::quota_view::{self, Reading, Shown};
+use crate::readings::Readings;
 use crate::theme::Theme;
 use crate::ui::{self, Button};
 
@@ -48,7 +50,7 @@ pub fn logo(store: &Store, agent: usize) -> Logo {
 }
 
 /// 官方那一组里的一个账号。
-pub struct Entry<'a> {
+pub struct Entry {
     /// 账号 ID：存下的，或登录文件里还没存的那个（起名字时存下）。Claude Code 的没有。
     pub id: Option<String>,
     /// 存下了（能删）。
@@ -61,10 +63,11 @@ pub struct Entry<'a> {
     pub live: bool,
     /// 在用：登录文件里是它，而且这个 agent 用着官方登录（文件连的是别处时不算，B2）。打勾、高亮、「在用」都看它。
     pub in_use: bool,
-    pub reading: Option<Reading<'a>>,
+    /// 读数记在哪（`readings.rs`）：登着的是 [`Store::live_target`]，存下的是这个账号。查不了的（Claude 官方）没有读数。
+    pub check: CheckKey,
 }
 
-impl Entry<'_> {
+impl Entry {
     /// 写在界面上的：起了名字写名字，不然写邮箱。
     pub fn title(&self) -> String {
         self.name
@@ -90,7 +93,7 @@ impl Store {
 
     /// 这个 agent 的官方账号：存下的（先存的在前），再加登录文件里还没存的那个。
     /// 存不了多个账号的（不是 macOS 时的 Claude Code）只有登着的那个；Codex 的登录在钥匙串里时一个也没有（认不出）。
-    pub fn official_entries(&self, agent: usize) -> Vec<Entry<'_>> {
+    pub fn official_entries(&self, agent: usize) -> Vec<Entry> {
         let kind = self.agents[agent].kind;
         let official = self.uses_official(agent);
         if kind == AgentKind::ClaudeCode && !account::supported(kind) {
@@ -104,10 +107,10 @@ impl Store {
                     name: None,
                     note: None,
                     email: profile.email.clone(),
-                    plan: self.official_plan(agent),
+                    plan: profile.plan.clone(),
                     live: true,
                     in_use: official,
-                    reading: self.official_reading(kind),
+                    check: self.live_target(kind),
                 })
                 .into_iter()
                 .collect();
@@ -130,11 +133,7 @@ impl Store {
                     plan: account.plan.clone(),
                     live: is_live,
                     in_use: is_live && official,
-                    reading: if is_live {
-                        self.official_reading(kind)
-                    } else {
-                        self.account_reading(kind, &account.id)
-                    },
+                    check: CheckKey::Account(kind, account.id.clone()),
                 }
             })
             .collect();
@@ -148,7 +147,7 @@ impl Store {
                 plan: identity.plan.clone(),
                 live: true,
                 in_use: official,
-                reading: self.official_reading(kind),
+                check: self.live_target(kind),
             });
         }
         entries
@@ -173,12 +172,12 @@ impl Store {
     }
 
     /// 登着的官方账号的套餐：查到的额度里有就用它，没有用账号资料里的。
-    pub fn official_plan(&self, agent: usize) -> Option<String> {
+    pub fn official_plan(&self, readings: &Readings, agent: usize) -> Option<String> {
         let kind = self.agents[agent].kind;
         if let Some(Reading {
             shown: Shown::Quota(found),
             ..
-        }) = self.official_reading(kind)
+        }) = readings.of(&self.live_target(kind))
             && let Some(plan) = &found.plan
         {
             return Some(plan.clone());
@@ -258,8 +257,13 @@ impl Officials {
                 cx.stop_propagation();
             }
         });
+        let readings = store.read(cx).readings.clone();
         Self {
-            _subscriptions: vec![cx.observe(&store, |_, _, cx| cx.notify()), intercept],
+            _subscriptions: vec![
+                cx.observe(&store, |_, _, cx| cx.notify()),
+                cx.observe(&readings, |_, _, cx| cx.notify()),
+                intercept,
+            ],
             store,
             menu: None,
             just_closed: None,
@@ -452,7 +456,8 @@ impl Officials {
                 .child(self.edit_row(editing, t, window, cx))
                 .into_any_element();
         }
-        let reading = store.official_reading(kind);
+        let readings = store.readings.read(cx);
+        let reading = readings.of(&store.live_target(kind));
         let signed_out = matches!(
             reading.as_ref().map(|r| &r.shown),
             Some(Shown::QuotaFailed(QuotaError::NotLoggedIn))
@@ -475,7 +480,7 @@ impl Officials {
             ))
             .child(match &reading {
                 Some(reading) => {
-                    quota_view::cells(t, &format!("official-{agent}"), reading, &self.store)
+                    quota_view::cells(t, &format!("official-{agent}"), reading, &store.readings)
                 }
                 None => quota_view::blank(),
             })
@@ -490,7 +495,7 @@ impl Officials {
                     cx,
                 ))
             })
-            .children(store.official_plan(agent).map(|plan| {
+            .children(store.official_plan(readings, agent).map(|plan| {
                 div()
                     .flex_none()
                     .h(px(22.))
@@ -533,7 +538,9 @@ impl Officials {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let kind = self.store.read(cx).agents[agent].kind;
+        let store = self.store.read(cx);
+        let readings = store.readings.read(cx);
+        let kind = store.agents[agent].kind;
         let key = entry.id.clone().map(|id| (kind, id));
         if let Some(editing) = self.editing_for(key.as_ref()) {
             return ui::row(t, false, false)
@@ -606,9 +613,9 @@ impl Officials {
                 format!("who-{agent}-{n}"),
                 entry.note.clone(),
             ))
-            .child(match &entry.reading {
+            .child(match &readings.of(&entry.check) {
                 Some(reading) => {
-                    quota_view::cells(t, &format!("account-{agent}-{n}"), reading, &self.store)
+                    quota_view::cells(t, &format!("account-{agent}-{n}"), reading, &store.readings)
                 }
                 None => quota_view::blank(),
             })
@@ -680,7 +687,7 @@ impl Officials {
         let remove = key.clone();
         let closed = key.clone();
         let target = CheckKey::Account(key.0, key.1.clone());
-        let checkable = self.store.read(cx).checkable(&target);
+        let checkable = readings::checkable(&target);
         ui::menu(t)
             .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
                 this.menu = None;

@@ -11,10 +11,10 @@
 //! | OpenCode Go | 供应商的 Key | `GET opencode.ai/zen/go/v1/usage` |
 //!
 //! 官方的登录凭证只读不写：访问令牌过期了照样试一次，被拒就报登录过期，等 agent 自己下次运行时换新的。
-//! Codex、Grok Build 也能拿存下的账号（`crate::account`，和登录文件一个格式）查：`codex_login`、`grok_login`。
+//! Codex、Grok Build 拿一份登录查（`codex_login`、`grok_login`）：登录文件里的，或者存下的账号的（`crate::account`，
+//! 和登录文件一个格式）；从哪读在 `crate::readings`。
 //! 自己去换会让 agent 手里的刷新令牌作废。火山方舟的套餐要账号的 AccessKey（不是推理的 Key），ZenMux 要管理 Key，这里不查。
 
-use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -416,16 +416,9 @@ fn parse_opencode_go(body: &Value) -> Result<Quota, QuotaError> {
 
 // ── 官方订阅 ──────────────────────────────────────────
 
-/// Codex 官方：用 `<home>/.codex/auth.json` 里的 ChatGPT 登录查。登录存在钥匙串里（`cli_auth_credentials_store`）的读不到，
-/// 算没登录。
-pub fn codex(http: &Http, home: &Path) -> Result<Quota, QuotaError> {
-    let bytes =
-        std::fs::read(home.join(".codex/auth.json")).map_err(|_| QuotaError::NotLoggedIn)?;
-    codex_login(http, &bytes)
-}
-
-/// 用一份 Codex 登录（`auth.json` 的内容）查：`tokens.access_token`，有 `tokens.account_id` 时带上
-/// `ChatGPT-Account-Id`（同一个人的几个工作区各算各的）。只有 API Key 的不算登录。
+/// Codex 官方：用一份 ChatGPT 登录（`~/.codex/auth.json` 的内容，或存下的账号的；从哪读在 [`crate::readings`]）查：
+/// `tokens.access_token`，有 `tokens.account_id` 时带上 `ChatGPT-Account-Id`（同一个人的几个工作区各算各的）。
+/// 只有 API Key 的不算登录；登录存在钥匙串里（`cli_auth_credentials_store`）的读不到，也算没登录。
 pub fn codex_login(http: &Http, login: &[u8]) -> Result<Quota, QuotaError> {
     let auth: Value = serde_json::from_slice(login).map_err(|_| QuotaError::NotLoggedIn)?;
     if auth["auth_mode"] == "apikey" {
@@ -491,14 +484,8 @@ fn parse_codex(body: &Value) -> Result<Quota, QuotaError> {
     })
 }
 
-/// Grok Build 官方：用 `<home>/.grok/auth.json` 里的登录查。这个文件按登录的范围分条，用 `https://auth.x.ai::` 开头那条，
-/// 没有再用老的 `…/sign-in` 那条。账单只回一个额度窗口：`config.creditUsagePercent` 和 `config.currentPeriod`（类型、结束时间）。
-pub fn grok(http: &Http, home: &Path) -> Result<Quota, QuotaError> {
-    let bytes = std::fs::read(home.join(".grok/auth.json")).map_err(|_| QuotaError::NotLoggedIn)?;
-    grok_login(http, &bytes)
-}
-
-/// 用一份 Grok Build 登录（`auth.json` 的内容）查。
+/// Grok Build 官方：用一份登录（`~/.grok/auth.json` 的内容，或存下的账号的）查。这个文件按登录的范围分条，用 `https://auth.x.ai::`
+/// 开头那条，没有再用老的 `…/sign-in` 那条。账单只回一个额度窗口：`config.creditUsagePercent` 和 `config.currentPeriod`（类型、结束时间）。
 pub fn grok_login(http: &Http, login: &[u8]) -> Result<Quota, QuotaError> {
     let auth: Value = serde_json::from_slice(login).map_err(|_| QuotaError::NotLoggedIn)?;
     let entries = auth.as_object().ok_or(QuotaError::NotLoggedIn)?;

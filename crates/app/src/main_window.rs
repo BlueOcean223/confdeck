@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use confdeck_core::provider::Provider;
 use confdeck_core::quota::CheckKey;
+use confdeck_core::readings;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -198,8 +199,11 @@ pub struct MainWindow {
 impl MainWindow {
     fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         crate::hush(window);
+        let readings = store.read(cx).readings.clone();
         let _subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
+            // 额度、余额查回来只通知画读数的地方（`readings.rs`）。
+            cx.observe(&readings, |_, _, cx| cx.notify()),
             // 写了文件（这个窗口、面板或启动时的后台任务）都从这里收到一句话，做成提示条。
             cx.subscribe(&store, |this, _, notice: &Notice, cx| {
                 this.toast(notice.kind, notice.text.clone(), cx)
@@ -331,7 +335,8 @@ impl MainWindow {
                             this.settings = None;
                             match *tab {
                                 Tab::Providers => {
-                                    this.store.update(cx, |store, cx| store.check_due(cx))
+                                    let readings = this.store.read(cx).readings.clone();
+                                    readings.update(cx, |readings, cx| readings.check_due(cx))
                                 }
                                 Tab::Usage => this.open_usage(cx),
                                 Tab::Sessions => this.open_sessions(window, cx),
@@ -349,11 +354,15 @@ impl MainWindow {
                     ui::spinning(
                         ui::icon("rotate-cw", 16., t.ctl_fg),
                         "refresh-spin",
-                        self.tab == Tab::Providers && self.store.read(cx).checking_any(),
+                        self.tab == Tab::Providers
+                            && self.store.read(cx).readings.read(cx).checking_any(),
                     ),
                 )
                 .on_click(cx.listener(|this, _, _, cx| match this.tab {
-                    Tab::Providers => this.store.update(cx, |store, cx| store.check_all(cx)),
+                    Tab::Providers => {
+                        let readings = this.store.read(cx).readings.clone();
+                        readings.update(cx, |readings, cx| readings.check_all(cx))
+                    }
                     Tab::Usage => this.store.update(cx, |store, cx| store.refresh_usage(cx)),
                     Tab::Sessions => this.store.update(cx, |store, cx| store.refresh_usage(cx)),
                     _ => {}
@@ -689,11 +698,9 @@ impl MainWindow {
 
         // 有额度、余额可写时，名字一列定宽、额度一列紧跟在后面，各行（官方的和各家的）的额度格子上下对齐。
         let officials = store.officials();
-        let meters = !officials.is_empty()
-            || store
-                .providers
-                .iter()
-                .any(|p| store.provider_reading(p).is_some());
+        let readings = store.readings.read(cx);
+        let reading = |provider: &Provider| readings.of(&CheckKey::Provider(provider.id.clone()));
+        let meters = !officials.is_empty() || store.providers.iter().any(|p| reading(p).is_some());
 
         if !officials.is_empty() {
             page = page.child(self.officials.clone());
@@ -760,7 +767,7 @@ impl MainWindow {
             .flex()
             .items_center();
 
-            let reading = store.provider_reading(provider);
+            let reading = reading(provider);
             list = list.child(
                 ui::row(t, false, i == 0)
                     .id(ElementId::named_usize("provider", i))
@@ -791,9 +798,12 @@ impl MainWindow {
                     )
                     .when(meters, |row| {
                         row.child(match &reading {
-                            Some(reading) => {
-                                quota_view::cells(t, &format!("provider-{i}"), reading, &self.store)
-                            }
+                            Some(reading) => quota_view::cells(
+                                t,
+                                &format!("provider-{i}"),
+                                reading,
+                                &store.readings,
+                            ),
                             None => quota_view::blank(),
                         })
                         .child(div().flex_1())
@@ -966,7 +976,7 @@ impl MainWindow {
             return more.into_any_element();
         }
         let target = CheckKey::Provider(provider.id.clone());
-        let checkable = self.store.read(cx).checkable(&target);
+        let checkable = readings::checkable(&target);
         let (edit, remove) = (provider.clone(), provider.clone());
         let name: SharedString = provider.name.clone().into();
         let logo = data::logo(provider);

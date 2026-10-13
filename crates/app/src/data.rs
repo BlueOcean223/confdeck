@@ -311,6 +311,10 @@ pub struct Store {
     pub(crate) usage: crate::usage::UsageState,
     /// 官方账号，见 `accounts.rs`。
     pub(crate) accounts: crate::accounts::AccountState,
+    /// 额度、余额的读数，见 `readings.rs`。单独一个 `Entity`：查回来不通知整个 Store。
+    pub(crate) readings: Entity<crate::readings::Readings>,
+    /// 读数说登录文件换了人（[`crate::readings::LoginChanged`]）：重读。
+    _login_changed: Subscription,
     _quit: Subscription,
 }
 
@@ -323,6 +327,14 @@ impl Store {
         account::clean_stale_logins(&data);
         let engine = Arc::new(Engine::new(data));
         let snapshot = status::snapshot(&engine, &home);
+        let net = crate::net::NetState::default();
+        let reader = crate::readings::reader(home.clone(), engine.data().clone());
+        let http = net.http.clone();
+        let readings = cx.new(|_| crate::readings::Readings::new(reader, http));
+        let login_changed = cx.subscribe(
+            &readings,
+            |store, _, _: &crate::readings::LoginChanged, cx| store.reload(cx),
+        );
         let mut store = Self {
             engine,
             home,
@@ -335,15 +347,18 @@ impl Store {
             generation: 0,
             queue: Default::default(),
             after_snapshot: Vec::new(),
-            net: Default::default(),
+            net,
             usage: Default::default(),
             accounts: Default::default(),
+            readings,
+            _login_changed: login_changed,
             _quit: cx.on_app_quit(|store, _| {
                 store.abandon_logins();
                 async {}
             }),
         };
         store.apply_snapshot(snapshot, 0);
+        store.plan_readings(cx);
         store
     }
 
@@ -433,6 +448,7 @@ impl Store {
     /// 换上读好的快照，做排着等它的事（[`Self::reload_then`]），通知。
     fn settle(&mut self, snapshot: status::Snapshot, edits: u64, cx: &mut Context<Self>) {
         self.apply_snapshot(snapshot, edits);
+        self.plan_readings(cx);
         for then in std::mem::take(&mut self.after_snapshot) {
             then(self, cx);
         }

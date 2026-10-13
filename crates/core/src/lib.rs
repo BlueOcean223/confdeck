@@ -44,6 +44,7 @@ pub mod program;
 pub mod provider;
 pub mod query;
 pub mod quota;
+pub mod readings;
 pub mod remote;
 pub mod session;
 pub mod status;

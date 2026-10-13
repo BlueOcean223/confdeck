@@ -11,9 +11,9 @@
 //!   查询关着时这一行变淡、箭头藏起来，卡片高矮不变（不然「保存」会挪位置）。
 
 use confdeck_core::balance::{Balance, BalanceError, Currency};
-use confdeck_core::net::Http;
 use confdeck_core::query::{self, Query, Template};
 use confdeck_core::quota::{Check, CheckKey};
+use confdeck_core::readings;
 use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -129,7 +129,12 @@ impl CheckSheet {
                 cx.stop_propagation();
             }
         });
-        let mut subscriptions = vec![cx.observe(&store, |_, _, cx| cx.notify()), intercept];
+        let readings = store.read(cx).readings.clone();
+        let mut subscriptions = vec![
+            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe(&readings, |_, _, cx| cx.notify()),
+            intercept,
+        ];
         let form = match &target {
             CheckKey::Provider(id) => {
                 let provider = store
@@ -139,7 +144,7 @@ impl CheckSheet {
                     .find(|p| &p.id == id)
                     .cloned();
                 provider.map(|provider| {
-                    let built_in = store.read(cx).built_in(&provider);
+                    let built_in = readings::built_in(&provider);
                     let root = query::root(&provider).unwrap_or_default();
                     Self::form(
                         check.query.clone(),
@@ -318,10 +323,8 @@ impl CheckSheet {
         }
         if !self.changed(cx) {
             let target = self.target.clone();
-            if !self.store.read(cx).checking_target(&target) {
-                self.store
-                    .update(cx, |store, cx| store.check_one(&target, cx));
-            }
+            let readings = self.store.read(cx).readings.clone();
+            readings.update(cx, |readings, cx| readings.check_one(&target, cx));
             return;
         }
         if matches!(self.trial, Some(Trial::Running)) {
@@ -345,9 +348,10 @@ impl CheckSheet {
             return;
         }
         let proxy = self.store.read(cx).proxy();
+        let http = self.store.read(cx).net.http.clone();
         self.trial = Some(Trial::Running);
         let task = cx.background_executor().spawn(async move {
-            Http::new(&proxy)
+            http.get(&proxy)
                 .map_err(BalanceError::Net)
                 .and_then(|http| query::run(&http, &provider, &query))
         });
@@ -690,14 +694,17 @@ impl Render for CheckSheet {
                 None => (div(), false),
             }
         } else {
-            let store = self.store.read(cx);
-            let meters = match store.reading_of(&self.target) {
+            let readings = self.store.read(cx).readings.read(cx);
+            let meters = match readings.of(&self.target) {
                 Some(reading) if !matches!(reading.shown, Shown::Off) => {
                     quota_view::meters(&t, "check-now", &reading.shown)
                 }
                 _ => div(),
             };
-            (meters, store.checking_target(&self.target))
+            let checking = readings
+                .of(&self.target)
+                .is_some_and(|reading| reading.checking);
+            (meters, checking)
         };
         let complete = self.query(cx).is_none_or(|q| q.complete());
         let now = div()
