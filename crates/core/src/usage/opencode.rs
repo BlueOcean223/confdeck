@@ -85,7 +85,7 @@ fn scan_db(db: &mut Db, path: &Path) -> Result<Option<usize>, UsageError> {
         offset: 0,
         state: watermark.to_string(),
     };
-    db.commit(&key, &row, &requests, None, None).map(Some)
+    db.commit(&key, &row, &requests, None).map(Some)
 }
 
 /// `since` 之后改过的消息里的请求，和下次从哪儿读起。

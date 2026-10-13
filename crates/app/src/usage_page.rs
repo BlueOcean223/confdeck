@@ -294,7 +294,7 @@ impl Render for UsagePage {
         }
         let store = self.store.read(cx);
         page = page
-            .children(quotas(&t, store, loaded.as_deref(), window, cx))
+            .children(quotas(&t, store, window, cx))
             .children(balances(&t, store, window, cx));
         let (Some(loaded), Some(summary)) = (loaded.as_ref(), summary) else {
             return page.child(skeleton(&t));
@@ -484,21 +484,11 @@ fn card_grid(cards: Vec<Div>, per_row: usize) -> Option<Div> {
 /// 额度卡：Claude、Codex、Grok Build 官方（装了的；没有官方登录的不画），再是能查套餐额度的供应商。
 /// 照 magpie 的 `.subscription-card`：每个窗口一格，格里是窗口名和用了多少、进度条、多久后重置。
 /// 卡片两张一排、窗口三格一排（最多三个窗口），同一排的卡片一样高，出错的卡不会空出一大块。
-fn quotas(
-    t: &Theme,
-    store: &Store,
-    loaded: Option<&Loaded>,
-    window: &Window,
-    cx: &App,
-) -> Option<Div> {
+fn quotas(t: &Theme, store: &Store, window: &Window, cx: &App) -> Option<Div> {
     let mut cards = Vec::new();
     for agent in store.agents.iter().filter(|a| a.installed) {
         let state = match agent.kind {
-            AgentKind::Codex => match loaded.and_then(|l| l.codex.as_ref()) {
-                Some(found) => Some(Ok(found)),
-                None => continue,
-            },
-            AgentKind::ClaudeCode | AgentKind::GrokBuild => {
+            AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::GrokBuild => {
                 match store.usage.quotas.get(&QuotaOf::Agent(agent.kind)) {
                     Some(Err(QuotaError::NotLoggedIn)) => continue,
                     Some(result) => Some(result.as_ref()),

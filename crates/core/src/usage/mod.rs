@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use crate::agent::AgentKind;
 
-pub use db::{Db, Limit};
+pub use db::Db;
 pub use scan::{Report, scan};
 
 #[derive(Debug, thiserror::Error)]

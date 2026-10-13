@@ -8,7 +8,6 @@
 //!   `token_count`），所以按文件做差就够了，键用文件名 + 行的位置（归档挪了目录、文件名不变）。
 //!   有了 `token_usage_record` 的文件不再看 `token_count`，它们记的是同一批。
 //! - `input_tokens` 含缓存读写，`output_tokens` 含推理。
-//! - `token_count` 还带官方订阅的 `rate_limits`，存成 `codex` 的额度快照。
 //! - 会话概况：`session_meta` 的 `id`、`cwd`、`timestamp`；第一句提问是 `response_item` 里第一条 `role: user` 的消息里
 //!   不是 Codex 自己插的那段（`<environment_context>` 这类 `<` 开头的、`# AGENTS.md` 开头的）。
 //!   子代理（`session_meta.thread_source == "subagent"`）不是会话。
@@ -19,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::scan::{Parsed, Parser, is_jsonl, walk};
-use super::{Limit, Request, SessionPatch, Tokens, clean_model, parse_time, prompt_text};
+use super::{Request, SessionPatch, Tokens, clean_model, parse_time, prompt_text};
 use crate::agent::AgentKind;
 
 pub(super) fn files(home: &Path) -> Vec<PathBuf> {
@@ -37,7 +36,6 @@ pub(super) fn open(path: &Path, state: &str) -> Box<dyn Parser> {
             .unwrap_or_default(),
         state: serde_json::from_str(state).unwrap_or_default(),
         requests: Vec::new(),
-        limit: None,
         session: SessionPatch::default(),
     })
 }
@@ -115,7 +113,6 @@ struct Codex {
     file: String,
     state: State,
     requests: Vec<Request>,
-    limit: Option<Limit>,
     session: SessionPatch,
 }
 
@@ -159,14 +156,6 @@ impl Codex {
     }
 
     fn token_count(&mut self, offset: u64, at: i64, payload: &Value) {
-        if let Some(limits) = payload.get("rate_limits").filter(|v| v.is_object())
-            && self.limit.as_ref().is_none_or(|limit| at > limit.at)
-        {
-            self.limit = Some(Limit {
-                at,
-                data: limits.clone(),
-            });
-        }
         if self.state.records {
             return;
         }
@@ -306,7 +295,6 @@ impl Parser for Codex {
         Parsed {
             requests: self.requests,
             state: serde_json::to_string(&self.state).unwrap_or_default(),
-            limit: self.limit.map(|limit| ("codex", limit)),
             session: (!self.state.subagent).then_some(self.session),
         }
     }
@@ -352,9 +340,6 @@ mod tests {
                 reasoning: 0
             }
         );
-        let (source, limit) = parsed.limit.unwrap();
-        assert_eq!(source, "codex");
-        assert_eq!(limit.data["plan_type"], "plus");
 
         // 下次接着读：线程、模型、累计值都还在。
         let mut parser = open("/y/rollout-a.jsonl".as_ref(), &parsed.state);
@@ -391,7 +376,5 @@ mod tests {
         assert_eq!(request.at, 1789528824844);
         assert_eq!(request.tokens.input, 25074 - 18176);
         assert_eq!(request.tokens.reasoning, 52);
-        // 额度照样从 token_count 拿。
-        assert!(parsed.limit.is_some());
     }
 }

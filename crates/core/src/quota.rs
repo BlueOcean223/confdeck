@@ -4,7 +4,7 @@
 //! | 哪个 | 凭证 | 怎么查 |
 //! | --- | --- | --- |
 //! | Claude 官方 | Claude Code 的登录：macOS 钥匙串 `Claude Code-credentials`，没有再读 `~/.claude/.credentials.json` | `GET api.anthropic.com/api/oauth/usage` |
-//! | Codex 官方 | 不用凭证 | 会话记录里最新的 `rate_limits`（[`crate::usage`] 扫的时候存下），不联网 |
+//! | Codex 官方 | `~/.codex/auth.json` 的 ChatGPT 登录 | `GET chatgpt.com/backend-api/wham/usage` |
 //! | Grok Build 官方 | `~/.grok/auth.json` | `GET cli-chat-proxy.grok.com/v1/billing?format=credits` |
 //! | Kimi For Coding | 供应商的 Key | `GET api.kimi.com/coding/v1/usages`（海外 `api.kimi.ai`） |
 //! | 智谱 / Z.AI Coding Plan | 供应商的 Key（不加 `Bearer`） | `GET open.bigmodel.cn/api/monitor/usage/quota/limit`（海外 `api.z.ai`） |
@@ -12,6 +12,7 @@
 //! | OpenCode Go | 供应商的 Key | `GET opencode.ai/zen/go/v1/usage` |
 //!
 //! 官方的登录凭证只读不写：访问令牌过期了照样试一次，被拒就报登录过期，等 agent 自己下次运行时换新的。
+//! Codex、Grok Build 也能拿存下的账号（`crate::account`，和登录文件一个格式）查：`codex_login`、`grok_login`。
 //! 自己去换会让 agent 手里的刷新令牌作废。火山方舟的套餐要账号的 AccessKey（不是推理的 Key），ZenMux 要管理 Key，这里不查。
 
 use std::path::Path;
@@ -21,7 +22,6 @@ use serde_json::Value;
 
 use crate::net::{Http, NetError};
 use crate::provider::{self, Provider};
-use crate::usage::Limit;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -358,48 +358,79 @@ fn parse_opencode_go(body: &Value) -> Result<Quota, QuotaError> {
 
 // ── 官方订阅 ──────────────────────────────────────────
 
-/// Codex 官方：会话记录里最新的 `rate_limits`。`primary`、`secondary` 各带 `used_percent`、`window_minutes`、
-/// `resets_at`（秒；老版本是相对记录时间的 `resets_in_seconds`）。记下以后已经重置过的窗口算 0、不写重置时间。
-pub fn codex(limit: &Limit, now: i64) -> Quota {
-    let data = &limit.data;
-    let windows = ["primary", "secondary"]
+/// Codex 官方：用 `<home>/.codex/auth.json` 里的 ChatGPT 登录查。登录存在钥匙串里（`cli_auth_credentials_store`）的读不到，
+/// 算没登录。
+pub fn codex(http: &Http, home: &Path) -> Result<Quota, QuotaError> {
+    let bytes =
+        std::fs::read(home.join(".codex/auth.json")).map_err(|_| QuotaError::NotLoggedIn)?;
+    codex_login(http, &bytes)
+}
+
+/// 用一份 Codex 登录（`auth.json` 的内容）查：`tokens.access_token`，有 `tokens.account_id` 时带上
+/// `ChatGPT-Account-Id`（同一个人的几个工作区各算各的）。只有 API Key 的不算登录。
+pub fn codex_login(http: &Http, login: &[u8]) -> Result<Quota, QuotaError> {
+    let auth: Value = serde_json::from_slice(login).map_err(|_| QuotaError::NotLoggedIn)?;
+    if auth["auth_mode"] == "apikey" {
+        return Err(QuotaError::NotLoggedIn);
+    }
+    let tokens = &auth["tokens"];
+    let token = tokens["access_token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .ok_or(QuotaError::NotLoggedIn)?;
+    let bearer = format!("Bearer {token}");
+    let mut headers = vec![
+        ("Authorization", bearer.as_str()),
+        ("Accept", "application/json"),
+    ];
+    if let Some(account) = tokens["account_id"].as_str().filter(|id| !id.is_empty()) {
+        headers.push(("ChatGPT-Account-Id", account));
+    }
+    let bytes = http
+        .get(
+            "https://chatgpt.com/backend-api/wham/usage",
+            &headers,
+            TIMEOUT,
+            &[token],
+        )
+        .map_err(|err| match err {
+            NetError::Status {
+                status: 401 | 403, ..
+            } => QuotaError::Expired,
+            err => QuotaError::Net(err),
+        })?;
+    parse_codex(&json(&bytes)?)
+}
+
+/// Codex 的用量：`rate_limit` 下 `primary_window`、`secondary_window` 各一个窗口，`used_percent`、`limit_window_seconds`
+/// （18000 是 5 小时、604800 是每周、2592000 是免费账号的 30 天）、`reset_at`（秒）；`plan_type` 是套餐。
+fn parse_codex(body: &Value) -> Result<Quota, QuotaError> {
+    let limit = &body["rate_limit"];
+    if !limit.is_object() && !body["plan_type"].is_string() {
+        return Err(unknown(body));
+    }
+    let windows = ["primary_window", "secondary_window"]
         .iter()
         .filter_map(|key| {
-            let window = data.get(*key).filter(|w| w.is_object())?;
-            let used = number(&window["used_percent"])?;
-            let resets_at = window["resets_at"]
-                .as_i64()
-                .map(|secs| secs * 1000)
-                .or_else(|| {
-                    window["resets_in_seconds"]
-                        .as_i64()
-                        .map(|secs| limit.at + secs * 1000)
-                });
-            let span = match window["window_minutes"].as_u64() {
-                Some(300) => Span::FiveHours,
-                Some(10080) => Span::Week,
-                Some(43200) => Span::Month,
-                Some(minutes) => Span::Minutes(minutes as u32),
+            let window = limit.get(*key).filter(|w| w.is_object())?;
+            let span = match window["limit_window_seconds"].as_u64() {
+                Some(18_000) => Span::FiveHours,
+                Some(604_800) => Span::Week,
+                Some(2_592_000) => Span::Month,
+                Some(seconds) => Span::Minutes((seconds / 60) as u32),
                 None => Span::Period,
             };
-            Some(match resets_at {
-                Some(at) if at <= now => Window {
-                    span,
-                    used: 0.,
-                    resets_at: None,
-                },
-                _ => Window {
-                    span,
-                    used,
-                    resets_at,
-                },
+            Some(Window {
+                span,
+                used: number(&window["used_percent"])?,
+                resets_at: time(&window["reset_at"]),
             })
         })
         .collect();
-    Quota {
-        plan: data["plan_type"].as_str().map(str::to_string),
+    Ok(Quota {
+        plan: body["plan_type"].as_str().map(str::to_string),
         windows,
-    }
+    })
 }
 
 /// Claude 官方：用 Claude Code 的登录查。`keychain` 时先读 macOS 钥匙串，没有再读 `<home>/.claude/.credentials.json`；
@@ -586,9 +617,13 @@ fn parse_claude(body: &Value) -> Result<Quota, QuotaError> {
 /// Grok Build 官方：用 `<home>/.grok/auth.json` 里的登录查。这个文件按登录的范围分条，用 `https://auth.x.ai::` 开头那条，
 /// 没有再用老的 `…/sign-in` 那条。账单只回一个额度窗口：`config.creditUsagePercent` 和 `config.currentPeriod`（类型、结束时间）。
 pub fn grok(http: &Http, home: &Path) -> Result<Quota, QuotaError> {
-    let text = std::fs::read_to_string(home.join(".grok/auth.json"))
-        .map_err(|_| QuotaError::NotLoggedIn)?;
-    let auth: Value = serde_json::from_str(&text).map_err(|_| QuotaError::NotLoggedIn)?;
+    let bytes = std::fs::read(home.join(".grok/auth.json")).map_err(|_| QuotaError::NotLoggedIn)?;
+    grok_login(http, &bytes)
+}
+
+/// 用一份 Grok Build 登录（`auth.json` 的内容）查。
+pub fn grok_login(http: &Http, login: &[u8]) -> Result<Quota, QuotaError> {
+    let auth: Value = serde_json::from_slice(login).map_err(|_| QuotaError::NotLoggedIn)?;
     let entries = auth.as_object().ok_or(QuotaError::NotLoggedIn)?;
     let usable = |entry: &Value| entry["key"].as_str().is_some_and(|k| !k.is_empty());
     let entry = entries
@@ -690,11 +725,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Plan, QuotaError, Span, Window, codex, keychain_user, parse_claude, parse_grok, parse_kimi,
-        parse_minimax, parse_opencode_go, parse_zhipu, plan_of,
+        Plan, QuotaError, Span, Window, keychain_user, parse_claude, parse_codex, parse_grok,
+        parse_kimi, parse_minimax, parse_opencode_go, parse_zhipu, plan_of,
     };
     use crate::provider::{Protocol, Provider};
-    use crate::usage::Limit;
 
     fn provider(url: &str, key: &str, preset: Option<&str>) -> Provider {
         Provider {
@@ -814,25 +848,34 @@ mod tests {
     }
 
     #[test]
-    fn codex_windows_that_reset_since_count_as_unused() {
-        let limit = Limit {
-            at: 1_000_000,
-            data: json!({"plan_type": "pro",
-                "primary": {"used_percent": 30.0, "window_minutes": 300, "resets_at": 1_500},
-                "secondary": {"used_percent": 12.0, "window_minutes": 10080, "resets_at": 9_000}}),
-        };
-        let quota = codex(&limit, 2_000_000);
+    fn codex_names_windows_by_length() {
+        let body = json!({"plan_type": "pro",
+            "rate_limit": {"allowed": true, "limit_reached": false,
+                "primary_window": {"used_percent": 30, "limit_window_seconds": 18000, "reset_at": 1_791_468_000},
+                "secondary_window": {"used_percent": 12.5, "limit_window_seconds": 604800, "reset_after_seconds": 3600}},
+            "credits": {"has_credits": false, "unlimited": false, "balance": "0"}});
+        let quota = parse_codex(&body).unwrap();
         assert_eq!(quota.plan.as_deref(), Some("pro"));
         assert_eq!(
-            quota.windows[0],
-            Window {
-                span: Span::FiveHours,
-                used: 0.,
-                resets_at: None
-            }
+            quota.windows,
+            [
+                Window {
+                    span: Span::FiveHours,
+                    used: 30.,
+                    resets_at: Some(1_791_468_000_000)
+                },
+                Window {
+                    span: Span::Week,
+                    used: 12.5,
+                    resets_at: None
+                }
+            ]
         );
-        assert_eq!(quota.windows[1].used, 12.);
-        assert_eq!(quota.windows[1].resets_at, Some(9_000_000));
+        // 免费账号只有一个 30 天的窗口；没有 `rate_limit` 的是别的回答。
+        let free = json!({"plan_type": "free", "rate_limit": {"primary_window":
+            {"used_percent": 4, "limit_window_seconds": 2592000}, "secondary_window": null}});
+        assert_eq!(parse_codex(&free).unwrap().windows[0].span, Span::Month);
+        assert!(parse_codex(&json!({"detail": "Unauthorized"})).is_err());
     }
 
     #[test]

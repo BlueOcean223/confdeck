@@ -30,13 +30,6 @@ pub(super) struct FileRow {
     pub state: String,
 }
 
-/// 订阅额度的快照：什么时候记的、原样的 JSON。
-#[derive(Debug, Clone, PartialEq)]
-pub struct Limit {
-    pub at: i64,
-    pub data: serde_json::Value,
-}
-
 impl Db {
     pub fn open(path: &Path) -> Result<Self, UsageError> {
         if let Some(dir) = path.parent() {
@@ -99,11 +92,7 @@ impl Db {
                      cost REAL
                  ) WITHOUT ROWID;
                  CREATE INDEX IF NOT EXISTS requests_at ON requests (at);
-                 CREATE TABLE IF NOT EXISTS limits (
-                     source TEXT PRIMARY KEY,
-                     at INTEGER NOT NULL,
-                     data TEXT NOT NULL
-                 );
+                 DROP TABLE IF EXISTS limits;
                  CREATE TABLE IF NOT EXISTS sessions (
                      path TEXT PRIMARY KEY,
                      agent TEXT NOT NULL,
@@ -139,14 +128,12 @@ impl Db {
             .map_err(db_error(&self.path))
     }
 
-    /// 一个文件扫完：新请求（已有的跳过）、扫到哪、额度快照（比存着的新才换）、会话概况（agent、更新、文件的修改时间）
-    /// 一起提交。返回新加了几条。
+    /// 一个文件扫完：新请求（已有的跳过）、扫到哪、会话概况（agent、更新、文件的修改时间）一起提交。返回新加了几条。
     pub(super) fn commit(
         &mut self,
         path: &str,
         file: &FileRow,
         requests: &[Request],
-        limit: Option<(&str, &Limit)>,
         session: Option<(AgentKind, &SessionPatch, i64)>,
     ) -> Result<usize, UsageError> {
         let db_path = self.path.clone();
@@ -185,15 +172,6 @@ impl Db {
             params![path, file.size as i64, file.mtime, file.offset as i64, file.state],
         )
         .map_err(db_error(&db_path))?;
-        if let Some((source, limit)) = limit {
-            tx.execute(
-                "INSERT INTO limits (source, at, data) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (source) DO UPDATE SET at = excluded.at, data = excluded.data
-                 WHERE excluded.at > limits.at",
-                params![source, limit.at, limit.data.to_string()],
-            )
-            .map_err(db_error(&db_path))?;
-        }
         if let Some((agent, patch, active)) = session {
             tx.execute(
                 "INSERT INTO sessions (path, agent, id, cwd, prompt, name, title, started, active)
@@ -310,24 +288,6 @@ impl Db {
         }
         Ok(requests)
     }
-
-    /// 这个来源最新的额度快照。
-    pub fn limit(&self, source: &str) -> Result<Option<Limit>, UsageError> {
-        let row: Option<(i64, String)> = self
-            .conn
-            .query_row(
-                "SELECT at, data FROM limits WHERE source = ?1",
-                [source],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(db_error(&self.path))?;
-        Ok(row.and_then(|(at, data)| {
-            serde_json::from_str(&data)
-                .ok()
-                .map(|data| Limit { at, data })
-        }))
-    }
 }
 
 fn db_error(path: &Path) -> impl Fn(rusqlite::Error) -> UsageError + '_ {
@@ -339,9 +299,7 @@ fn db_error(path: &Path) -> impl Fn(rusqlite::Error) -> UsageError + '_ {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
-    use super::{Db, FileRow, Limit};
+    use super::{Db, FileRow};
     use crate::agent::AgentKind;
     use crate::usage::{Request, Tokens};
 
@@ -377,19 +335,11 @@ mod tests {
     fn requests_are_kept_once_and_read_back_in_order() {
         let mut db = Db::in_memory();
         let added = db
-            .commit(
-                "a",
-                &row(10),
-                &[request("k2", 20), request("k1", 10)],
-                None,
-                None,
-            )
+            .commit("a", &row(10), &[request("k2", 20), request("k1", 10)], None)
             .unwrap();
         assert_eq!(added, 2);
         // 同一次请求在另一个文件里又出现（resume、fork 复制了历史）：不再加。
-        let added = db
-            .commit("b", &row(5), &[request("k1", 10)], None, None)
-            .unwrap();
+        let added = db.commit("b", &row(5), &[request("k1", 10)], None).unwrap();
         assert_eq!(added, 0);
 
         let all = db.requests(None).unwrap();
@@ -397,24 +347,5 @@ mod tests {
         assert_eq!(db.requests(Some(15)).unwrap(), vec![request("k2", 20)]);
         assert_eq!(db.file("a").unwrap(), Some(row(10)));
         assert_eq!(db.file("c").unwrap(), None);
-    }
-
-    #[test]
-    fn only_newer_limits_replace_the_stored_one() {
-        let mut db = Db::in_memory();
-        let newer = Limit {
-            at: 20,
-            data: json!({"plan": "plus"}),
-        };
-        let older = Limit {
-            at: 10,
-            data: json!({"plan": "free"}),
-        };
-        db.commit("a", &row(1), &[], Some(("codex", &newer)), None)
-            .unwrap();
-        db.commit("b", &row(1), &[], Some(("codex", &older)), None)
-            .unwrap();
-        assert_eq!(db.limit("codex").unwrap(), Some(newer));
-        assert_eq!(db.limit("claude").unwrap(), None);
     }
 }

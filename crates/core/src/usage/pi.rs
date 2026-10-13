@@ -200,7 +200,6 @@ impl Parser for Pi {
                 String::new()
             },
             session: Some(self.patch),
-            ..Parsed::default()
         }
     }
 }

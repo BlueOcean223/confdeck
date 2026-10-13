@@ -194,7 +194,6 @@ impl Parser for Grok {
                 String::new()
             },
             session: (!self.skip).then_some(self.patch),
-            ..Parsed::default()
         }
     }
 }

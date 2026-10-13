@@ -5,7 +5,7 @@
 //! - 会话页的会话列表也从这里来：扫的时候顺带记下的（core 的 `session`），文件已经不在的不要。
 //! - 价格用 models.dev 时只读磁盘上的缓存，不联网（供应商页拉列表、补全时会下）。
 //! - 余额（core 的 `balance`）和订阅额度（core 的 `quota`）：能查的每家一个后台任务，同时查；5 分钟内不重查，
-//!   点刷新按钮才重查。重查时先留着上次的数，查回来再换。Codex 官方的额度不联网，扫会话记录时一起读出来（`Loaded::codex`）。
+//!   点刷新按钮才重查。重查时先留着上次的数，查回来再换。
 //! - Claude 官方的登录在钥匙串里：只在家目录是真的时读（debug 构建用 `CONFDECK_HOME` 指到别处时不读）。
 
 use std::collections::HashMap;
@@ -40,7 +40,7 @@ pub struct UsageState {
     pub balances: HashMap<String, Result<Balance, BalanceError>>,
     /// 正在查余额的供应商 ID。
     pub checking: Vec<String>,
-    /// Claude、Grok Build 官方和各家套餐的额度。还在查、没查过的没有。
+    /// Claude、Codex、Grok Build 官方和各家套餐的额度。还在查、没查过的没有。
     pub quotas: HashMap<QuotaOf, Result<Quota, QuotaError>>,
     pub quota_checking: Vec<QuotaOf>,
     /// 上次查余额和额度的时候。
@@ -50,7 +50,7 @@ pub struct UsageState {
 /// 谁的额度。
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum QuotaOf {
-    /// 官方订阅（Claude Code、Grok Build 的登录）。
+    /// 官方订阅（Claude Code、Codex、Grok Build 的登录）。
     Agent(AgentKind),
     /// 套餐（供应商 ID）。
     Provider(String),
@@ -69,8 +69,6 @@ pub struct Loaded {
     pub heatmap: Heatmap,
     /// 供应商 ID → 名字：现在的，删了的从切换记录里找。
     pub names: HashMap<String, String>,
-    /// Codex 官方的额度：会话记录里最新的 `rate_limits`。没用过官方登录是 `None`。
-    pub codex: Option<Quota>,
     /// 全部会话，最近活动的在前。
     pub sessions: Vec<Session>,
 }
@@ -104,7 +102,6 @@ impl Store {
             confdeck_core::usage::scan(&home, &mut db);
             let requests = db.requests(None)?;
             let switches = history::load(&data)?;
-            let codex = db.limit("codex")?;
             let mut sessions = db.sessions()?;
             sessions.retain(|session| session.path.exists());
             let pricing = Pricing {
@@ -118,7 +115,6 @@ impl Store {
                 .map(|period| summary::summarize(&requests, &pricing, *period, &now))
                 .collect();
             let heatmap = summary::heatmap(&requests, &pricing, &now);
-            let codex = codex.map(|limit| quota::codex(&limit, now.timestamp_millis()));
             let names = summaries
                 .iter()
                 .flat_map(|summary| &summary.sources)
@@ -132,7 +128,6 @@ impl Store {
                     summaries,
                     heatmap,
                     names,
-                    codex,
                     sessions,
                 },
                 dev,
@@ -159,7 +154,7 @@ impl Store {
         .detach();
     }
 
-    /// 联网查的那些：余额、Claude 和 Grok Build 官方的额度、套餐额度。
+    /// 联网查的那些：余额、官方订阅的额度、套餐额度。
     pub(crate) fn refresh_remote(&mut self, force: bool, cx: &mut Context<Self>) {
         let fresh = self
             .usage
@@ -217,6 +212,10 @@ impl Store {
                 AgentKind::ClaudeCode => jobs.push((
                     QuotaOf::Agent(agent.kind),
                     Box::new(move |http| quota::claude(http, &home, keychain)),
+                )),
+                AgentKind::Codex => jobs.push((
+                    QuotaOf::Agent(agent.kind),
+                    Box::new(move |http| quota::codex(http, &home)),
                 )),
                 AgentKind::GrokBuild => jobs.push((
                     QuotaOf::Agent(agent.kind),

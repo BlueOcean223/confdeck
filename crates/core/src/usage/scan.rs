@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use super::db::FileRow;
-use super::{Db, Limit, Request, SessionPatch, UsageError, claude, codex, grok, opencode, pi};
+use super::{Db, Request, SessionPatch, UsageError, claude, codex, grok, opencode, pi};
 use crate::agent::AgentKind;
 
 /// 一次扫描的结果。
@@ -22,7 +22,7 @@ pub struct Report {
     pub errors: Vec<String>,
 }
 
-/// 一个文件的解析器：一行一行喂进去，最后交出请求、要接着用的状态和额度快照。
+/// 一个文件的解析器：一行一行喂进去，最后交出请求、要接着用的状态和会话概况。
 pub(super) trait Parser {
     /// `offset` 是这一行在文件里的起点。
     fn line(&mut self, offset: u64, line: &str);
@@ -34,8 +34,6 @@ pub(super) struct Parsed {
     pub requests: Vec<Request>,
     /// 下次接着读时交回给解析器的状态（各家自己定格式，空串是没有）。
     pub state: String,
-    /// 额度快照：来源和内容。
-    pub limit: Option<(&'static str, Limit)>,
     /// 会话概况的更新；不是会话（子代理）的是 `None`。
     pub session: Option<SessionPatch>,
 }
@@ -129,17 +127,12 @@ fn scan_file(db: &mut Db, source: &Source, path: &Path) -> Result<Option<usize>,
         offset: end,
         state: parsed.state,
     };
-    let limit = parsed
-        .limit
-        .as_ref()
-        .map(|(source, limit)| (*source, limit));
     // 最后活动时间用文件的修改时间，不用一行一行去解析时间。
     let session = parsed
         .session
         .as_ref()
         .map(|patch| (source.agent, patch, mtime / 1_000_000));
-    db.commit(&key, &row, &parsed.requests, limit, session)
-        .map(Some)
+    db.commit(&key, &row, &parsed.requests, session).map(Some)
 }
 
 /// 从 `offset` 起逐个读整行（不带换行符），交给 `line`；最后一行还没写完（没有换行符）的不读。

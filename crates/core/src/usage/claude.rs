@@ -188,7 +188,6 @@ impl Parser for Claude {
                 String::new()
             },
             session: self.session,
-            ..Parsed::default()
         }
     }
 }
