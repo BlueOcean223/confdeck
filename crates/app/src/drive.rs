@@ -224,7 +224,7 @@ fn run(cmd: &str, arg: &str, target: Target, shots: &Path, cx: &mut App) -> anyh
         // 屏幕锁着、窗口被挡住时 macOS 停掉了 display link，GPUI 不再画新帧，命中区域就停在旧的一帧上。
         // 开了 shots 特性就每条命令后自己画一帧，脚本在锁屏时也能跑。
         #[cfg(feature = "shots")]
-        window.draw(cx).clear(cx);
+        frame(window, cx);
         Ok(())
     })?
 }
@@ -269,15 +269,22 @@ fn click(position: Point<Pixels>, window: &mut Window, cx: &mut App) {
     );
 }
 
-/// 按窗口编号截图：只截这个窗口，被别的窗口挡住也照样截得到。
+/// 自己画一帧。和真的一帧一样，先跑排到下一帧的回调：动画靠它通知 view 重画，
+/// 页面区是缓存的（`main_window::PageView`），不通知就一直是动画第一帧的样子。
+#[cfg(feature = "shots")]
+fn frame(window: &mut Window, cx: &mut App) {
+    window.simulate_next_frame(cx);
+    window.draw(cx).clear(cx);
+}
+
 /// 截图。开了 `shots` 特性就让 GPUI 把刚画好的那一帧渲染成图片（不碰屏幕，不要屏幕录制权限）；
 /// 不然在 macOS 上用 `screencapture` 按窗口编号截。
 #[cfg(feature = "shots")]
 fn shot(window: &mut Window, cx: &mut App, path: &Path) -> anyhow::Result<()> {
     // 画两帧，中间等一下：淡入之类的动画从第一次画它开始计时，第二帧才是动画结束的样子。
-    window.draw(cx).clear(cx);
+    frame(window, cx);
     std::thread::sleep(Duration::from_millis(400));
-    window.draw(cx).clear(cx);
+    frame(window, cx);
     let image = window.render_to_image()?;
     image.save(path)?;
     Ok(())

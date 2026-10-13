@@ -3,13 +3,12 @@
 //! 数据在 `Store` 里（`usage.rs`），这里只管画和选时间段。
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use chrono::{Datelike as _, Duration, Local, NaiveDate, TimeZone as _};
 use confdeck_core::preset;
 use confdeck_core::usage::Tokens;
-use confdeck_core::usage::summary::{
-    HEATMAP_WEEKS, Heatmap, Period, Source, Step, Summary, Totals,
-};
+use confdeck_core::usage::summary::{HEATMAP_WEEKS, Period, Source, Step, Summary, Totals};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -54,6 +53,23 @@ enum Metric {
 
 const METRICS: [Metric; 3] = [Metric::Tokens, Metric::Requests, Metric::Cost];
 
+impl Metric {
+    fn of(self, day: &Totals) -> f64 {
+        match self {
+            Metric::Tokens => day.tokens.in_out() as f64,
+            Metric::Requests => day.requests as f64,
+            Metric::Cost => day.cost,
+        }
+    }
+}
+
+/// 热力图每天的深浅（[`levels`]），每份汇总、每种指标算一次。
+struct HeatLevels {
+    loaded: Arc<Loaded>,
+    metric: Metric,
+    levels: Vec<usize>,
+}
+
 pub struct UsagePage {
     store: Entity<Store>,
     period: Period,
@@ -66,6 +82,7 @@ pub struct UsagePage {
     metric: Metric,
     metric_from: Option<(usize, u64)>,
     clicks: u64,
+    heat: Option<HeatLevels>,
     _subscription: Subscription,
 }
 
@@ -84,6 +101,7 @@ impl UsagePage {
             metric: Metric::Tokens,
             metric_from: None,
             clicks: 0,
+            heat: None,
             _subscription,
         }
     }
@@ -132,12 +150,36 @@ impl UsagePage {
         cx.notify();
     }
 
+    /// 热力图每天的深浅：换了汇总或指标才重算。
+    fn heat_levels(&mut self, loaded: &Arc<Loaded>) -> &[usize] {
+        let metric = self.metric;
+        let fresh = self
+            .heat
+            .as_ref()
+            .is_some_and(|heat| Arc::ptr_eq(&heat.loaded, loaded) && heat.metric == metric);
+        if !fresh {
+            let values: Vec<f64> = loaded
+                .heatmap
+                .days
+                .iter()
+                .map(|day| metric.of(day))
+                .collect();
+            let level = levels(&values);
+            self.heat = Some(HeatLevels {
+                loaded: loaded.clone(),
+                metric,
+                levels: values.into_iter().map(level).collect(),
+            });
+        }
+        self.heat.as_ref().map_or(&[], |heat| &heat.levels)
+    }
+
     /// 「全部」的图表：柱状图或热力图，左上角切换。别的时间段只有柱状图。
     fn chart(
-        &self,
+        &mut self,
         t: &Theme,
         summary: &Summary,
-        map: &Heatmap,
+        loaded: &Arc<Loaded>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -172,6 +214,7 @@ impl UsagePage {
                     window,
                     cx.listener(|this, metric: &Metric, _, cx| this.set_metric(*metric, cx)),
                 ));
+                let cell = heat_cell(window);
                 chart_card(t)
                     .pb(px(12.))
                     .child(
@@ -183,7 +226,7 @@ impl UsagePage {
                             .child(div().flex_1())
                             .child(pick),
                     )
-                    .child(heat_grid(t, map, self.metric, heat_cell(window)))
+                    .child(heat_grid(t, loaded, self.heat_levels(loaded), cell))
             }
         }
     }
@@ -308,7 +351,7 @@ impl Render for UsagePage {
                 ),
             );
         }
-        let chart = self.chart(&t, summary, &loaded.heatmap, window, cx);
+        let chart = self.chart(&t, summary, loaded, window, cx);
         let groups = self.group_head(&t, window, cx);
         let store = self.store.read(cx);
         page.child(stats(&t, &summary.total))
@@ -505,11 +548,10 @@ fn chart(t: &Theme, summary: &Summary, switch: Option<AnyElement>) -> Div {
             .justify_end()
             .rounded_t(px(3.))
             .hover(move |s| s.bg(hover))
-            .tooltip(ui::tooltip(bar_tip(
-                summary.step,
-                bucket.start,
-                &bucket.totals,
-            )))
+            .tooltip({
+                let (step, start, totals) = (summary.step, bucket.start, bucket.totals.clone());
+                ui::tooltip_with(move || bar_tip(step, start, &totals).into())
+            })
             .when(output > px(0.), |d| {
                 d.child(div().h(output).flex_none().rounded_t(px(3.)).bg(t.accent))
             })
@@ -605,14 +647,9 @@ fn heat_cell(window: &Window) -> f32 {
     ((inner - HEAT_LABEL - weeks * HEAT_GAP) / weeks).clamp(6., HEAT_CELL_MAX)
 }
 
-/// 热力图：一列一周，周一在上；每天的深浅按 `metric` 在有用量的那些天里排第几个四分位（magpie 的 `sessLevels`）。
-fn heat_grid(t: &Theme, map: &Heatmap, metric: Metric, cell: f32) -> Div {
-    let value = |day: &Totals| match metric {
-        Metric::Tokens => day.tokens.in_out() as f64,
-        Metric::Requests => day.requests as f64,
-        Metric::Cost => day.cost,
-    };
-    let level = levels(&map.days.iter().map(value).collect::<Vec<_>>());
+/// 热力图：一列一周，周一在上；每天的深浅（`levels`）按选的指标在有用量的那些天里排第几个四分位（magpie 的 `sessLevels`）。
+fn heat_grid(t: &Theme, loaded: &Arc<Loaded>, levels: &[usize], cell: f32) -> Div {
+    let map = &loaded.heatmap;
     let colors = [
         t.pill,
         t.pill.blend(t.accent.opacity(0.22)),
@@ -674,14 +711,17 @@ fn heat_grid(t: &Theme, map: &Heatmap, metric: Metric, cell: f32) -> Div {
             .children((0..weeks).map(|week| {
                 let i = week * 7 + weekday;
                 let cell = div().flex_1().min_w_0().h(px(cell));
-                let Some(totals) = map.days.get(i) else {
+                let Some(&level) = levels.get(i) else {
                     return cell.into_any_element();
                 };
                 let day = map.first + Duration::days(i as i64);
+                let loaded = loaded.clone();
                 cell.id(ElementId::named_usize("heat", i))
                     .rounded(px(3.))
-                    .bg(colors[level(value(totals))])
-                    .tooltip(ui::tooltip(totals_tip(day_label(day, zh), totals)))
+                    .bg(colors[level])
+                    .tooltip(ui::tooltip_with(move || {
+                        totals_tip(day_label(day, zh), &loaded.heatmap.days[i]).into()
+                    }))
                     .into_any_element()
             }))
     });
@@ -984,10 +1024,10 @@ fn stat_list<'a>(
                         .mx(px(6.))
                         .rounded(px(2.))
                         .bg(t.pill)
-                        .tooltip(ui::tooltip(t!(
-                            "usage.share",
-                            percent = (share * 100.).round() as u64
-                        )))
+                        .tooltip({
+                            let percent = (share * 100.).round() as u64;
+                            ui::tooltip_with(move || t!("usage.share", percent = percent).into())
+                        })
                         .child(
                             div()
                                 .h_full()

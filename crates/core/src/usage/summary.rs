@@ -285,50 +285,6 @@ pub struct Summary {
     pub models: Vec<(String, Totals)>,
 }
 
-/// 汇总 `requests` 里落在 `period` 的部分。`now` 定「今天」和时区。
-pub fn summarize<Tz: TimeZone>(
-    requests: &[Request],
-    context: &Context,
-    period: Period,
-    now: &DateTime<Tz>,
-) -> Summary {
-    let since = period.since(now).unwrap_or(i64::MIN);
-    let requests: Vec<&Request> = requests.iter().filter(|r| r.at >= since).collect();
-    let (step, buckets) = buckets(&requests, period, now);
-    let mut summary = Summary {
-        buckets,
-        step,
-        ..Summary::default()
-    };
-    let mut prices = Prices::new();
-    let mut sources: HashMap<Source, Totals> = HashMap::new();
-    let mut agents: HashMap<AgentKind, Totals> = HashMap::new();
-    let mut models: HashMap<String, Totals> = HashMap::new();
-    for request in requests {
-        let source = context.source(request);
-        let cost = context.cost(&mut prices, &source, request);
-        let tokens = &request.tokens;
-        summary.total.add(tokens, cost);
-        let index = summary
-            .buckets
-            .partition_point(|bucket| bucket.start <= request.at)
-            .saturating_sub(1);
-        if let Some(bucket) = summary.buckets.get_mut(index) {
-            bucket.totals.add(tokens, cost);
-        }
-        sources.entry(source).or_default().add(tokens, cost);
-        agents.entry(request.agent).or_default().add(tokens, cost);
-        models
-            .entry(request.model.clone())
-            .or_default()
-            .add(tokens, cost);
-    }
-    summary.sources = ranked(sources);
-    summary.agents = ranked(agents);
-    summary.models = ranked(models);
-    summary
-}
-
 /// 热力图有多少周。
 pub const HEATMAP_WEEKS: i64 = 53;
 
@@ -341,30 +297,154 @@ pub struct Heatmap {
     pub days: Vec<Totals>,
 }
 
-/// 按天汇总最近 [`HEATMAP_WEEKS`] 周的请求。`now` 定「今天」和时区。
-pub fn heatmap<Tz: TimeZone>(
+/// 用量页要的汇总：每个时间段一份，加上热力图。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Overview {
+    /// 和传进来的时间段一一对应。
+    pub summaries: Vec<Summary>,
+    pub heatmap: Heatmap,
+}
+
+/// 汇总 `requests` 里落在各个 `periods` 的部分，再按天汇总最近 [`HEATMAP_WEEKS`] 周。`now` 定「今天」和时区。
+/// 一遍算完：每个请求只认一次供应商、算一次花费。`requests` 按时间先后排（[`super::Db::requests`] 就是）。
+pub fn overview<Tz: TimeZone>(
     requests: &[Request],
     context: &Context,
+    periods: &[Period],
     now: &DateTime<Tz>,
-) -> Heatmap {
-    let zone = now.timezone();
-    let today = now.date_naive();
-    let back = i64::from(today.weekday().num_days_from_monday()) + 7 * (HEATMAP_WEEKS - 1);
-    let first = today - Duration::days(back);
-    let starts: Vec<i64> = first
-        .iter_days()
-        .take_while(|day| *day <= today)
-        .map(|day| start_of(&zone, day))
+) -> Overview {
+    let mut tallies: Vec<Tally> = periods
+        .iter()
+        .map(|period| Tally::new(requests.first(), *period, now))
         .collect();
-    let mut days = vec![Totals::default(); starts.len()];
+    let mut days = Days::new(now);
+    let since = tallies
+        .iter()
+        .map(|tally| tally.since)
+        .fold(days.since(), i64::min);
     let mut prices = Prices::new();
-    for request in requests.iter().filter(|r| r.at >= starts[0]) {
-        let index = starts.partition_point(|start| *start <= request.at) - 1;
+    for request in requests.iter().filter(|r| r.at >= since) {
         let source = context.source(request);
         let cost = context.cost(&mut prices, &source, request);
-        days[index].add(&request.tokens, cost);
+        for tally in &mut tallies {
+            tally.add(request, &source, cost);
+        }
+        days.add(request, cost);
     }
-    Heatmap { first, days }
+    Overview {
+        summaries: tallies.into_iter().map(Tally::finish).collect(),
+        heatmap: days.finish(),
+    }
+}
+
+/// 一个时间段的汇总，边加边算。
+struct Tally {
+    since: i64,
+    summary: Summary,
+    sources: HashMap<Source, Totals>,
+    agents: HashMap<AgentKind, Totals>,
+    models: HashMap<String, Totals>,
+}
+
+impl Tally {
+    /// `earliest` 是最早的一条请求（「全部」的柱子从那天起）。
+    fn new<Tz: TimeZone>(earliest: Option<&Request>, period: Period, now: &DateTime<Tz>) -> Self {
+        let (step, buckets) = buckets(earliest, period, now);
+        Self {
+            since: period.since(now).unwrap_or(i64::MIN),
+            summary: Summary {
+                buckets,
+                step,
+                ..Summary::default()
+            },
+            sources: HashMap::new(),
+            agents: HashMap::new(),
+            models: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, request: &Request, source: &Source, cost: Option<f64>) {
+        if request.at < self.since {
+            return;
+        }
+        let tokens = &request.tokens;
+        self.summary.total.add(tokens, cost);
+        let index = self
+            .summary
+            .buckets
+            .partition_point(|bucket| bucket.start <= request.at)
+            .saturating_sub(1);
+        if let Some(bucket) = self.summary.buckets.get_mut(index) {
+            bucket.totals.add(tokens, cost);
+        }
+        self.sources
+            .entry(source.clone())
+            .or_default()
+            .add(tokens, cost);
+        self.agents
+            .entry(request.agent)
+            .or_default()
+            .add(tokens, cost);
+        self.models
+            .entry(request.model.clone())
+            .or_default()
+            .add(tokens, cost);
+    }
+
+    fn finish(self) -> Summary {
+        Summary {
+            sources: ranked(self.sources),
+            agents: ranked(self.agents),
+            models: ranked(self.models),
+            ..self.summary
+        }
+    }
+}
+
+/// 热力图，边加边算。
+struct Days {
+    first: NaiveDate,
+    /// 每天零点（毫秒）。
+    starts: Vec<i64>,
+    days: Vec<Totals>,
+}
+
+impl Days {
+    fn new<Tz: TimeZone>(now: &DateTime<Tz>) -> Self {
+        let zone = now.timezone();
+        let today = now.date_naive();
+        let back = i64::from(today.weekday().num_days_from_monday()) + 7 * (HEATMAP_WEEKS - 1);
+        let first = today - Duration::days(back);
+        let starts: Vec<i64> = first
+            .iter_days()
+            .take_while(|day| *day <= today)
+            .map(|day| start_of(&zone, day))
+            .collect();
+        Self {
+            first,
+            days: vec![Totals::default(); starts.len()],
+            starts,
+        }
+    }
+
+    fn since(&self) -> i64 {
+        self.starts[0]
+    }
+
+    fn add(&mut self, request: &Request, cost: Option<f64>) {
+        if request.at < self.since() {
+            return;
+        }
+        let index = self.starts.partition_point(|start| *start <= request.at) - 1;
+        self.days[index].add(&request.tokens, cost);
+    }
+
+    fn finish(self) -> Heatmap {
+        Heatmap {
+            first: self.first,
+            days: self.days,
+        }
+    }
 }
 
 fn ranked<K: Ord>(groups: HashMap<K, Totals>) -> Vec<(K, Totals)> {
@@ -379,8 +459,9 @@ fn ranked<K: Ord>(groups: HashMap<K, Totals>) -> Vec<(K, Totals)> {
     groups
 }
 
+/// 柱子的起点。`earliest` 是最早的一条请求（「全部」从那天画起）。
 fn buckets<Tz: TimeZone>(
-    requests: &[&Request],
+    earliest: Option<&Request>,
     period: Period,
     now: &DateTime<Tz>,
 ) -> (Step, Vec<Bucket>) {
@@ -397,9 +478,7 @@ fn buckets<Tz: TimeZone>(
     }
     let first = match period.since(now) {
         Some(since) => zone.timestamp_millis_opt(since).earliest(),
-        None => requests
-            .first()
-            .and_then(|r| zone.timestamp_millis_opt(r.at).earliest()),
+        None => earliest.and_then(|r| zone.timestamp_millis_opt(r.at).earliest()),
     }
     .map_or(today, |time| time.date_naive())
     .min(today);
@@ -420,11 +499,22 @@ fn buckets<Tz: TimeZone>(
 mod tests {
     use chrono::{FixedOffset, TimeZone};
 
-    use super::{Context, Period, Source, Step, heatmap, summarize};
+    use super::{Context, Period, Source, Step, Summary, overview};
     use crate::agent::AgentKind;
     use crate::provider::{Cost, Model, Provider};
     use crate::usage::history::{Switch, Target};
     use crate::usage::{Request, Tokens};
+
+    fn summarize(
+        requests: &[Request],
+        context: &Context,
+        period: Period,
+        now: &chrono::DateTime<FixedOffset>,
+    ) -> Summary {
+        overview(requests, context, &[period], now)
+            .summaries
+            .remove(0)
+    }
 
     fn request(agent: AgentKind, at: i64, model: &str, provider: Option<&str>) -> Request {
         Request {
@@ -587,12 +677,76 @@ mod tests {
             0,
             request(AgentKind::Codex, today - 400 * 24 * hour, "gpt-6", None),
         );
-        let map = heatmap(&old, &context, &now);
+        let map = overview(&old, &context, &[Period::Today], &now).heatmap;
         assert_eq!(map.first, now.date_naive() - chrono::Duration::days(52 * 7));
         assert_eq!(map.days.len(), 52 * 7 + 1);
         assert_eq!(map.days[364].requests, 3);
         assert_eq!(map.days[364].cost, 2.5);
         assert_eq!(map.days[363].requests, 1);
         assert_eq!(map.days.iter().map(|d| d.requests).sum::<u64>(), 5);
+    }
+
+    /// 一遍算几个时间段，和一个一个算的一样；热力图不受时间段影响。
+    #[test]
+    fn periods_together_are_each_period_alone() {
+        let providers = [provider("ds", "deepseek-v4", Some(2.))];
+        let history = [Switch {
+            at: 0,
+            agent: AgentKind::ClaudeCode,
+            to: Target::Provider {
+                id: "ds".into(),
+                name: "DS".into(),
+            },
+        }];
+        let context = Context {
+            providers: &providers,
+            history: &history,
+            dev: None,
+        };
+        let zone = FixedOffset::east_opt(8 * 3600).unwrap();
+        let now = zone.with_ymd_and_hms(2026, 10, 14, 15, 0, 0).unwrap();
+        let day = 24 * 3_600_000;
+        let today = zone
+            .with_ymd_and_hms(2026, 10, 14, 0, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let models = ["deepseek-v4", "claude-opus-5-5", "mystery"];
+        let mut requests: Vec<Request> = [500, 200, 40, 20, 6, 3, 1, 0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, back)| {
+                request(
+                    AgentKind::ClaudeCode,
+                    today - back * day + i as i64 * 3_600_000,
+                    models[i % 3],
+                    None,
+                )
+            })
+            .collect();
+        requests[3].cost = Some(0.25);
+
+        let periods = [Period::Today, Period::Week, Period::Month, Period::All];
+        let together = overview(&requests, &context, &periods, &now);
+        for (period, summary) in periods.iter().zip(&together.summaries) {
+            assert_eq!(
+                *summary,
+                summarize(&requests, &context, *period, &now),
+                "{period:?}"
+            );
+        }
+        assert_eq!(together.summaries[3].total.requests, 8);
+        assert_eq!(together.summaries[2].total.requests, 5);
+        // 只要今天的时候，一年以内的也照样进热力图。
+        let today_only = overview(&requests, &context, &[Period::Today], &now);
+        assert_eq!(today_only.heatmap, together.heatmap);
+        assert_eq!(
+            together
+                .heatmap
+                .days
+                .iter()
+                .map(|d| d.requests)
+                .sum::<u64>(),
+            7
+        );
     }
 }

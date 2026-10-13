@@ -22,6 +22,7 @@ mod quota_view;
 mod readings;
 mod sessions_page;
 mod settings_page;
+mod spin;
 mod theme;
 mod tray;
 mod ui;

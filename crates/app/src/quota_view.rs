@@ -12,6 +12,7 @@ use rust_i18n::t;
 
 use crate::errors::Describe as _;
 use crate::readings::Readings;
+use crate::spin;
 use crate::theme::Theme;
 use crate::ui;
 
@@ -98,7 +99,7 @@ pub fn meters(t: &Theme, id: &str, shown: &Shown) -> Div {
     }
 }
 
-/// 圆形箭头：点了重查这一个，查着的时候转。
+/// 圆形箭头：点了重查这一个，查着的时候转（转的箭头画在 `spin.rs` 那一层，这里只占位）。
 fn refresh(t: &Theme, id: &str, reading: &Reading, readings: &Entity<Readings>) -> Stateful<Div> {
     let readings = readings.clone();
     let target = reading.of.clone();
@@ -121,11 +122,11 @@ fn refresh(t: &Theme, id: &str, reading: &Reading, readings: &Entity<Readings>) 
                 readings.update(cx, |readings, cx| readings.check_one(&target, cx));
             }
         })
-        .child(ui::spinning(
-            ui::icon("rotate-cw", 13., t.muted),
-            ElementId::Name(format!("check-spin-{id}").into()),
-            checking,
-        ))
+        .child(if checking {
+            spin::marker(spin::Group::Page, "rotate-cw", 13., t.muted).into_any_element()
+        } else {
+            ui::icon("rotate-cw", 13., t.muted).into_any_element()
+        })
 }
 
 /// 没有额度可写的行：空出 [`COLUMN`] 那么宽，右边的东西和别的行对齐。

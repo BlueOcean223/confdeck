@@ -1,6 +1,7 @@
 //! 会话页：各 agent 的本地会话，最近活动的在前；能搜、按 agent 筛，点开看对话，复制恢复命令。
 //! 会话列表和用量一起扫（`Store::refresh_usage`，`Loaded::sessions`），点开一个会话时才在后台读那个文件（core 的 `session::messages`）。
 //! 返回列表、点开别的会话时，没读完的那次读取就停掉，读回来的结果也只给读的那个会话。
+//! 搜索：每份会话列表把要搜的几样转好小写存一份，筛出来的结果按搜索词和 agent 留着，画的时候不再一个个转。
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use crate::data::{Logo, Notice, NoticeKind, Store};
 use crate::errors::Describe as _;
 use crate::theme::Theme;
 use crate::ui;
+use crate::usage::Loaded;
 
 /// 列表一次多画多少条（「再显示」一次加这么多）。
 const PAGE: usize = 50;
@@ -35,14 +37,29 @@ pub struct SessionsPage {
     /// 列表画到第几条。
     shown: usize,
     open: Option<Opened>,
+    search_cache: Option<Searched>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// 一份会话列表的搜索：每个会话要搜的几样（[`haystack`]），和上一次按什么（搜索词、agent）筛出来的下标。
+struct Searched {
+    loaded: Arc<Loaded>,
+    haystacks: Vec<String>,
+    key: Option<(String, Option<AgentKind>)>,
+    hits: Vec<usize>,
+}
+
+/// 读回来的一条消息，画的时候不再拷贝文字。工具那行的家目录在读回来时就换成 `~`。
+struct Line {
+    role: Role,
+    text: SharedString,
 }
 
 /// 点开的会话。返回列表、换一个会话时整个丢掉：在读的任务跟着丢，后台的读取看到 `stop` 就停。
 struct Opened {
     session: Session,
     /// 还在读是 `None`。
-    messages: Option<Result<Vec<Message>, String>>,
+    messages: Option<Result<Vec<Line>, String>>,
     /// 对话从倒数第几条画起。
     shown: usize,
     _reading: Task<()>,
@@ -77,6 +94,7 @@ impl SessionsPage {
             clicks: 0,
             shown: PAGE,
             open: None,
+            search_cache: None,
             _subscriptions,
         }
     }
@@ -107,9 +125,12 @@ impl SessionsPage {
         let stop = Arc::new(AtomicBool::new(false));
         let reading = session.clone();
         let flag = stop.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { session::messages(&reading, &flag).map_err(|err| err.describe()) });
+        let home = self.store.read(cx).home.to_string_lossy().into_owned();
+        let task = cx.background_executor().spawn(async move {
+            session::messages(&reading, &flag)
+                .map(|messages| lines(messages, &home))
+                .map_err(|err| err.describe())
+        });
         let (agent, id) = (session.agent, session.id.clone());
         let waiting = cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -149,10 +170,11 @@ impl SessionsPage {
     fn list(
         &mut self,
         t: &Theme,
-        sessions: &[Session],
+        loaded: &Arc<Loaded>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
+        let sessions = &loaded.sessions;
         let query = self.search.read(cx).value().trim().to_lowercase();
         let present: HashSet<AgentKind> = sessions.iter().map(|s| s.agent).collect();
         let mut agents: Vec<Option<AgentKind>> = vec![None];
@@ -172,19 +194,16 @@ impl SessionsPage {
                 (*agent, name)
             })
             .collect();
-        let matches: Vec<&Session> = sessions
-            .iter()
-            .filter(|s| self.agent.is_none_or(|agent| s.agent == agent))
-            .filter(|s| query.is_empty() || matches(s, &query))
-            .collect();
-        let total = matches.len();
+        let shown = self.shown;
+        let hits = Searched::hits(&mut self.search_cache, loaded, (query, self.agent));
+        let total = hits.len();
+        let hits: Vec<usize> = hits.iter().take(shown).copied().collect();
         let home = self.store.read(cx).home.to_string_lossy().into_owned();
         let now = Local::now().timestamp_millis();
-        let rows: Vec<AnyElement> = matches
+        let rows: Vec<AnyElement> = hits
             .iter()
-            .take(self.shown)
             .enumerate()
-            .map(|(i, s)| self.row(t, i, s, &home, now, window, cx))
+            .map(|(i, &n)| self.row(t, i, &sessions[n], &home, now, window, cx))
             .collect();
         let agents_for_click = agents.clone();
         let head = div()
@@ -440,7 +459,7 @@ impl SessionsPage {
                     .px(px(16.))
                     .py(px(14.))
                     .children(earlier)
-                    .children(conversation(t, &messages[skip..], &home))
+                    .children(conversation(t, &messages[skip..]))
                     .into_any_element()
             }
         };
@@ -469,7 +488,7 @@ impl Render for SessionsPage {
             return page;
         }
         match loaded {
-            Some(loaded) => self.list(&t, &loaded.sessions, window, cx),
+            Some(loaded) => self.list(&t, &loaded, window, cx),
             // 第一次扫完之前：灰条。
             None => div()
                 .v_flex()
@@ -496,18 +515,28 @@ fn card(t: &Theme) -> Div {
         .rounded(px(12.))
 }
 
+/// 读回来的消息转成画的时候用的：工具那行的家目录写成 `~`。
+fn lines(messages: Vec<Message>, home: &str) -> Vec<Line> {
+    messages
+        .into_iter()
+        .map(|m| Line {
+            role: m.role,
+            text: if m.role == Role::Tool && !home.is_empty() {
+                m.text.replace(home, "~").into()
+            } else {
+                m.text.into()
+            },
+        })
+        .collect()
+}
+
 /// 对话：提问是灰底的块，回答是正文，连着的几次工具调用并成一组小字。
-fn conversation(t: &Theme, messages: &[Message], home: &str) -> Vec<AnyElement> {
+fn conversation(t: &Theme, messages: &[Line]) -> Vec<AnyElement> {
     let mut out = Vec::new();
     let mut tools: Vec<AnyElement> = Vec::new();
     for m in messages {
         if m.role == Role::Tool {
-            let text = if home.is_empty() {
-                m.text.clone()
-            } else {
-                m.text.replace(home, "~")
-            };
-            tools.push(tool_line(t, text));
+            tools.push(tool_line(t, m.text.clone()));
             continue;
         }
         if !tools.is_empty() {
@@ -533,7 +562,7 @@ fn conversation(t: &Theme, messages: &[Message], home: &str) -> Vec<AnyElement> 
     out
 }
 
-fn tool_line(t: &Theme, text: String) -> AnyElement {
+fn tool_line(t: &Theme, text: SharedString) -> AnyElement {
     div()
         .h_flex()
         .items_center()
@@ -546,7 +575,7 @@ fn tool_line(t: &Theme, text: String) -> AnyElement {
         .into_any_element()
 }
 
-fn message(t: &Theme, m: &Message) -> AnyElement {
+fn message(t: &Theme, m: &Line) -> AnyElement {
     match m.role {
         Role::User => div()
             .px(px(12.))
@@ -566,8 +595,48 @@ fn message(t: &Theme, m: &Message) -> AnyElement {
     }
 }
 
-/// 搜：名字、第一句提问、目录、会话 ID 里有没有（不分大小写）。
-fn matches(s: &Session, query: &str) -> bool {
+impl Searched {
+    /// 筛出来的会话（`loaded.sessions` 的下标）：会话列表、搜索词、agent 有一样变了才重筛，结果留在 `cache` 里。
+    fn hits<'a>(
+        cache: &'a mut Option<Searched>,
+        loaded: &Arc<Loaded>,
+        key: (String, Option<AgentKind>),
+    ) -> &'a [usize] {
+        let searched = match cache.take() {
+            Some(searched) if Arc::ptr_eq(&searched.loaded, loaded) => searched,
+            _ => Searched::new(loaded.clone()),
+        };
+        let searched = if searched.key.as_ref() == Some(&key) {
+            searched
+        } else {
+            searched.filter(key)
+        };
+        &cache.insert(searched).hits
+    }
+
+    fn new(loaded: Arc<Loaded>) -> Self {
+        Self {
+            haystacks: loaded.sessions.iter().map(haystack).collect(),
+            loaded,
+            key: None,
+            hits: Vec::new(),
+        }
+    }
+
+    fn filter(mut self, key: (String, Option<AgentKind>)) -> Self {
+        let (query, agent) = &key;
+        let sessions = &self.loaded.sessions;
+        self.hits = (0..sessions.len())
+            .filter(|&n| agent.is_none_or(|agent| sessions[n].agent == agent))
+            .filter(|&n| query.is_empty() || self.haystacks[n].contains(query.as_str()))
+            .collect();
+        self.key = Some(key);
+        self
+    }
+}
+
+/// 搜的是这几样：名字、第一句提问、目录、会话 ID（转成小写，一行一样，搜索词跨不过两样）。
+fn haystack(s: &Session) -> String {
     [
         Some(s.label()),
         s.prompt.clone(),
@@ -576,7 +645,9 @@ fn matches(s: &Session, query: &str) -> bool {
     ]
     .into_iter()
     .flatten()
-    .any(|text| text.to_lowercase().contains(query))
+    .map(|text| text.to_lowercase())
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 fn agent_logo(store: &Entity<Store>, kind: AgentKind, cx: &App) -> Logo {
@@ -665,4 +736,85 @@ fn time_text(at: i64) -> String {
         date_text(at)
     };
     format!("{date} {clock}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use confdeck_core::agent::AgentKind;
+    use confdeck_core::session::Session;
+
+    use super::Searched;
+    use crate::usage::Loaded;
+
+    fn session(agent: AgentKind, id: &str, prompt: &str, cwd: &str) -> Session {
+        Session {
+            agent,
+            id: id.into(),
+            path: PathBuf::from(format!("/s/{id}.jsonl")),
+            cwd: Some(cwd.into()),
+            prompt: Some(prompt.into()),
+            name: None,
+            title: None,
+            started: None,
+            active: 0,
+        }
+    }
+
+    fn hits(
+        cache: &mut Option<Searched>,
+        loaded: &Arc<Loaded>,
+        query: &str,
+        agent: Option<AgentKind>,
+    ) -> Vec<usize> {
+        Searched::hits(cache, loaded, (query.to_lowercase(), agent)).to_vec()
+    }
+
+    /// 名字、提问、目录、ID 都能搜，不分大小写；按 agent 筛；搜索词跨不过两样。
+    #[test]
+    fn sessions_are_found_by_any_of_their_texts() {
+        let loaded = Arc::new(Loaded::of_sessions(vec![
+            session(AgentKind::ClaudeCode, "a1", "Fix the Build", "/w/app"),
+            session(AgentKind::Codex, "b2", "write docs", "/w/site"),
+            session(AgentKind::ClaudeCode, "c3", "refactor", "/w/core"),
+        ]));
+        let cache = &mut None;
+        assert_eq!(hits(cache, &loaded, "", None), [0, 1, 2]);
+        assert_eq!(hits(cache, &loaded, "BUILD", None), [0]);
+        assert_eq!(
+            hits(cache, &loaded, "/w/", Some(AgentKind::ClaudeCode)),
+            [0, 2]
+        );
+        assert_eq!(hits(cache, &loaded, "b2", None), [1]);
+        // 提问的末尾和目录的开头连不成一个词。
+        assert!(hits(cache, &loaded, "build/w", None).is_empty());
+    }
+
+    /// 留着的结果只在会话列表、搜索词、agent 都没变时用。
+    #[test]
+    fn the_search_is_redone_when_anything_changes() {
+        let both = Arc::new(Loaded::of_sessions(vec![
+            session(AgentKind::ClaudeCode, "a1", "fix", "/w/app"),
+            session(AgentKind::Codex, "b2", "docs", "/w/site"),
+        ]));
+        let cache = &mut None;
+        assert_eq!(hits(cache, &both, "", None), [0, 1]);
+        assert_eq!(hits(cache, &both, "", None), [0, 1]);
+        assert_eq!(hits(cache, &both, "", Some(AgentKind::Codex)), [1]);
+        assert_eq!(
+            hits(cache, &both, "fix", Some(AgentKind::Codex)),
+            [] as [usize; 0]
+        );
+        // 换了一份会话列表，搜索词和 agent 一样也重筛。
+        let codex = Arc::new(Loaded::of_sessions(vec![session(
+            AgentKind::Codex,
+            "b2",
+            "docs",
+            "/w/site",
+        )]));
+        assert_eq!(hits(cache, &both, "", Some(AgentKind::Codex)), [1]);
+        assert_eq!(hits(cache, &codex, "", Some(AgentKind::Codex)), [0]);
+    }
 }

@@ -21,6 +21,7 @@ use crate::picker::{Picker, PickerEvent};
 use crate::quota_view;
 use crate::sessions_page::SessionsPage;
 use crate::settings_page::SettingsPage;
+use crate::spin::{self, SpinLayer};
 use crate::theme::Theme;
 use crate::ui;
 use crate::usage_page::UsagePage;
@@ -167,6 +168,21 @@ struct Toast {
 /// 成功提示多久后消失。
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
 
+/// 顶栏下面的页面：单独一个 view，按缓存画（`AnyView::cached`，大小跟着窗口）。顶栏和转圈的箭头（`spin.rs`）每帧重画时，
+/// 页面没变就沿用上一帧。页面还是 [`MainWindow::page`] 画的，`MainWindow` 一通知（`observe_self`）这里就重画。
+struct PageView {
+    main: WeakEntity<MainWindow>,
+}
+
+impl Render for PageView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        spin::clear(spin::Group::Page, window, cx);
+        self.main
+            .update(cx, |main, cx| main.page(window, cx))
+            .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
 pub struct MainWindow {
     store: Entity<Store>,
     tab: Tab,
@@ -191,6 +207,8 @@ pub struct MainWindow {
     tab_anim: Option<(usize, u64)>,
     /// 页面的滚动区（各标签共用一个）。
     page_scroll: ScrollHandle,
+    page_view: Entity<PageView>,
+    spins: Entity<SpinLayer>,
     clicks: u64,
     should_move: bool,
     _subscriptions: Vec<Subscription>,
@@ -221,7 +239,12 @@ impl MainWindow {
             }),
         ];
         let officials = cx.new(|cx| Officials::new(store.clone(), window, cx));
+        let main = cx.weak_entity();
+        let page_view = cx.new(|_| PageView { main });
         let mut _subscriptions = _subscriptions;
+        // 这里一通知，页面跟着重画（页面是缓存着的 view，不然沿用上一帧）。
+        _subscriptions
+            .push(cx.observe_self(|this, cx| this.page_view.update(cx, |_, cx| cx.notify())));
         _subscriptions.push(cx.subscribe_in(
             &officials,
             window,
@@ -248,6 +271,8 @@ impl MainWindow {
             just_closed: None,
             tab_anim: None,
             page_scroll: ScrollHandle::new(),
+            page_view,
+            spins: cx.new(|_| SpinLayer),
             clicks: 0,
             should_move: false,
             _subscriptions,
@@ -351,12 +376,14 @@ impl MainWindow {
                 ui::icon_button_with(
                     "refresh",
                     t,
-                    ui::spinning(
-                        ui::icon("rotate-cw", 16., t.ctl_fg),
-                        "refresh-spin",
-                        self.tab == Tab::Providers
-                            && self.store.read(cx).readings.read(cx).checking_any(),
-                    ),
+                    if self.tab == Tab::Providers
+                        && self.store.read(cx).readings.read(cx).checking_any()
+                    {
+                        spin::marker(spin::Group::Window, "rotate-cw", 16., t.ctl_fg)
+                            .into_any_element()
+                    } else {
+                        ui::icon("rotate-cw", 16., t.ctl_fg).into_any_element()
+                    },
                 )
                 .on_click(cx.listener(|this, _, _, cx| match this.tab {
                     Tab::Providers => {
@@ -699,8 +726,12 @@ impl MainWindow {
         // 有额度、余额可写时，名字一列定宽、额度一列紧跟在后面，各行（官方的和各家的）的额度格子上下对齐。
         let officials = store.officials();
         let readings = store.readings.read(cx);
-        let reading = |provider: &Provider| readings.of(&CheckKey::Provider(provider.id.clone()));
-        let meters = !officials.is_empty() || store.providers.iter().any(|p| reading(p).is_some());
+        let row_readings: Vec<_> = store
+            .providers
+            .iter()
+            .map(|provider| readings.of(&CheckKey::Provider(provider.id.clone())))
+            .collect();
+        let meters = !officials.is_empty() || row_readings.iter().any(Option::is_some);
 
         if !officials.is_empty() {
             page = page.child(self.officials.clone());
@@ -720,7 +751,7 @@ impl MainWindow {
         }
 
         let mut list = ui::list(t, false);
-        for (i, provider) in store.providers.iter().enumerate() {
+        for (i, (provider, reading)) in store.providers.iter().zip(row_readings).enumerate() {
             let last = i + 1 == count;
             let host = data::host(provider).unwrap_or_default().to_string();
             let models = provider.models.len();
@@ -744,7 +775,7 @@ impl MainWindow {
                 }
             });
             let hover_bg = t.card_2;
-            let provider_clone = provider.clone();
+            let id = provider.id.clone();
 
             let key_pill = match data::key_tail(provider) {
                 Some(tail) => div()
@@ -767,7 +798,6 @@ impl MainWindow {
             .flex()
             .items_center();
 
-            let reading = reading(provider);
             list = list.child(
                 ui::row(t, false, i == 0)
                     .id(ElementId::named_usize("provider", i))
@@ -776,7 +806,10 @@ impl MainWindow {
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover_bg))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_editor(provider_clone.clone(), window, cx)
+                        let provider = this.store.read(cx).providers.iter().find(|p| p.id == id);
+                        if let Some(provider) = provider.cloned() {
+                            this.open_editor(provider, window, cx)
+                        }
                     }))
                     .child(ui::logo(data::logo(provider), 22., t, window, cx))
                     .child(
@@ -1188,11 +1221,10 @@ impl MainWindow {
     }
 }
 
-impl Render for MainWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl MainWindow {
+    /// 顶栏下面的页面（在 [`PageView`] 里画）。
+    fn page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = Theme::window(window.appearance());
-        let save_bar = self.save_bar(&t, cx);
-        let toasts = self.toast_layer(&t, save_bar.is_some(), cx);
         let page = match (&self.settings, self.tab, &self.config) {
             (Some(settings), _, _) => settings.clone().into_any_element(),
             (None, Tab::Agents, Some(config)) => config.page.clone().into_any_element(),
@@ -1210,6 +1242,24 @@ impl Render for MainWindow {
                 .unwrap_or_else(|| div().into_any_element()),
             _ => self.placeholder(&t).into_any_element(),
         };
+        div()
+            .id("page")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.page_scroll)
+            .px(px(16.))
+            .pb(px(16.))
+            .child(page)
+            .into_any_element()
+    }
+}
+
+impl Render for MainWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        spin::clear(spin::Group::Window, window, cx);
+        let t = Theme::window(window.appearance());
+        let save_bar = self.save_bar(&t, cx);
+        let toasts = self.toast_layer(&t, save_bar.is_some(), cx);
 
         div()
             .relative()
@@ -1224,17 +1274,13 @@ impl Render for MainWindow {
             )
             .child(self.header(&t, window, cx))
             .child(
-                div()
-                    .id("page")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.page_scroll)
-                    .px(px(16.))
-                    .pb(px(16.))
-                    .child(page),
+                div().flex_1().min_h_0().child(
+                    AnyView::from(self.page_view.clone())
+                        .cached(StyleRefinement::default().size_full()),
+                ),
             )
             .children(save_bar)
+            .child(self.spins.clone())
             .children(self.overlay_layer(&t, cx))
             .children(toasts)
     }

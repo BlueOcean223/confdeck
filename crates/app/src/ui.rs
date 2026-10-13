@@ -390,8 +390,9 @@ pub fn text_button(id: impl Into<ElementId>, t: &Theme) -> Stateful<Div> {
         .hover(move |s| s.text_color(hover))
 }
 
-/// 顶栏右边的图标按钮。
-/// 图标转圈（在查、在刷新）；`on` 是假时原样不动。各处一起转，步调一致。
+/// 图标转圈（在查、在刷新）；`on` 是假时原样不动。几个一起转时步调一致（`repeat_synced`）。
+/// 现在只有「额度查询」卡片用：它在弹层里，画在 [`crate::spin::SpinLayer`] 上面。页面和顶栏的箭头用 [`crate::spin`]，
+/// 和这里不是同一个起点。
 pub fn spinning(icon: Svg, id: impl Into<ElementId>, on: bool) -> AnyElement {
     if !on {
         return icon.into_any_element();
@@ -509,6 +510,13 @@ pub fn field(
 pub fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
     let text = text.into();
     move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)
+}
+
+/// 悬停时才拼文字的 [`tooltip`]：一页几百个格子时，每次画都把字拼好是白费。
+pub fn tooltip_with(
+    text: impl Fn() -> SharedString + 'static,
+) -> impl Fn(&mut Window, &mut App) -> AnyView {
+    move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text()).build(window, cx)
 }
 
 /// 小芯片（在用的 agent：图标 + 名字 + 模型名）。
