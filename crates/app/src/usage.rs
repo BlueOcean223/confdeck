@@ -5,32 +5,31 @@
 //! - 会话页的会话列表也从这里来：扫的时候顺带记下的（core 的 `session`），文件已经不在的不要。
 //! - 价格用 models.dev 时只读磁盘上的缓存，不联网（供应商页拉列表、补全时会下）。
 //! - 余额（core 的 `balance`）和订阅额度（core 的 `quota`）画在供应商页、菜单栏面板（10-13 起不在用量页）。
-//!   每家供应商、每个官方账号（[`CheckOf`]）各有一份设置（core 的 `quota::Check`，存在 `state.json`）：关掉的不查；
+//!   每家供应商、每个官方账号（[`CheckKey`]）各有一份设置（core 的 `quota::Check`，存在 `state.json`）：关掉的不查；
 //!   自动查的到点就查（[`Store::check_due`]：每 30 秒看一次，打开面板、切到供应商页时也看）；在用的默认 5 分钟，
 //!   不在用的默认不自动查，那一格是个圆形箭头，点了查。供应商页点刷新是没关掉的全查（[`Store::check_all`]）。
 //!   一家一个后台任务，重查时先留着上次的数，查回来再换。存下的官方账号也各查各的（`QuotaOf::Account`）。
 //! - Claude 官方的额度先不查（10-13 用户说先不做），官方那一行的额度一栏空着。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use confdeck_core::account::{self, Live};
 use confdeck_core::agent::AgentKind;
 use confdeck_core::balance::{self, Balance, BalanceError};
-use confdeck_core::current::Current;
 use confdeck_core::models_dev::{self, ModelsDev};
 use confdeck_core::net::Http;
 use confdeck_core::provider::Provider;
 use confdeck_core::query::{self, Query};
-use confdeck_core::quota::{self, Check, Quota, QuotaError};
+use confdeck_core::quota::{self, Check, CheckKey, Quota, QuotaError};
 use confdeck_core::session::Session;
-use confdeck_core::usage::history::{self, Target};
+use confdeck_core::usage::history;
 use confdeck_core::usage::summary::{self, Context as Pricing, Heatmap, Period, Source, Summary};
 use confdeck_core::usage::{Db, UsageError};
 use gpui_kit::*;
 
-use crate::data::{Selection, Store};
+use crate::data::Store;
 
 pub const PERIODS: [Period; 4] = [Period::Today, Period::Week, Period::Month, Period::All];
 
@@ -49,32 +48,9 @@ pub struct UsageState {
     pub quotas: HashMap<QuotaOf, Result<Quota, QuotaError>>,
     pub quota_checking: Vec<QuotaOf>,
     /// 每家、每个账号上次开始查的时候。
-    checked_at: HashMap<CheckOf, Instant>,
-    /// 额度查询的设置（`state.json` 的 `checks`），`Store::reload` 时重读。
-    pub checks: BTreeMap<String, Check>,
+    checked_at: HashMap<CheckKey, Instant>,
     /// 定时查的循环起了没有。
     ticking: bool,
-}
-
-/// 额度查询的设置管的是谁：一家供应商，或一个官方账号。
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum CheckOf {
-    Provider(String),
-    /// 官方账号（账号 ID，登着的和存下的都是）。
-    Account(AgentKind, String),
-    /// 登录文件里认不出是谁（没登录、Codex 的登录在钥匙串里）：照样查一次，好写「未登录」。
-    Login(AgentKind),
-}
-
-impl CheckOf {
-    /// `state.json` 里 `checks` 的键。
-    pub fn key(&self) -> String {
-        match self {
-            CheckOf::Provider(id) => quota::provider_check_key(id),
-            CheckOf::Account(kind, id) => quota::account_check_key(*kind, id),
-            CheckOf::Login(kind) => format!("login:{}", kind.id()),
-        }
-    }
 }
 
 /// 查什么。
@@ -191,31 +167,29 @@ impl Store {
     }
 
     /// 一家供应商、一个账号的额度查询设置；没设过是默认值。
-    pub fn check_of(&self, target: &CheckOf) -> Check {
-        self.usage
-            .checks
-            .get(&target.key())
-            .cloned()
-            .unwrap_or_default()
+    pub fn check_of(&self, target: &CheckKey) -> Check {
+        self.local.check(target)
     }
 
     /// 改一家供应商、一个账号的额度查询设置，改完按新的设置看一次要不要查。
-    pub fn set_check(&mut self, target: &CheckOf, check: Check, cx: &mut Context<Self>) {
+    pub fn set_check(&mut self, target: &CheckKey, check: Check, cx: &mut Context<Self>) {
         let old = self.check_of(target);
         // 刚打开的、换了查法的：马上查一次，不等间隔。换了查法的，旧的读数不留。
         let now = !check.off && (old.off || old.query != check.query);
         if old.query != check.query
-            && let CheckOf::Provider(id) = target
+            && let CheckKey::Provider(id) = target
         {
             self.usage.balances.remove(id);
             self.usage.quotas.remove(&QuotaOf::Provider(id.clone()));
         }
-        if let Err(err) = self.engine.set_check(&target.key(), check) {
-            let notice = crate::data::Notice::err(err.to_string());
-            self.announce(&[notice], cx);
-            return;
+        match self.engine.set_check(target, check) {
+            Ok(local) => self.set_local(local),
+            Err(err) => {
+                let notice = crate::data::Notice::err(err.to_string());
+                self.announce(&[notice], cx);
+                return;
+            }
         }
-        self.usage.checks = self.engine.checks();
         if now {
             self.check_one(target, cx);
         }
@@ -224,28 +198,28 @@ impl Store {
     }
 
     /// 这家、这个账号算不算在用：有 agent 选着的供应商，登录文件里登着的官方账号（agent 暂时在用第三方也算）。
-    pub fn in_use(&self, target: &CheckOf) -> bool {
+    pub fn in_use(&self, target: &CheckKey) -> bool {
         match target {
-            CheckOf::Provider(id) => self
+            CheckKey::Provider(id) => self
                 .providers
                 .iter()
                 .position(|p| &p.id == id)
                 .is_some_and(|i| !self.users_of(i).is_empty()),
-            CheckOf::Account(kind, id) => match self.live_account(*kind) {
+            CheckKey::Account(kind, id) => match self.live_account(*kind) {
                 Some(Live::Known(live)) => live == id,
                 Some(Live::Unknown(identity)) => &identity.id == id,
                 _ => false,
             },
-            CheckOf::Login(_) => true,
+            CheckKey::Login(_) => true,
         }
     }
 
     /// 登录文件里那个官方账号的设置管它：认得出是谁就是那个账号，认不出是 `Login`。
-    pub fn live_target(&self, kind: AgentKind) -> CheckOf {
+    pub fn live_target(&self, kind: AgentKind) -> CheckKey {
         match self.live_account(kind) {
-            Some(Live::Known(id)) => CheckOf::Account(kind, id.clone()),
-            Some(Live::Unknown(identity)) => CheckOf::Account(kind, identity.id.clone()),
-            _ => CheckOf::Login(kind),
+            Some(Live::Known(id)) => CheckKey::Account(kind, id.clone()),
+            Some(Live::Unknown(identity)) => CheckKey::Account(kind, identity.id.clone()),
+            _ => CheckKey::Login(kind),
         }
     }
 
@@ -285,14 +259,14 @@ impl Store {
     }
 
     /// 只查这一个（行里和「额度查询」卡片里的圆形箭头、切了账号、加了账号以后）。
-    pub(crate) fn check_one(&mut self, target: &CheckOf, cx: &mut Context<Self>) {
+    pub(crate) fn check_one(&mut self, target: &CheckKey, cx: &mut Context<Self>) {
         self.run_checks(cx, |_, t| t == target);
     }
 
     /// 能查的每一个：供应商的套餐额度或余额、官方登录、存下的账号。Claude 官方的（登着的、存下的）先不查（10-13 用户说先不做）。
-    fn jobs(&self) -> Vec<(CheckOf, Job)> {
-        let mut jobs: Vec<(CheckOf, Job)> = Vec::new();
-        for agent in self.agents.iter().filter(|a| a.installed) {
+    fn jobs(&self) -> Vec<(CheckKey, Job)> {
+        let mut jobs: Vec<(CheckKey, Job)> = Vec::new();
+        for agent in self.agents.iter().filter(|a| a.installed()) {
             let home = self.home.clone();
             let job: QuotaJob = match agent.kind {
                 AgentKind::Codex => Box::new(move |http| quota::codex(http, &home)),
@@ -307,7 +281,7 @@ impl Store {
         // 存下的官方账号各查各的：用存着的登录。登着的那个上面已经查了。
         for account in &self.accounts.list {
             let kind = account.agent;
-            let installed = self.agents.iter().any(|a| a.kind == kind && a.installed);
+            let installed = self.agents.iter().any(|a| a.kind == kind && a.installed());
             let live =
                 matches!(self.live_account(kind), Some(Live::Known(id)) if *id == account.id);
             if !installed
@@ -330,12 +304,12 @@ impl Store {
                 }
             });
             jobs.push((
-                CheckOf::Account(kind, account.id.clone()),
+                CheckKey::Account(kind, account.id.clone()),
                 Job::Quota(QuotaOf::Account(kind, account.id.clone()), job),
             ));
         }
         for provider in &self.providers {
-            let target = CheckOf::Provider(provider.id.clone());
+            let target = CheckKey::Provider(provider.id.clone());
             if let Some(query) = self.custom_query(provider) {
                 jobs.push((
                     target,
@@ -358,7 +332,7 @@ impl Store {
     }
 
     /// 查 `pick` 选中的、没关掉的、没在查的。
-    fn run_checks(&mut self, cx: &mut Context<Self>, pick: impl Fn(&Self, &CheckOf) -> bool) {
+    fn run_checks(&mut self, cx: &mut Context<Self>, pick: impl Fn(&Self, &CheckKey) -> bool) {
         let proxy = self.proxy();
         let now = Instant::now();
         for (target, job) in self.jobs() {
@@ -436,7 +410,7 @@ impl Store {
 
     /// 这家供应商自己配的查法（填够了的）。
     pub fn custom_query(&self, provider: &Provider) -> Option<Query> {
-        self.check_of(&CheckOf::Provider(provider.id.clone()))
+        self.check_of(&CheckKey::Provider(provider.id.clone()))
             .query
             .filter(Query::complete)
     }
@@ -447,46 +421,23 @@ impl Store {
     }
 
     /// 这一个现在是不是在查。
-    pub fn checking_target(&self, target: &CheckOf) -> bool {
+    pub fn checking_target(&self, target: &CheckKey) -> bool {
         match target {
-            CheckOf::Provider(id) => {
+            CheckKey::Provider(id) => {
                 self.usage.checking.contains(id)
                     || self
                         .usage
                         .quota_checking
                         .contains(&QuotaOf::Provider(id.clone()))
             }
-            CheckOf::Account(kind, _) if self.in_use(target) => {
+            CheckKey::Account(kind, _) if self.in_use(target) => {
                 self.usage.quota_checking.contains(&QuotaOf::Agent(*kind))
             }
-            CheckOf::Account(kind, id) => self
+            CheckKey::Account(kind, id) => self
                 .usage
                 .quota_checking
                 .contains(&QuotaOf::Account(*kind, id.clone())),
-            CheckOf::Login(kind) => self.usage.quota_checking.contains(&QuotaOf::Agent(*kind)),
-        }
-    }
-
-    /// 单选 agent 现在连的是哪家，记进切换记录（和上一笔一样不记）。在别处改了配置，用量也能对上是哪家。
-    pub(crate) fn note_selections(&self) {
-        for agent in &self.agents {
-            let (Selection::Single(_), true) = (&agent.selection, agent.installed) else {
-                continue;
-            };
-            let target = match &agent.current {
-                Some(Current::Default) => Target::Official,
-                Some(Current::Provider(id)) | Some(Current::KeyMismatch { provider: id }) => {
-                    match self.providers.iter().find(|p| &p.id == id) {
-                        Some(provider) => Target::of(Some(provider)),
-                        None => continue,
-                    }
-                }
-                Some(Current::Custom { .. }) => Target::Other,
-                // 配置读不了：不知道连的是哪家，不记。
-                None => continue,
-            };
-            // 记不下来只是用量页少一条线索。
-            let _ = history::note(self.engine.data(), agent.kind, target);
+            CheckKey::Login(kind) => self.usage.quota_checking.contains(&QuotaOf::Agent(*kind)),
         }
     }
 }

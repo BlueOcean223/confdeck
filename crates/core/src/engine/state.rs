@@ -23,14 +23,15 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent::AgentKind;
 use crate::fsx::{self, Digest, Mode};
 use crate::net::Proxy;
 use crate::patch::KeyPath;
-use crate::quota::Check;
+use crate::quota::{Check, CheckKey};
 
 const VERSION: u32 = 1;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     version: u32,
@@ -53,6 +54,32 @@ pub struct State {
     proxy: Proxy,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     checks: BTreeMap<String, Check>,
+}
+
+/// `state.json` 里本机的设置：藏起来的 agent、出站代理、额度查询、单选 agent 上次选的哪家。
+/// 读一次用到底（[`super::Engine::local`]），不每用一样读一次文件。
+#[derive(Debug, Clone, Default)]
+pub struct Local(pub(super) State);
+
+impl Local {
+    /// 这一处藏起来的 agent（id）。
+    pub fn hidden(&self, place: Place) -> &BTreeSet<String> {
+        self.0.hidden(place)
+    }
+
+    pub fn proxy(&self) -> &Proxy {
+        self.0.proxy()
+    }
+
+    /// 一家供应商、一个账号的额度查询设置；没设过是默认值。
+    pub fn check(&self, key: &CheckKey) -> Check {
+        self.0.check(key)
+    }
+
+    /// 单选 agent 上次在 confdeck 里选的是哪家：`None` 是没选过，`Some(None)` 是「默认」。
+    pub fn selection(&self, agent: AgentKind) -> Option<Option<&str>> {
+        self.0.selection(agent.id())
+    }
 }
 
 /// 「显示哪些 agent」分两处：主窗口的 Agent 页、菜单栏面板。
@@ -141,16 +168,17 @@ impl State {
         self.proxy = proxy;
     }
 
-    pub fn checks(&self) -> &BTreeMap<String, Check> {
-        &self.checks
+    /// 没设过是默认值。
+    pub fn check(&self, key: &CheckKey) -> Check {
+        self.checks.get(&key.stored()).cloned().unwrap_or_default()
     }
 
     /// 默认值不存。
-    pub fn set_check(&mut self, key: &str, check: Check) {
+    pub fn set_check(&mut self, key: &CheckKey, check: Check) {
         if check.is_default() {
-            self.checks.remove(key);
+            self.checks.remove(&key.stored());
         } else {
-            self.checks.insert(key.to_string(), check);
+            self.checks.insert(key.stored(), check);
         }
     }
 
@@ -192,21 +220,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         let mut state = State::load(&path);
+        let deepseek = CheckKey::Provider("deepseek".into());
+        let codex = CheckKey::Account(crate::agent::AgentKind::Codex, "abc".into());
+        let grok = CheckKey::Login(crate::agent::AgentKind::GrokBuild);
         state.set_check(
-            "provider:deepseek",
+            &grok,
             Check {
                 off: true,
                 ..Default::default()
             },
         );
         state.set_check(
-            "account:codex:abc",
+            &deepseek,
+            Check {
+                off: true,
+                ..Default::default()
+            },
+        );
+        state.set_check(
+            &codex,
             Check {
                 every: Some(15),
                 ..Default::default()
             },
         );
-        state.set_check("provider:kimi", Check::default());
+        state.set_check(&CheckKey::Provider("kimi".into()), Check::default());
         state.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(
@@ -214,13 +252,16 @@ mod tests {
             "default values are not stored: {text}"
         );
         let state = State::load(&path);
-        assert!(state.checks()["provider:deepseek"].off);
-        assert_eq!(state.checks()["account:codex:abc"].every, Some(15));
+        assert!(text.contains("\"provider:deepseek\"") && text.contains("\"account:codex:abc\""));
+        assert!(text.contains("\"login:grok-build\""), "{text}");
+        assert!(state.check(&grok).off);
+        assert!(state.check(&deepseek).off);
+        assert_eq!(state.check(&codex).every, Some(15));
         // 在用的默认 5 分钟，不在用的不自动查；关掉的都不查；设了的照设的。
         assert_eq!(Check::default().every(true), Check::DEFAULT_EVERY);
         assert_eq!(Check::default().every(false), 0);
-        assert_eq!(state.checks()["provider:deepseek"].every(true), 0);
-        assert_eq!(state.checks()["account:codex:abc"].every(false), 15);
+        assert_eq!(state.check(&deepseek).every(true), 0);
+        assert_eq!(state.check(&codex).every(false), 15);
     }
 
     #[test]

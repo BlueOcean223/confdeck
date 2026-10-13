@@ -13,7 +13,7 @@
 use confdeck_core::balance::{Balance, BalanceError, Currency};
 use confdeck_core::net::Http;
 use confdeck_core::query::{self, Query, Template};
-use confdeck_core::quota::Check;
+use confdeck_core::quota::{Check, CheckKey};
 use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -24,7 +24,6 @@ use crate::data::{Logo, Store};
 use crate::quota_view::{self, Shown};
 use crate::theme::Theme;
 use crate::ui::{self, Button};
-use crate::usage::CheckOf;
 
 /// 卡片的宽度：「自动查询」一行放得下六档。
 const WIDTH: f32 = 560.;
@@ -88,7 +87,7 @@ enum Trial {
 
 pub struct CheckSheet {
     store: Entity<Store>,
-    target: CheckOf,
+    target: CheckKey,
     name: SharedString,
     logo: Logo,
     on: bool,
@@ -105,7 +104,7 @@ impl EventEmitter<CheckEvent> for CheckSheet {}
 impl CheckSheet {
     pub fn new(
         store: Entity<Store>,
-        target: CheckOf,
+        target: CheckKey,
         name: SharedString,
         logo: Logo,
         window: &mut Window,
@@ -132,7 +131,7 @@ impl CheckSheet {
         });
         let mut subscriptions = vec![cx.observe(&store, |_, _, cx| cx.notify()), intercept];
         let form = match &target {
-            CheckOf::Provider(id) => {
+            CheckKey::Provider(id) => {
                 let provider = store
                     .read(cx)
                     .providers
@@ -328,7 +327,7 @@ impl CheckSheet {
         if matches!(self.trial, Some(Trial::Running)) {
             return;
         }
-        let CheckOf::Provider(id) = &self.target else {
+        let CheckKey::Provider(id) = &self.target else {
             return;
         };
         let (Some(query), Some(provider)) = (

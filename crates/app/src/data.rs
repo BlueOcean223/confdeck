@@ -1,24 +1,25 @@
-//! 界面的数据层。供应商来自 confdeck-core 的 `providers.json`；每个 agent 现在用哪家，
-//! 从它的配置文件里认出来（`current`）。agent 的清单在这里写死：core 里有适配器的五个能选供应商，
-//! 其余三个（阶段 7）只列出来。
+//! 界面的数据层。供应商、每个 agent 现在连的是谁、本机设置、官方账号都来自 core 的一份快照（`status::snapshot`）：
+//! 启动时在界面线程读第一份（免得窗口先空着闪一下），之后每次 `reload` 都在后台读，读完换上。
+//! agent 的清单在这里写死：core 里有适配器的五个能选供应商。
 //!
-//! 选了一家就写文件（`switch` / `toggle`）：写在后台线程，写完按文件重读一遍，内存里先改的胶囊会被
-//! 文件里的实际状态盖掉；写了什么、有没有备份、失败的原因做成 [`Notice`] 事件发出去，主窗口做成提示条，面板写在底栏。
+//! 选了一家就写文件（`switch` / `toggle`）：内存里先改胶囊，写在后台线程，写完再读一份快照，
+//! 文件里的实际状态盖掉先改的；先改的时候还在读的快照丢掉（读的是改之前的）。
+//! 写了什么、有没有备份、失败的原因做成 [`Notice`] 事件发出去，主窗口做成提示条，面板写在底栏。
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use confdeck_core::account;
 use confdeck_core::agent::codex::catalog::Skipped;
-use confdeck_core::agent::{self, AgentKind, Connection, FileSetup, Mode};
+use confdeck_core::agent::{self, AgentKind, FileSetup, Mode};
 use confdeck_core::apply::{self, ApplyError, Switched, Synced, UsedBy};
 use confdeck_core::backup::{self, Backup, Reason};
-use confdeck_core::current::{self, Current};
+use confdeck_core::current;
 use confdeck_core::data::DataDir;
-use confdeck_core::engine::{Engine, EngineError, LiveFile, Outcome, Place, Snapshot};
+use confdeck_core::engine::{Engine, EngineError, LiveFile, Local, Outcome, Place, Snapshot};
 use confdeck_core::preset;
 use confdeck_core::provider::{self, Protocol, Provider};
+use confdeck_core::status::{self, AgentStatus};
 use confdeck_core::store::{self, StoreError};
 use confdeck_core::toggles::{self, ClaudeToggle};
 use gpui_kit::*;
@@ -42,29 +43,19 @@ impl Logo {
     }
 }
 
-/// agent 用哪家：单选 agent 一家（`None` 是「默认」，agent 自带的登录），多选 agent 勾了哪几家。
-/// 存的是 `Store::providers` 里的下标。
-pub enum Selection {
-    Single(Option<usize>),
-    Multi(Vec<usize>),
-}
-
 pub struct Agent {
     pub kind: AgentKind,
     pub name: &'static str,
     pub logo: Logo,
     /// 配置文件，相对家目录。
     pub config: &'static str,
-    /// 配置文件存在。
-    pub installed: bool,
     pub mode: Mode,
     /// 能说的协议，按偏好排序：供应商提供好几种时用第一种（decisions「供应商和 agent 的关系」）。
     pub protocols: &'static [Protocol],
     /// 连第三方必须有 Key：core 的适配器没 Key 就拒绝写（Claude Code、Codex、Grok Build）。
     pub requires_key: bool,
-    pub selection: Selection,
-    /// 单选 agent 从文件里认出来的原样结果，「自定义 · 主机名」「Key 不一致」要用。
-    pub current: Option<Current>,
+    /// 现在连的是谁（core 的快照；切换时先改成选的那家，不等写完）。
+    pub status: AgentStatus,
     /// 设置页「显示哪些 agent」里关掉了：Agent 页不列它。
     pub hidden_on_page: bool,
     /// 设置页「显示哪些 agent」里关掉了：菜单栏面板不列它。
@@ -72,9 +63,14 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// 配置文件存在。
+    pub fn installed(&self) -> bool {
+        self.status.installed()
+    }
+
     /// 能在界面上选供应商：配置文件在。
     pub fn selectable(&self) -> bool {
-        self.installed
+        self.installed()
     }
 
     /// 显示用的配置文件路径。
@@ -156,6 +152,34 @@ const AGENTS: &[AgentDef] = &[
     },
 ];
 
+fn agent(def: &AgentDef, status: &AgentStatus, local: &Local) -> Agent {
+    Agent {
+        kind: def.kind,
+        name: def.name,
+        logo: def.logo,
+        config: def.config,
+        mode: def.mode,
+        protocols: def.protocols,
+        requires_key: def.requires_key,
+        status: status.clone(),
+        hidden_on_page: hidden(local, Place::Page, def.kind),
+        hidden_in_panel: hidden(local, Place::Panel, def.kind),
+    }
+}
+
+/// 设置页里在这一处藏起了这个 agent。
+fn hidden(local: &Local, place: Place, kind: AgentKind) -> bool {
+    local.hidden(place).contains(kind.id())
+}
+
+/// 单选 agent 的配置文件连的就是选中的那家：`disk` 是最近一份快照里的，`now` 是内存里的（先改了还没写完时两边不一样）。
+fn settled(disk: Option<&AgentStatus>, now: &AgentStatus) -> bool {
+    disk == Some(now) && *now != AgentStatus::Unreadable
+}
+
+/// 快照换上以后要做的（[`Store::reload_then`]）。
+type AfterReload = Box<dyn FnOnce(&mut Store, &mut Context<Store>)>;
+
 /// 某个 agent 为什么用不了某家供应商。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Unusable {
@@ -229,6 +253,18 @@ pub struct Store {
     pub agents: Vec<Agent>,
     /// `providers.json` 读不了的原因。读不了时列表是空的，不许保存，不然会把文件盖掉。
     pub load_error: Option<String>,
+    /// `state.json` 里本机的设置（藏起哪些 agent、出站代理、额度查询），跟着快照读，改了换成改完的样子。
+    pub(crate) local: Local,
+    /// 在界面线程上改过几次 `state.json`（[`Self::set_local`]）。快照是改之前开始读的，就不用它读到的那份。
+    local_edits: u64,
+    /// 最近一份快照里各 agent 的样子（文件里的），和 `agents` 一一对应。先改了内存、还没写完时两边不一样。
+    disk: Vec<AgentStatus>,
+    /// 换上过几份快照。配置页看它变了才重读文件。
+    generation: u64,
+    /// 在后台读着的快照。再读一份、先改了内存时丢掉：读到的已经旧了。
+    reading: Option<Task<()>>,
+    /// 下一份快照换上以后要做的（[`Self::reload_then`]）。在读的那份被丢掉也留着，等下一份。
+    after_reload: Vec<AfterReload>,
     /// 联网的那几样（测连通、models.dev）的状态，见 `net.rs`。
     pub(crate) net: crate::net::NetState,
     /// 用量的汇总，见 `usage.rs`。
@@ -241,15 +277,24 @@ pub struct Store {
 impl EventEmitter<Notice> for Store {}
 
 impl Store {
-    /// 读数据目录和各 agent 的配置文件。上次没收拾完的登录（强退、崩了）这时收拾掉，退出时停掉在跑的登录。
+    /// 读数据目录和各 agent 的配置文件（第一份快照在界面线程读）。上次没收拾完的登录（强退、崩了）这时收拾掉，
+    /// 退出时停掉在跑的登录。
     pub fn load(data: DataDir, home: PathBuf, cx: &mut Context<Self>) -> Self {
         account::clean_stale_logins(&data);
+        let engine = Arc::new(Engine::new(data));
+        let snapshot = status::snapshot(&engine, &home);
         let mut store = Self {
-            engine: Arc::new(Engine::new(data)),
+            engine,
             home,
             providers: Vec::new(),
             agents: Vec::new(),
             load_error: None,
+            local: Local::default(),
+            local_edits: 0,
+            disk: Vec::new(),
+            generation: 0,
+            reading: None,
+            after_reload: Vec::new(),
             net: Default::default(),
             usage: Default::default(),
             accounts: Default::default(),
@@ -258,70 +303,96 @@ impl Store {
                 async {}
             }),
         };
-        store.reload();
+        store.apply_snapshot(snapshot, 0);
         store
     }
 
-    /// 重新读供应商和每个 agent 现在用的是哪家。
-    pub fn reload(&mut self) {
-        match store::load(self.engine.data()) {
-            Ok(providers) => {
-                self.providers = providers;
-                self.load_error = None;
-            }
-            Err(err) => {
-                self.providers = Vec::new();
-                self.load_error = Some(err.to_string());
-            }
-        }
-        let hidden = (
-            self.engine.hidden(Place::Page),
-            self.engine.hidden(Place::Panel),
-        );
-        self.usage.checks = self.engine.checks();
-        self.agents = AGENTS.iter().map(|def| self.agent(def, &hidden)).collect();
-        self.note_selections();
-        self.reload_accounts();
+    /// 在后台重读供应商、每个 agent 现在连的是谁、本机设置和官方账号，读完换上、通知。
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        let engine = self.engine.clone();
+        let home = self.home.clone();
+        let edits = self.local_edits;
+        let read = cx
+            .background_executor()
+            .spawn(async move { status::snapshot(&engine, &home) });
+        self.reading = Some(cx.spawn(async move |this, cx| {
+            let snapshot = read.await;
+            this.update(cx, |store, cx| {
+                store.apply_snapshot(snapshot, edits);
+                for then in std::mem::take(&mut store.after_reload) {
+                    then(store, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
-    fn agent(&self, def: &AgentDef, hidden: &(BTreeSet<String>, BTreeSet<String>)) -> Agent {
-        let kind = def.kind;
-        let installed = self.home.join(def.config).exists();
-        let index_of = |id: &str| self.providers.iter().position(|p| p.id == id);
-        let mut current = None;
-        let selection = match def.mode {
-            Mode::Switch if installed => {
-                let found = current::current(&self.engine, &self.home, kind, &self.providers).ok();
-                let picked = match &found {
-                    Some(Current::Provider(id)) => index_of(id),
-                    _ => None,
-                };
-                current = found;
-                Selection::Single(picked)
-            }
-            Mode::Coexist if installed => Selection::Multi(
-                current::enabled(&self.engine, &self.home, kind)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|id| index_of(id))
-                    .collect(),
-            ),
-            Mode::Switch => Selection::Single(None),
-            Mode::Coexist => Selection::Multi(Vec::new()),
-        };
-        Agent {
-            kind,
-            name: def.name,
-            logo: def.logo,
-            config: def.config,
-            installed,
-            mode: def.mode,
-            protocols: def.protocols,
-            requires_key: def.requires_key,
-            selection,
-            current,
-            hidden_on_page: hidden.0.contains(kind.id()),
-            hidden_in_panel: hidden.1.contains(kind.id()),
+    /// [`Self::reload`]，读完换上以后再做 `then`（要按新读到的账号、供应商做的事）。
+    pub(crate) fn reload_then(
+        &mut self,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
+        self.after_reload.push(Box::new(then));
+        self.reload(cx);
+    }
+
+    /// 内存里先改了（还没写）：在读的快照是改之前的，丢掉，免得把先改的又盖回去。调的人写完要再 `reload`。
+    pub(crate) fn touch(&mut self) {
+        self.reading = None;
+    }
+
+    /// 改完 `state.json` 拿回来的样子换上（core 的 `set_hidden` 这类返回的）。
+    pub(crate) fn set_local(&mut self, local: Local) {
+        for agent in &mut self.agents {
+            agent.hidden_on_page = hidden(&local, Place::Page, agent.kind);
+            agent.hidden_in_panel = hidden(&local, Place::Panel, agent.kind);
+        }
+        self.local = local;
+        self.local_edits += 1;
+    }
+
+    /// 换上过几份快照：变了才说明文件可能变了。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 换上一份快照。`edits` 是开始读时的 `local_edits`：之后又改过 `state.json`，留着改完的那份。
+    fn apply_snapshot(&mut self, snapshot: status::Snapshot, edits: u64) {
+        if edits == self.local_edits {
+            self.local = snapshot.local.clone();
+        }
+        let local = &self.local;
+        self.agents = AGENTS
+            .iter()
+            .map(|def| agent(def, &snapshot.agent(def.kind).status, local))
+            .collect();
+        self.load_error = snapshot.providers_error.map(|err| err.to_string());
+        self.providers = snapshot.providers;
+        self.disk = self
+            .agents
+            .iter()
+            .map(|agent| agent.status.clone())
+            .collect();
+        self.apply_accounts(snapshot.accounts);
+        self.generation += 1;
+    }
+
+    /// 单选 agent 连着的那家（`providers` 的下标）；「默认」「自定义」「Key 不一致」是 `None`。
+    pub fn picked(&self, agent: usize) -> Option<usize> {
+        let id = self.agents[agent].status.provider()?;
+        self.providers.iter().position(|p| p.id == id)
+    }
+
+    /// 多选 agent 勾着的（下标，按文件里的顺序；列表里没有的不算）。
+    pub fn enabled(&self, agent: usize) -> Vec<usize> {
+        match &self.agents[agent].status {
+            AgentStatus::Multi { ids } => ids
+                .iter()
+                .filter_map(|id| self.providers.iter().position(|p| &p.id == id))
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -334,42 +405,24 @@ impl Store {
         cx: &mut Context<Self>,
     ) {
         let kind = self.agents[agent].kind;
-        let notice = self
-            .engine
-            .set_hidden(place, kind.id(), hidden)
-            .err()
-            .map(|err| {
-                Notice::err(t!(
-                    "toast.sync_failed",
-                    agent = kind.to_string(),
-                    error = err.to_string()
-                ))
-            });
-        self.reload();
+        let notice = match self.engine.set_hidden(place, kind.id(), hidden) {
+            Ok(local) => {
+                self.set_local(local);
+                None
+            }
+            Err(err) => Some(Notice::err(t!(
+                "toast.sync_failed",
+                agent = kind.to_string(),
+                error = err.to_string()
+            ))),
+        };
         self.announce(notice.as_slice(), cx);
-    }
-
-    /// 单选 agent 的配置文件现在连到哪：地址和凭据的原样，选择器「现在」那组要用。读不了就是 `None`。
-    pub fn connection(&self, agent: usize) -> Option<Connection> {
-        let kind = self.agents[agent].kind;
-        current::connection(&self.engine, &self.home, kind).ok()
-    }
-
-    /// 「把当前配置存成供应商」：按这个 agent 的配置文件拼好的一家新供应商（core 的 `draft`），
-    /// 交给新建表单预先填好。文件连的不是一个地址（Bedrock 这类）时是 `None`。
-    pub fn draft(&self, agent: usize) -> Option<Provider> {
-        let kind = self.agents[agent].kind;
-        current::draft(&self.engine, &self.home, kind, &self.providers)
-            .ok()
-            .flatten()
     }
 
     /// 单选 agent 的配置文件连的就是选中的那家。刚选了别家、文件还没写完时不是，
     /// 这时文件里还是上一家的模型，「配置 ›」页不拿来显示。
     pub fn settled(&self, agent: usize) -> bool {
-        let kind = self.agents[agent].kind;
-        current::current(&self.engine, &self.home, kind, &self.providers)
-            .is_ok_and(|on_disk| Some(&on_disk) == self.agents[agent].current.as_ref())
+        settled(self.disk.get(agent), &self.agents[agent].status)
     }
 
     /// 「配置 ›」页编辑框里的内容写的模型（下拉框显示的就是它）。解析不了（手改到一半）是 `Err`；
@@ -412,7 +465,7 @@ impl Store {
         cx: &mut Context<Self>,
     ) -> Result<Outcome, EngineError> {
         let outcome = self.engine.replace(file, bytes, base)?;
-        self.reload();
+        self.reload(cx);
         if announce {
             self.announce(
                 &[Notice::ok(t!("write.file_saved", file = file_name(file)))],
@@ -439,6 +492,7 @@ impl Store {
         if let Some(slot) = self.providers.iter_mut().find(|p| p.id == provider.id) {
             *slot = provider.clone();
         }
+        self.touch();
         cx.notify();
 
         let engine = self.engine.clone();
@@ -449,7 +503,7 @@ impl Store {
         cx.spawn(async move |this, cx| {
             let result = write.await;
             this.update(cx, |store, cx| {
-                store.reload();
+                store.reload(cx);
                 let notices = store.describe_update(kind, result);
                 store.announce(&notices, cx);
             })
@@ -480,7 +534,7 @@ impl Store {
                 error = err.to_string()
             ))),
         };
-        self.reload();
+        self.reload(cx);
         self.announce(notice.as_slice(), cx);
     }
 
@@ -550,7 +604,7 @@ impl Store {
             Ok(_) => Notice::ok(t!("write.file_restored", file = file_name(file))),
             Err(err) => Notice::err(err.to_string()),
         };
-        self.reload();
+        self.reload(cx);
         self.announce(&[notice], cx);
     }
 
@@ -572,14 +626,14 @@ impl Store {
             Ok(_) => None,
             Err(err) => Some(Notice::err(err.to_string())),
         };
+        // 备份列表变了：重读一份，设置页按新的代数重列。
+        self.reload(cx);
         self.announce(notice.as_slice(), cx);
     }
 
     /// 胶囊画成虚线边框：文件连的和列表里哪家都对不上（decisions「『自定义』的样子」）。
     pub fn pill_dashed(&self, agent: usize) -> bool {
-        let agent = &self.agents[agent];
-        matches!(agent.selection, Selection::Single(None))
-            && matches!(agent.current, Some(Current::Custom { .. }))
+        matches!(self.agents[agent].status, AgentStatus::Custom { .. })
     }
 
     pub fn agent_index(&self, kind: AgentKind) -> Option<usize> {
@@ -587,16 +641,34 @@ impl Store {
     }
 
     /// 保存一家（新建或替换同 ID 的），写进在用它的 agent，然后重新读一遍。
-    pub fn save_provider(&mut self, provider: &Provider) -> Result<Vec<Synced>, StoreError> {
+    /// 存好了列表先换上（调用的人马上要按 ID 找它），不等快照。
+    pub fn save_provider(
+        &mut self,
+        provider: &Provider,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<Synced>, StoreError> {
         let synced = apply::save_provider(&self.engine, &self.home, &self.providers, provider);
-        self.reload();
+        if synced.is_ok() {
+            match self.providers.iter_mut().find(|p| p.id == provider.id) {
+                Some(slot) => *slot = provider.clone(),
+                None => self.providers.push(provider.clone()),
+            }
+        }
+        self.reload(cx);
         synced
     }
 
-    /// 删掉一家，多选 agent 里的那一项一起删，然后重新读一遍。
-    pub fn delete_provider(&mut self, id: &str) -> Result<Vec<Synced>, StoreError> {
+    /// 删掉一家，多选 agent 里的那一项一起删，然后重新读一遍。删好了列表先拿掉它。
+    pub fn delete_provider(
+        &mut self,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<Synced>, StoreError> {
         let synced = apply::delete_provider(&self.engine, &self.home, &self.providers, id);
-        self.reload();
+        if synced.is_ok() {
+            self.providers.retain(|p| p.id != id);
+        }
+        self.reload(cx);
         synced
     }
 
@@ -635,30 +707,20 @@ impl Store {
         let kind = self.agents[agent].kind;
         // 选的就是现在这家、文件是 confdeck 写的样子、state.json 也记着它：没什么可写，也不提示「已切到」。
         // 文件认出来是这家但 state 里没记（比如刚把文件里的连接存成供应商）还是要走一遍，把选择记下来。
-        let picked_id = provider.map(|p| self.providers[p].id.as_str());
-        let recorded = self
-            .engine
-            .selection(kind.id())
-            .is_some_and(|recorded| recorded.as_deref() == picked_id);
-        let unchanged = recorded
-            && match (&self.agents[agent].selection, &self.agents[agent].current) {
-                (Selection::Single(current), Some(Current::Provider(id))) => {
-                    *current == provider && picked_id == Some(id.as_str())
-                }
-                (Selection::Single(None), Some(Current::Default)) => provider.is_none(),
-                _ => false,
-            };
+        let picked = provider.map(|p| self.providers[p].clone());
+        let status = match &picked {
+            Some(p) => AgentStatus::Provider { id: p.id.clone() },
+            None => AgentStatus::Official,
+        };
+        let picked_id = picked.as_ref().map(|p| p.id.as_str());
+        let unchanged =
+            self.local.selection(kind) == Some(picked_id) && self.agents[agent].status == status;
         if unchanged {
             return Task::ready(Vec::new());
         }
-        let picked = provider.map(|p| self.providers[p].clone());
         let name = picked.as_ref().map(|p| p.name.clone());
-        let row = &mut self.agents[agent];
-        row.selection = Selection::Single(provider);
-        row.current = Some(match &picked {
-            Some(p) => Current::Provider(p.id.clone()),
-            None => Current::Default,
-        });
+        self.agents[agent].status = status;
+        self.touch();
         cx.notify();
 
         let engine = self.engine.clone();
@@ -669,7 +731,7 @@ impl Store {
         cx.spawn(async move |this, cx| {
             let result = write.await;
             this.update(cx, |store, cx| {
-                store.reload();
+                store.reload(cx);
                 let notices = store.describe_switch(kind, name, result);
                 store.announce(&notices, cx);
                 notices
@@ -686,18 +748,25 @@ impl Store {
         cx: &mut Context<Self>,
     ) -> Task<Vec<Notice>> {
         let kind = self.agents[agent].kind;
-        let Selection::Multi(enabled) = &mut self.agents[agent].selection else {
+        if self.agents[agent].mode != Mode::Coexist {
             return Task::ready(Vec::new());
-        };
-        let enabling = !enabled.contains(&provider);
-        if enabling {
-            enabled.push(provider);
-        } else {
-            enabled.retain(|&p| p != provider);
         }
+        let picked = self.providers[provider].clone();
+        // 文件读不了时当成一家都没勾：照样去写，写的时候报哪一行坏了。
+        let mut ids = match &self.agents[agent].status {
+            AgentStatus::Multi { ids } => ids.clone(),
+            _ => Vec::new(),
+        };
+        let enabling = !ids.contains(&picked.id);
+        if enabling {
+            ids.push(picked.id.clone());
+        } else {
+            ids.retain(|id| *id != picked.id);
+        }
+        self.agents[agent].status = AgentStatus::Multi { ids };
+        self.touch();
         cx.notify();
 
-        let picked = self.providers[provider].clone();
         let name = picked.name.clone();
         let engine = self.engine.clone();
         let home = self.home.clone();
@@ -711,7 +780,7 @@ impl Store {
         cx.spawn(async move |this, cx| {
             let result = write.await;
             this.update(cx, |store, cx| {
-                store.reload();
+                store.reload(cx);
                 let notices = store.describe_toggle(kind, name, enabling, result);
                 store.announce(&notices, cx);
                 notices
@@ -734,9 +803,10 @@ impl Store {
         let mut picked = self.providers[provider].clone();
         picked.key = key;
         let name = picked.name.clone();
-        let row = &mut self.agents[agent];
-        row.selection = Selection::Single(Some(provider));
-        row.current = Some(Current::Provider(picked.id.clone()));
+        self.agents[agent].status = AgentStatus::Provider {
+            id: picked.id.clone(),
+        };
+        self.touch();
         cx.notify();
 
         let engine = self.engine.clone();
@@ -752,7 +822,7 @@ impl Store {
         cx.spawn(async move |this, cx| {
             let result = write.await;
             this.update(cx, |store, cx| {
-                store.reload();
+                store.reload(cx);
                 let notices = store.describe_adopt(kind, name, result);
                 store.announce(&notices, cx);
                 notices
@@ -957,9 +1027,11 @@ impl Store {
     }
 
     pub fn is_enabled(&self, agent: usize, provider: usize) -> bool {
-        match &self.agents[agent].selection {
-            Selection::Single(current) => *current == Some(provider),
-            Selection::Multi(enabled) => enabled.contains(&provider),
+        let id = &self.providers[provider].id;
+        match &self.agents[agent].status {
+            AgentStatus::Provider { id: picked } => picked == id,
+            AgentStatus::Multi { ids } => ids.contains(id),
+            _ => false,
         }
     }
 
@@ -996,41 +1068,32 @@ impl Store {
     pub fn pill(&self, agent: usize) -> (Vec<Logo>, SharedString) {
         let index = agent;
         let agent = &self.agents[agent];
-        match &agent.selection {
-            Selection::Single(Some(p)) => (
-                vec![logo(&self.providers[*p])],
-                self.providers[*p].name.clone().into(),
-            ),
-            // 文件连的不是列表里的哪家：「自定义 · 主机名」；地址对得上、Key 不一样：「DeepSeek · Key 不一致」。
-            Selection::Single(None) => match &agent.current {
-                Some(Current::Custom { host }) => {
-                    let label = match host {
-                        Some(host) => t!("pill.custom", host = host),
-                        None => t!("pill.custom_bare"),
-                    };
-                    (vec![agent.logo], label.into())
-                }
-                Some(Current::KeyMismatch { provider }) => {
-                    let found = self.providers.iter().find(|p| &p.id == provider);
-                    let name = found.map(|p| p.name.clone()).unwrap_or_default();
-                    let logos = found.map(logo).into_iter().collect();
-                    (logos, t!("pill.key_mismatch", name = name).into())
-                }
-                // 配置文件解析不了：不能冒充「默认」，选一家时的报错会说明哪一行坏了。
-                None if agent.selectable() => (vec![agent.logo], t!("pill.unreadable").into()),
-                // 官方登录写成一家供应商（「Anthropic 官方」，厂商的图标）；存过几个官方账号时写现在登的是哪个。
-                _ => {
-                    let logo = crate::official::logo(self, index);
-                    match self.live_label(index) {
-                        Some(label) => (vec![logo], label.into()),
-                        None => (vec![logo], crate::official::name(agent.kind)),
-                    }
-                }
+        let found = |id: &str| self.providers.iter().find(|p| p.id == id);
+        match &agent.status {
+            AgentStatus::Provider { id } => match found(id) {
+                Some(p) => (vec![logo(p)], p.name.clone().into()),
+                // 刚删掉、快照还没读回来的一瞬间。
+                None => (vec![agent.logo], id.clone().into()),
             },
-            Selection::Multi(enabled) if enabled.is_empty() => {
-                (vec![agent.logo], t!("multi.none").into())
+            // 文件连的不是列表里的哪家：「自定义 · 主机名」；地址对得上、Key 不一样：「DeepSeek · Key 不一致」。
+            AgentStatus::Custom { host, .. } => {
+                let label = match host {
+                    Some(host) => t!("pill.custom", host = host),
+                    None => t!("pill.custom_bare"),
+                };
+                (vec![agent.logo], label.into())
             }
-            Selection::Multi(enabled) => {
+            AgentStatus::KeyMismatch { id, .. } => {
+                let found = found(id);
+                let name = found.map(|p| p.name.clone()).unwrap_or_default();
+                let logos = found.map(logo).into_iter().collect();
+                (logos, t!("pill.key_mismatch", name = name).into())
+            }
+            _ if agent.mode == Mode::Coexist => {
+                let enabled = self.enabled(index);
+                if enabled.is_empty() {
+                    return (vec![agent.logo], t!("multi.none").into());
+                }
                 let logos = enabled.iter().map(|&p| logo(&self.providers[p])).collect();
                 let label = if enabled.len() == 1 {
                     t!("multi.count_one")
@@ -1038,6 +1101,16 @@ impl Store {
                     t!("multi.count_other", count = enabled.len())
                 };
                 (logos, label.into())
+            }
+            // 配置文件解析不了：不能冒充「默认」，选一家时的报错会说明哪一行坏了。
+            AgentStatus::Unreadable => (vec![agent.logo], t!("pill.unreadable").into()),
+            // 官方登录写成一家供应商（「Anthropic 官方」，厂商的图标）；存过几个官方账号时写现在登的是哪个。
+            AgentStatus::Official | AgentStatus::Absent | AgentStatus::Multi { .. } => {
+                let logo = crate::official::logo(self, index);
+                match self.live_label(index) {
+                    Some(label) => (vec![logo], label.into()),
+                    None => (vec![logo], crate::official::name(agent.kind)),
+                }
             }
         }
     }
@@ -1151,9 +1224,24 @@ mod tests {
     // 不能 `use super::*`：gpui 也导出一个 `test` 属性宏，会把 `#[test]` 抢走。
     use std::path::Path;
 
+    use confdeck_core::status::AgentStatus;
     use confdeck_core::{apply, preset};
 
-    use super::{AGENTS, key_tail, logo};
+    use super::{AGENTS, key_tail, logo, settled};
+
+    #[test]
+    fn settled_means_the_file_is_what_is_shown() {
+        let relay = AgentStatus::Provider { id: "relay".into() };
+        assert!(settled(Some(&relay), &relay));
+        // 刚选了别家、文件还没写完。
+        assert!(!settled(Some(&AgentStatus::Official), &relay));
+        assert!(!settled(None, &relay));
+        // 文件读不了时不拿文件里的值。
+        assert!(!settled(
+            Some(&AgentStatus::Unreadable),
+            &AgentStatus::Unreadable
+        ));
+    }
 
     /// 写死的配置文件路径要和 core 适配器写的文件一致，不然「配置文件存在」和实际写的不是同一个文件。
     #[test]

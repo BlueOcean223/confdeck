@@ -18,6 +18,7 @@ use confdeck_core::agent::{self, AgentKind, FileSetup, Mode, claude, slots};
 use confdeck_core::engine::{EngineError, LiveFile, Snapshot};
 use confdeck_core::patch::{self, Format, PatchError};
 use confdeck_core::provider::{AgentOverride, Model, Protocol, Provider};
+use confdeck_core::status::AgentStatus;
 use gpui_kit::component::input::{
     Editor as CodeEditor, EditorState, Input, InputEvent, InputState,
 };
@@ -26,7 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::{self, Selection, Store};
+use crate::data::{self, Store};
 use crate::picker::{Picker, PickerEvent};
 use crate::theme::Theme;
 use crate::ui::{self, Button};
@@ -86,6 +87,8 @@ pub struct ConfigPage {
     in_use: Vec<String>,
     /// 文件连的就是选中的那家（`Store::settled`）。不是时下拉框不拿文件里的值。
     settled: bool,
+    /// 上次读文件时 Store 换上过几份快照（`Store::generation`）。没换过就不重读文件：Store 别的通知（额度查回来了这类）和文件无关。
+    seen: u64,
     raw: Option<RawEditor>,
     saving: bool,
     /// 保存没成的原因，显示在底栏。
@@ -213,6 +216,7 @@ impl ConfigPage {
             drafts: Vec::new(),
             in_use: Vec::new(),
             settled: false,
+            seen: 0,
             raw,
             saving: false,
             failure: None,
@@ -220,6 +224,7 @@ impl ConfigPage {
             _subscriptions: subscriptions,
         };
         page.settled = page.store.read(cx).settled(agent);
+        page.seen = page.store.read(cx).generation();
         page.reparse(cx);
         page
     }
@@ -285,7 +290,7 @@ impl ConfigPage {
             return;
         }
         let store = self.store.read(cx);
-        self.settled = store.settled(self.agent);
+        let was_settled = std::mem::replace(&mut self.settled, store.settled(self.agent));
         if !self.drafts.is_empty() && in_use(store, self.agent) != self.in_use {
             self.drafts.clear();
         }
@@ -300,18 +305,28 @@ impl ConfigPage {
         if self.hand_edited(cx) {
             return;
         }
+        let generation = store.generation();
+        let stale = generation != self.seen;
+        self.seen = generation;
         let Some(raw) = &mut self.raw else {
             return;
         };
-        let (snapshot, text, error) = read(store, &raw.file);
-        if snapshot.digest == raw.snapshot.digest && !dropped {
-            self.reparse(cx);
-            return;
+        if stale {
+            let (snapshot, text, error) = read(store, &raw.file);
+            if snapshot.digest != raw.snapshot.digest {
+                raw.snapshot = snapshot;
+                raw.loaded = text;
+                raw.error = error;
+                self.sync(window, cx);
+                return;
+            }
         }
-        raw.snapshot = snapshot;
-        raw.loaded = text;
-        raw.error = error;
-        self.sync(window, cx);
+        // 编辑框没变、快照也没换：下拉框的值不会变，不再解析（Codex 解析时要读模型目录）。
+        if dropped {
+            self.sync(window, cx);
+        } else if stale || was_settled != self.settled {
+            self.reparse(cx);
+        }
     }
 
     /// 编辑框换成「读出来的内容 + 草稿」：没手改时用。
@@ -552,10 +567,7 @@ impl ConfigPage {
 
     /// 单选 agent 现在用的那家。
     fn single(&self, store: &Store) -> Option<usize> {
-        match &store.agents[self.agent].selection {
-            Selection::Single(Some(p)) => Some(*p),
-            _ => None,
-        }
+        store.picked(self.agent)
     }
 
     /// 手填的输入框此刻对着哪家：单选是当前那家，多选是展开的那块。
@@ -941,14 +953,18 @@ impl ConfigPage {
     fn models_card(&self, t: &Theme, window: &mut Window, cx: &Context<Self>) -> Option<Div> {
         let store = self.store.read(cx);
         let kind = self.kind(store);
-        match &store.agents[self.agent].selection {
-            Selection::Single(Some(p)) => Some(match kind {
-                AgentKind::ClaudeCode => self.slots_card(*p, kind, store, t, cx),
-                _ => self.list_card(*p, kind, store, t, window, cx),
-            }),
-            Selection::Single(None) => None,
-            Selection::Multi(enabled) if enabled.is_empty() => None,
-            Selection::Multi(enabled) => Some(self.multi_card(enabled, kind, store, t, window, cx)),
+        match store.agents[self.agent].mode {
+            Mode::Switch => {
+                let p = store.picked(self.agent)?;
+                Some(match kind {
+                    AgentKind::ClaudeCode => self.slots_card(p, kind, store, t, cx),
+                    _ => self.list_card(p, kind, store, t, window, cx),
+                })
+            }
+            Mode::Coexist => {
+                let enabled = store.enabled(self.agent);
+                (!enabled.is_empty()).then(|| self.multi_card(&enabled, kind, store, t, window, cx))
+            }
         }
     }
 
@@ -1690,10 +1706,10 @@ fn set_text(raw: &mut RawEditor, text: String, window: &mut Window, cx: &mut App
 
 /// 这个 agent 在用哪几家（供应商 id）。
 fn in_use(store: &Store, agent: usize) -> Vec<String> {
-    let ids = |ps: &[usize]| ps.iter().map(|&p| store.providers[p].id.clone()).collect();
-    match &store.agents[agent].selection {
-        Selection::Single(p) => ids(p.as_slice()),
-        Selection::Multi(ps) => ids(ps),
+    match &store.agents[agent].status {
+        AgentStatus::Provider { id } => vec![id.clone()],
+        AgentStatus::Multi { ids } => ids.clone(),
+        _ => Vec::new(),
     }
 }
 

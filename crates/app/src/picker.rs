@@ -17,15 +17,15 @@
 use std::time::Duration;
 
 use confdeck_core::agent::{Connection, Credential, Mode};
-use confdeck_core::current::Current;
 use confdeck_core::provider::Provider;
+use confdeck_core::status::AgentStatus;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::{self, Logo, Selection, Store, Unusable};
+use crate::data::{self, Logo, Store, Unusable};
 use crate::theme::Theme;
 use crate::ui;
 
@@ -83,8 +83,8 @@ struct Choice {
     name: Option<SharedString>,
     email: SharedString,
     plan: Option<SharedString>,
-    /// 登录文件现在是它。
-    live: bool,
+    /// 在用（[`crate::official::Entry::in_use`]）：打勾、打开时高亮。
+    in_use: bool,
 }
 
 /// 列表里的一行。
@@ -178,11 +178,8 @@ impl Picker {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(t!("picker.filter")));
         input.update(cx, |input, cx| input.focus(window, cx));
 
-        let (multi, pinned) = match &store.read(cx).agents[agent].selection {
-            Selection::Single(_) => (false, Vec::new()),
-            Selection::Multi(enabled) => (true, enabled.clone()),
-        };
-        debug_assert_eq!(multi, store.read(cx).agents[agent].mode == Mode::Coexist);
+        let multi = store.read(cx).agents[agent].mode == Mode::Coexist;
+        let pinned = store.read(cx).enabled(agent);
         let now = if multi {
             None
         } else {
@@ -240,12 +237,13 @@ impl Picker {
         };
         // 单选时高亮现在用的那家；没有在用的（默认、自定义、多选）高亮第一个选得了的行。
         let rows = picker.rows(cx);
-        let current = match &picker.store.read(cx).agents[agent].selection {
-            Selection::Single(Some(p)) => Some(Pick::Option(Some(*p))),
-            Selection::Single(None) => picker
+        let store = picker.store.read(cx);
+        let current = match &store.agents[agent].status {
+            AgentStatus::Provider { .. } => store.picked(agent).map(|p| Pick::Option(Some(p))),
+            AgentStatus::Official => picker
                 .accounts
                 .iter()
-                .position(|choice| choice.live)
+                .position(|choice| choice.in_use)
                 .map(Pick::Account),
             _ => None,
         };
@@ -279,7 +277,7 @@ impl Picker {
                     .plan
                     .as_deref()
                     .map(|plan| SharedString::from(ui::capitalize(plan))),
-                live: entry.live,
+                in_use: entry.in_use,
             })
             .collect()
     }
@@ -287,18 +285,16 @@ impl Picker {
     /// 「现在」那组：文件连的不是 confdeck 列表里的哪家时才有。
     fn now(store: &Store, agent: usize) -> Option<Now> {
         let row = &store.agents[agent];
-        if !matches!(row.selection, Selection::Single(None)) {
-            return None;
-        }
-        let (logos, title) = store.pill(agent);
-        match row.current.as_ref()? {
-            Current::Custom { .. } => {
+        match &row.status {
+            AgentStatus::Custom {
+                connection, draft, ..
+            } => {
+                let (logos, title) = store.pill(agent);
                 // 小字是文件里的地址；Bedrock 这类没有地址的接法说一句是什么。
-                let sub: SharedString = match store.connection(agent) {
-                    Some(Connection::Endpoint { base_url, .. }) => base_url.into(),
+                let sub: SharedString = match connection {
+                    Connection::Endpoint { base_url, .. } => base_url.clone().into(),
                     _ => t!("picker.other_setup").into(),
                 };
-                let draft = store.draft(agent);
                 let actions = draft
                     .is_some()
                     .then_some(Action::SaveAs)
@@ -310,18 +306,17 @@ impl Picker {
                     sub,
                     actions,
                     key: None,
-                    draft,
+                    draft: draft.clone(),
                 })
             }
-            Current::KeyMismatch { provider } => {
-                let p = store.providers.iter().position(|x| &x.id == provider)?;
-                let credential = match store.connection(agent) {
-                    Some(Connection::Endpoint { credential, .. }) => credential,
-                    _ => None,
-                };
+            AgentStatus::KeyMismatch { id, credential } => {
+                let (logos, title) = store.pill(agent);
+                let p = store.providers.iter().position(|x| &x.id == id)?;
                 // 只有文件里写的是 Key 本身才能存进供应商（core.md「现在用哪家」）。
                 let (sub, key): (SharedString, Option<String>) = match credential {
-                    Some(Credential::Key(key)) => (t!("picker.key_differs").into(), Some(key)),
+                    Some(Credential::Key(key)) => {
+                        (t!("picker.key_differs").into(), Some(key.clone()))
+                    }
                     Some(Credential::Helper(_)) => (t!("picker.key_helper").into(), None),
                     Some(Credential::EnvVar(var)) => (t!("picker.key_env", var = var).into(), None),
                     None => (t!("picker.key_missing").into(), None),
@@ -339,7 +334,7 @@ impl Picker {
                     draft: None,
                 })
             }
-            Current::Default | Current::Provider(_) => None,
+            _ => None,
         }
     }
 
@@ -627,9 +622,8 @@ impl Picker {
         window: &Window,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
-        let agent = &store.agents[self.agent];
         let choice = &self.accounts[i];
-        let checked = choice.live && matches!(agent.selection, Selection::Single(None));
+        let checked = choice.in_use;
         div()
             .id(ElementId::named_usize("account", n))
             .h_flex()

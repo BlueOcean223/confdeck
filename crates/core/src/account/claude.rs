@@ -121,10 +121,21 @@ fn read_json(path: &Path) -> Result<Option<Value>, EngineError> {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok()))
 }
 
-/// 登着的是谁：只看 `~/.claude.json`，不读钥匙串。
-pub(super) fn live_identity(home: &Path) -> Option<Identity> {
-    let doc = read_json(&home.join(".claude.json")).ok()??;
-    let (key, email, plan) = profile_of(&doc["oauthAccount"], &Value::Null)?;
+/// `~/.claude.json` 的 `oauthAccount`（登着的是谁）。文件常有几百 KB，只解析这一项；没有、读不了是 `None`。
+pub(super) fn read_account(home: &Path) -> Option<Value> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        #[serde(rename = "oauthAccount", default)]
+        account: Value,
+    }
+    let bytes = fsx::read_optional(&home.join(".claude.json")).ok()??;
+    let doc: Doc = serde_json::from_slice(&bytes).ok()?;
+    Some(doc.account).filter(Value::is_object)
+}
+
+/// 登着的是谁（[`read_account`] 读出来的 `oauthAccount`）。不读钥匙串。
+pub(super) fn live_identity(account: &Value) -> Option<Identity> {
+    let (key, email, plan) = profile_of(account, &Value::Null)?;
     Some(Identity {
         id: id_of(&key),
         email,

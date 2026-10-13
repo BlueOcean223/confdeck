@@ -93,6 +93,8 @@ pub struct SettingsPage {
     /// 展开的文件（`files` 的下标）。
     expanded: Option<usize>,
     diff: Option<DiffView>,
+    /// 上次重列备份时 Store 换上过几份快照（`Store::generation`）。
+    seen: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -106,8 +108,13 @@ const SECTIONS: [Section; 3] = [Section::General, Section::Claude, Section::Data
 
 impl SettingsPage {
     pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let _subscription = cx.observe(&store, |this, _, cx| {
-            this.refresh(cx);
+        // Store 换上新快照（写了文件、重读过）才重列备份、重读开关；额度查回来这类通知和文件无关。
+        let _subscription = cx.observe(&store, |this, store, cx| {
+            let generation = store.read(cx).generation();
+            if generation != this.seen {
+                this.seen = generation;
+                this.refresh(cx);
+            }
             cx.notify();
         });
         let proxy = store.read(cx).proxy();
@@ -129,6 +136,7 @@ impl SettingsPage {
         let files = store.read(cx).backups();
         let owners = store.read(cx).backup_owners();
         let claude_toggles = read_toggles(&store, cx);
+        let seen = store.read(cx).generation();
         // 默认看 Claude Code 的（用户 10-12）。
         let owner = owners
             .iter()
@@ -156,6 +164,7 @@ impl SettingsPage {
             just_closed: false,
             expanded: None,
             diff: None,
+            seen,
             _subscriptions: vec![_subscription, proxy_subscription],
         }
     }
@@ -324,9 +333,10 @@ impl SettingsPage {
         cx.notify();
     }
 
-    /// 文件写了（开关、恢复、清理）以后重列备份；点开的差异按新内容重算。
+    /// 文件写了（开关、恢复、清理、别处切换）以后重列备份、重读开关；点开的差异按新内容重算。
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.files = self.store.read(cx).backups();
+        self.claude_toggles = read_toggles(&self.store, cx);
         if self.expanded.is_some_and(|n| n >= self.files.len()) {
             self.expanded = None;
         }

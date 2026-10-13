@@ -61,14 +61,26 @@ impl Check {
     }
 }
 
-/// `state.json` 里 `checks` 一家供应商的键。
-pub fn provider_check_key(id: &str) -> String {
-    format!("provider:{id}")
+/// 一份额度查询设置管的是谁。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CheckKey {
+    /// 一家供应商。
+    Provider(String),
+    /// 一个官方账号（账号 ID，登着的和存下的都是）。
+    Account(AgentKind, String),
+    /// 登录文件里认不出是谁（没登录、Codex 的登录在钥匙串里）：照样查一次，好写「未登录」。
+    Login(AgentKind),
 }
 
-/// `state.json` 里 `checks` 一个官方账号的键。
-pub fn account_check_key(agent: AgentKind, id: &str) -> String {
-    format!("account:{}:{id}", agent.id())
+impl CheckKey {
+    /// 存进 `state.json` 的 `checks` 时的键：`provider:<id>`、`account:<agent>:<id>`、`login:<agent>`。
+    pub fn stored(&self) -> String {
+        match self {
+            Self::Provider(id) => format!("provider:{id}"),
+            Self::Account(agent, id) => format!("account:{}:{id}", agent.id()),
+            Self::Login(agent) => format!("login:{}", agent.id()),
+        }
+    }
 }
 
 /// 一个账号或一个套餐的额度。

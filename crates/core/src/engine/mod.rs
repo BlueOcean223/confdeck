@@ -20,20 +20,18 @@
 
 mod state;
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-
-use chrono::Local;
 
 use crate::backup::{self, Backup, Reason, Shelf};
 use crate::data::DataDir;
 use crate::fsx::{self, Digest, Mode};
 use crate::net::Proxy;
 use crate::patch::{self, Format, KeyPath, LivePatch, PatchError};
-pub use state::Place;
+use crate::quota::{Check, CheckKey};
+pub use state::{Local, Place};
 use state::{Owned, State};
 
 /// 第 6 步发现被外部改了以后最多重来几次。
@@ -191,62 +189,48 @@ impl Engine {
         })
     }
 
-    /// 单选 agent 上次在 confdeck 里选的是哪家：`None` 是没选过，`Some(None)` 是「默认」。
-    pub fn selection(&self, agent: &str) -> Option<Option<String>> {
-        State::load(&self.data.state())
-            .selection(agent)
-            .map(|id| id.map(str::to_string))
+    /// `state.json` 里本机的设置，读一次。
+    pub fn local(&self) -> Local {
+        Local(State::load(&self.data.state()))
+    }
+
+    /// 拿着锁改一下 `state.json`，返回改完的样子。
+    fn edit_state(&self, edit: impl FnOnce(&mut State)) -> Result<Local, EngineError> {
+        let _lock = self.lock()?;
+        let path = self.data.state();
+        let mut state = State::load(&path);
+        edit(&mut state);
+        state.save(&path).map_err(io_error(&path))?;
+        Ok(Local(state))
     }
 
     /// 记下单选 agent 选了哪家（`None` 是「默认」）。只存在本机。
-    pub fn set_selection(&self, agent: &str, provider_id: Option<&str>) -> Result<(), EngineError> {
-        let _lock = self.lock()?;
-        let path = self.data.state();
-        let mut state = State::load(&path);
-        state.select(agent, provider_id);
-        state.save(&path).map_err(io_error(&path))
-    }
-
-    /// 设置页「显示哪些 agent」里在这一处关掉的 agent（id）。
-    pub fn hidden(&self, place: Place) -> BTreeSet<String> {
-        State::load(&self.data.state()).hidden(place).clone()
+    pub fn set_selection(
+        &self,
+        agent: &str,
+        provider_id: Option<&str>,
+    ) -> Result<Local, EngineError> {
+        self.edit_state(|state| state.select(agent, provider_id))
     }
 
     /// 在 Agent 页或面板里显示 / 藏起一个 agent。只存在本机。
-    pub fn set_hidden(&self, place: Place, agent: &str, hidden: bool) -> Result<(), EngineError> {
-        let _lock = self.lock()?;
-        let path = self.data.state();
-        let mut state = State::load(&path);
-        state.set_hidden(place, agent, hidden);
-        state.save(&path).map_err(io_error(&path))
-    }
-
-    /// 设置页的出站代理。
-    pub fn proxy(&self) -> Proxy {
-        State::load(&self.data.state()).proxy().clone()
+    pub fn set_hidden(
+        &self,
+        place: Place,
+        agent: &str,
+        hidden: bool,
+    ) -> Result<Local, EngineError> {
+        self.edit_state(|state| state.set_hidden(place, agent, hidden))
     }
 
     /// 改出站代理。只存在本机。
-    pub fn set_proxy(&self, proxy: Proxy) -> Result<(), EngineError> {
-        let _lock = self.lock()?;
-        let path = self.data.state();
-        let mut state = State::load(&path);
-        state.set_proxy(proxy);
-        state.save(&path).map_err(io_error(&path))
-    }
-
-    /// 额度查询的设置（键见 `state.json` 的 `checks`）。
-    pub fn checks(&self) -> std::collections::BTreeMap<String, crate::quota::Check> {
-        State::load(&self.data.state()).checks().clone()
+    pub fn set_proxy(&self, proxy: Proxy) -> Result<Local, EngineError> {
+        self.edit_state(|state| state.set_proxy(proxy))
     }
 
     /// 改一家供应商或一个账号的额度查询设置。只存在本机。
-    pub fn set_check(&self, key: &str, check: crate::quota::Check) -> Result<(), EngineError> {
-        let _lock = self.lock()?;
-        let path = self.data.state();
-        let mut state = State::load(&path);
-        state.set_check(key, check);
-        state.save(&path).map_err(io_error(&path))
+    pub fn set_check(&self, key: &CheckKey, check: Check) -> Result<Local, EngineError> {
+        self.edit_state(|state| state.set_check(key, check))
     }
 
     /// 上次切换时原始片段写进这个 agent 共用位置的键和值（见 `state.json` 的 `owned`）。
@@ -264,9 +248,6 @@ impl Engine {
         agent: &str,
         entries: &[(KeyPath, serde_json::Value)],
     ) -> Result<(), EngineError> {
-        let _lock = self.lock()?;
-        let path = self.data.state();
-        let mut state = State::load(&path);
         let entries = entries
             .iter()
             .map(|(path, value)| Owned {
@@ -274,8 +255,8 @@ impl Engine {
                 value: value.clone(),
             })
             .collect();
-        state.own(agent, entries);
-        state.save(&path).map_err(io_error(&path))
+        self.edit_state(|state| state.own(agent, entries))
+            .map(|_| ())
     }
 
     /// 按键补丁写入：切换供应商、勾选供应商。
@@ -341,7 +322,7 @@ impl Engine {
                 });
             }
 
-            let now = Local::now().naive_local();
+            let now = chrono::Local::now().naive_local();
             let reason = match kind {
                 Kind::Patch if state.is_ours(&target, pre.digest.as_ref()) => None,
                 Kind::Patch => Some(Reason::External),

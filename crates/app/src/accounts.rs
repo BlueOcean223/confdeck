@@ -1,7 +1,7 @@
 //! `Store` 的官方账号部分（10-13，阶段 4）：Codex、Grok Build、Claude Code 存下的几个官方登录、登录文件现在是谁、正在跑的登录。
 //! core 那边见 `confdeck_core::account`。
 //!
-//! - 每次 `Store::reload` 都 `sync` 一遍：登录文件是存过的账号，就把 agent 新换的令牌存回去。
+//! - 每次 `Store::reload` 读快照时 core 都 `sync` 一遍：登录文件是存过的账号，就把 agent 新换的令牌存回去。
 //! - 加账号：在后台跑 agent 自己的 `login` 命令（家目录指到临时目录），它自己开浏览器；登录完存下来。
 //!   等太久 core 会停掉它（`Login::wait`）；应用退出时停掉在跑的登录、删掉临时目录，强退留下的下次启动时收拾。
 //! - 选择器或供应商页上选一个账号：这个 agent 不在「默认」就先切回默认，再换登录文件。
@@ -10,14 +10,15 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use confdeck_core::account::{self, Account, AccountError, Live, Login, LoginHandle};
+use confdeck_core::account::{self, Account, AccountError, Accounts, Live, Login, LoginHandle};
 use confdeck_core::agent::AgentKind;
 use confdeck_core::apply;
+use confdeck_core::quota::CheckKey;
+use confdeck_core::status::AgentStatus;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::{Notice, Selection, Store};
-use crate::usage::CheckOf;
+use crate::data::{Notice, Store};
 
 #[derive(Default)]
 pub(crate) struct AccountState {
@@ -44,44 +45,13 @@ pub(crate) struct Pending {
 }
 
 impl Store {
-    /// 重读存下的账号，看登录文件现在是谁（顺带把 agent 新换的令牌存回去）。`reload` 末尾调。
-    pub(crate) fn reload_accounts(&mut self) {
-        let mut live = HashMap::new();
-        let mut blocked = HashSet::new();
-        let mut error = None;
-        for agent in self
-            .agents
-            .iter()
-            .filter(|a| a.installed && account::supported(a.kind))
-        {
-            if account::blocked(&self.home, agent.kind) {
-                blocked.insert(agent.kind);
-                continue;
-            }
-            match account::sync(&self.engine, &self.home, agent.kind) {
-                Ok(found) => {
-                    live.insert(agent.kind, found);
-                }
-                Err(err) => error = Some(err.to_string()),
-            }
-        }
-        match account::list(self.engine.data()) {
-            Ok(list) => self.accounts.list = list,
-            Err(err) => {
-                self.accounts.list = Vec::new();
-                error = Some(err.to_string());
-            }
-        }
-        self.accounts.live = live;
-        self.accounts.blocked = blocked;
-        self.accounts.error = error;
-        let claude = self
-            .agents
-            .iter()
-            .any(|a| a.kind == AgentKind::ClaudeCode && a.installed);
-        self.accounts.claude = claude
-            .then(|| account::claude_profile(&self.home))
-            .flatten();
+    /// 换上快照里的账号（`Store::reload` 读完调）。
+    pub(crate) fn apply_accounts(&mut self, accounts: Accounts) {
+        self.accounts.list = accounts.list;
+        self.accounts.live = accounts.live;
+        self.accounts.blocked = accounts.blocked;
+        self.accounts.claude = accounts.claude;
+        self.accounts.error = accounts.error.map(|err| err.to_string());
     }
 
     /// 这个 agent 存下的账号。
@@ -136,7 +106,24 @@ impl Store {
         cx: &mut Context<Self>,
     ) {
         let result = account::label(&self.engine, &self.home, kind, id, name, note);
-        self.reload();
+        if let Ok(labeled) = &result {
+            // 先换上，不等快照（名字不闪回旧的）。登录文件里没存的那个这时存下了。
+            let list = &mut self.accounts.list;
+            match list
+                .iter_mut()
+                .find(|a| a.agent == kind && a.id == labeled.id)
+            {
+                Some(slot) => *slot = labeled.clone(),
+                None => list.push(labeled.clone()),
+            }
+            if matches!(self.accounts.live.get(&kind), Some(Live::Unknown(identity)) if identity.id == labeled.id)
+            {
+                self.accounts
+                    .live
+                    .insert(kind, Live::Known(labeled.id.clone()));
+            }
+        }
+        self.reload(cx);
         if let Err(err) = result {
             let notice = Notice::err(describe(&err));
             self.announce(&[notice], cx);
@@ -216,8 +203,16 @@ impl Store {
                     .logins
                     .remove(&kind)
                     .is_some_and(|pending| pending.cancelled);
-                store.reload();
                 let added = result.as_ref().ok().map(|account| account.id.clone());
+                // 新加的账号还没有额度读数，不查的话一直是占位条，要等下一次刷新（10-13 用户截图里看到的）。
+                // 按读回来的账号查：新账号要在列表里，登录文件现在是谁也要是新的。
+                store.reload_then(cx, move |store, cx| {
+                    if let Some(id) = added {
+                        store.check_one(&CheckKey::Account(kind, id), cx);
+                    }
+                    let live = store.live_target(kind);
+                    store.check_one(&live, cx);
+                });
                 let notice = match result {
                     Ok(account) => Notice::ok(t!(
                         "accounts.added",
@@ -230,12 +225,6 @@ impl Store {
                     Err(err) => Notice::err(describe(&err)),
                 };
                 store.announce(&[notice], cx);
-                // 新加的账号还没有额度读数，不查的话一直是占位条，要等下一次刷新（10-13 用户截图里看到的）。
-                if let Some(id) = added {
-                    store.check_one(&CheckOf::Account(kind, id), cx);
-                }
-                let live = store.live_target(kind);
-                store.check_one(&live, cx);
             })
             .ok();
         })
@@ -266,13 +255,7 @@ impl Store {
         cx: &mut Context<Self>,
     ) -> Task<Vec<Notice>> {
         let kind = self.agents[agent].kind;
-        let to_default = !matches!(
-            (&self.agents[agent].selection, &self.agents[agent].current),
-            (
-                Selection::Single(None),
-                Some(confdeck_core::current::Current::Default)
-            )
-        );
+        let to_default = self.agents[agent].status != AgentStatus::Official;
         let email = self
             .accounts
             .list
@@ -285,9 +268,9 @@ impl Store {
         if unchanged {
             return Task::ready(Vec::new());
         }
-        self.agents[agent].selection = Selection::Single(None);
-        self.agents[agent].current = Some(confdeck_core::current::Current::Default);
+        self.agents[agent].status = AgentStatus::Official;
         self.accounts.live.insert(kind, Live::Known(id.clone()));
+        self.touch();
         cx.notify();
 
         let engine = self.engine.clone();
@@ -303,7 +286,7 @@ impl Store {
         cx.spawn(async move |this, cx| {
             let result = write.await;
             this.update(cx, |store, cx| {
-                store.reload();
+                store.reload(cx);
                 let notices = match result {
                     Ok(()) => vec![Notice::ok(t!(
                         "write.switched",
@@ -329,7 +312,12 @@ impl Store {
     /// 删掉一个存下的账号。登录文件不动。
     pub fn remove_account(&mut self, kind: AgentKind, id: &str, cx: &mut Context<Self>) {
         let result = account::remove(&self.engine, &self.home, kind, id);
-        self.reload();
+        if result.is_ok() {
+            self.accounts
+                .list
+                .retain(|a| !(a.agent == kind && a.id == id));
+        }
+        self.reload(cx);
         if let Err(err) = result {
             let notice = Notice::err(describe(&err));
             self.announce(&[notice], cx);

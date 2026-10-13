@@ -92,19 +92,20 @@ pub enum Reach {
 impl Store {
     /// 设置页的出站代理。
     pub fn proxy(&self) -> Proxy {
-        self.engine.proxy()
+        self.local.proxy().clone()
     }
 
     /// 改出站代理（存在 `state.json`）。存不了报错。
     pub fn set_proxy(&mut self, proxy: Proxy, cx: &mut Context<Self>) {
-        if let Err(err) = self.engine.set_proxy(proxy) {
-            self.announce(
+        match self.engine.set_proxy(proxy) {
+            Ok(local) => self.set_local(local),
+            Err(err) => self.announce(
                 &[Notice::err(t!(
                     "net.proxy_not_saved",
                     error = err.to_string()
                 ))],
                 cx,
-            );
+            ),
         }
         cx.notify();
     }
@@ -302,7 +303,7 @@ impl Store {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |store, cx| {
-                store.reload();
+                store.reload(cx);
                 let notices = describe_import(count, result);
                 store.announce(&notices, cx);
             })

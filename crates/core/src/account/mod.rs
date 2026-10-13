@@ -6,7 +6,7 @@
 //! - **登录**（[`Login`]）：不自己做 OAuth，用 agent 自己的 `login` 命令，把它的家目录（`CODEX_HOME`、`GROK_HOME`）
 //!   指到一个临时目录；登录完读那里的 `auth.json` 存成账号（[`add`]），删掉临时目录。
 //! - **换下来的登录先存好**：agent 用着用着会换新令牌（刷新令牌用一次就作废），所以切换（[`switch`]）时先把登录文件
-//!   现在的内容存回它所属的账号（比存着的新才存；不认识的账号存成新账号），再写入要切的账号。[`sync`] 平时也这样存。
+//!   现在的内容存回它所属的账号（比存着的新才存；不认识的账号存成新账号），再写入要切的账号。每次读快照时（`read_all`）也这样存。
 //! - **认账号**（[`identify`]）：Codex 看 `id_token` 里的用户和工作区（同一个人的个人、团队工作区算两个），
 //!   Grok 看 `user_id` 和 `team_id`。账号 ID 是这两样的 hash。
 //! - **不换令牌**：confdeck 不用刷新令牌（同「订阅额度」）。存着不用的账号放久了令牌可能失效，到时候重新登录。
@@ -14,6 +14,7 @@
 
 pub mod claude;
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -27,12 +28,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::AgentKind;
+use crate::apply::CodexFiles;
 use crate::data::DataDir;
 use crate::engine::{Engine, EngineError, LiveFile, Outcome};
 use crate::fsx::{self, Digest, Mode};
 use crate::keychain::Keychain;
 use crate::patch::Format;
-use crate::quota::{self, Check};
+use crate::quota::{Check, CheckKey};
 
 /// 能存多个官方账号的 agent。
 pub const SUPPORTED: [AgentKind; 3] = [
@@ -136,12 +138,9 @@ pub fn login_file(home: &Path, kind: AgentKind) -> Option<LiveFile> {
 }
 
 /// Codex 的登录存在钥匙串里（`config.toml` 的 `cli_auth_credentials_store` 不是 `file`）时，换 `auth.json` 没用。
-/// confdeck 不读钥匙串，这时不让切。
-pub fn blocked(home: &Path, kind: AgentKind) -> bool {
-    if kind != AgentKind::Codex {
-        return false;
-    }
-    let Ok(text) = fs::read_to_string(home.join(".codex").join("config.toml")) else {
+/// confdeck 不读钥匙串，这时不让切。`config` 是读好的 `config.toml`（没有是 `None`）。
+fn codex_blocked(config: Option<&[u8]>) -> bool {
+    let Some(text) = config.and_then(|bytes| std::str::from_utf8(bytes).ok()) else {
         return false;
     };
     let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
@@ -159,12 +158,10 @@ pub struct Profile {
     pub plan: Option<String>,
 }
 
-/// Claude Code 登着的官方账号：`~/.claude.json` 的 `oauthAccount`（邮箱 `emailAddress`；`organizationType` 去掉 `claude_`
-/// 是套餐）。这里只有资料，凭证在钥匙串里，confdeck 不读。没登录官方的是 `None`。Claude Code 不能存多个账号。
-pub fn claude_profile(home: &Path) -> Option<Profile> {
-    let bytes = fs::read(home.join(".claude.json")).ok()?;
-    let json: Value = serde_json::from_slice(&bytes).ok()?;
-    let account = json.get("oauthAccount").filter(|a| a.is_object())?;
+/// Claude Code 登着的官方账号的资料：`~/.claude.json` 的 `oauthAccount`（邮箱 `emailAddress`；`organizationType` 去掉 `claude_`
+/// 是套餐）。这里只有资料，凭证在钥匙串里，confdeck 不读。
+fn profile_of(account: &Value) -> Option<Profile> {
+    account.as_object()?;
     let text = |key: &str| {
         account[key]
             .as_str()
@@ -376,7 +373,7 @@ fn write_stored(
     fsx::write_atomic(&path, bytes, Mode::Private).map_err(io_error(&path))
 }
 
-/// 把一份登录存进它的账号。调用的人拿着引擎的锁。
+/// 把一份登录存进它的账号，返回写了没有（存着的登录、`accounts.json` 有一样变了）。调用的人拿着引擎的锁。
 fn keep(
     data: &DataDir,
     home: &Path,
@@ -384,7 +381,7 @@ fn keep(
     identity: &Identity,
     bytes: &[u8],
     how: Keep,
-) -> Result<(), EngineError> {
+) -> Result<bool, EngineError> {
     let mut book = load(data)?;
     let mut changed = false;
     match book
@@ -392,7 +389,7 @@ fn keep(
         .iter_mut()
         .find(|account| account.agent == kind && account.id == identity.id)
     {
-        None if how == Keep::Known => return Ok(()),
+        None if how == Keep::Known => return Ok(false),
         None => {
             book.accounts.push(Account {
                 id: identity.id.clone(),
@@ -418,7 +415,25 @@ fn keep(
         }
     }
     let stored = read_stored(data, home, kind, &identity.id)?;
-    let replace = match stored.as_deref() {
+    let replace = replaces(kind, identity, stored.as_deref(), bytes, how);
+    if replace {
+        write_stored(data, home, kind, &identity.id, bytes)?;
+    }
+    if changed {
+        save(data, &book)?;
+    }
+    Ok(replace || changed)
+}
+
+/// 存着的登录 `stored` 要不要换成 `bytes`（是 `identity` 的）：一样的不换，旧的不换（刚登录的除外）。
+fn replaces(
+    kind: AgentKind,
+    identity: &Identity,
+    stored: Option<&[u8]>,
+    bytes: &[u8],
+    how: Keep,
+) -> bool {
+    match stored {
         None => true,
         Some(old) if old == bytes => false,
         _ if how == Keep::Fresh => true,
@@ -431,47 +446,144 @@ fn keep(
             (None, Some(_)) => false,
             _ => true,
         },
-    };
-    if replace {
-        write_stored(data, home, kind, &identity.id, bytes)?;
     }
-    if changed {
-        save(data, &book)?;
-    }
-    Ok(())
 }
 
-/// 看登录文件现在是谁；是存过的账号，就把文件里的登录存回去（比存着的新才存）。没存过的不存。
-/// Claude Code 的只看 `~/.claude.json` 是谁，不读钥匙串：它的令牌在切走的时候存（[`switch`]）。
-pub fn sync(engine: &Engine, home: &Path, kind: AgentKind) -> Result<Live, AccountError> {
-    let (identity, bytes) = if kind == AgentKind::ClaudeCode && supported(kind) {
-        match claude::live_identity(home) {
-            Some(identity) => (identity, None),
-            None => return Ok(Live::LoggedOut),
-        }
-    } else {
-        let file = login_file(home, kind).ok_or(AccountError::Unsupported)?;
-        let Some(bytes) = fsx::read_optional(&file.path).map_err(io_error(&file.path))? else {
-            return Ok(Live::LoggedOut);
-        };
-        let Some(identity) = identify(kind, &bytes) else {
-            return Ok(Live::LoggedOut);
-        };
-        (identity, Some(bytes))
+/// 登录文件里认出来的登录：是谁，和文件原样的内容（Claude Code 的令牌在钥匙串里，没有内容）。
+struct Found {
+    identity: Identity,
+    bytes: Option<Vec<u8>>,
+}
+
+/// Codex、Grok 的登录文件里是谁；没有文件、认不出是 `None`。
+fn read_login(home: &Path, kind: AgentKind) -> Result<Option<Found>, AccountError> {
+    let file = login_file(home, kind).ok_or(AccountError::Unsupported)?;
+    let bytes = fsx::read_optional(&file.path).map_err(io_error(&file.path))?;
+    Ok(found_in(kind, bytes))
+}
+
+/// [`read_login`]，文件已经读好了。
+fn found_in(kind: AgentKind, bytes: Option<Vec<u8>>) -> Option<Found> {
+    let bytes = bytes?;
+    identify(kind, &bytes).map(|identity| Found {
+        identity,
+        bytes: Some(bytes),
+    })
+}
+
+/// 登录文件里认出来的是存过的账号，就把文件里的登录存回去（比存着的新才存；没存过的不存）。`accounts` 是读好的存下的账号。
+/// 没有要存的（一样，或者存着的更新）时不拿锁、不再读 `accounts.json`。第二项是存回去了没有（存了的话 `accounts.json` 里的邮箱、套餐可能变了）。
+fn sync_found(
+    engine: &Engine,
+    home: &Path,
+    kind: AgentKind,
+    accounts: &[Account],
+    found: Found,
+) -> Result<(Live, bool), AccountError> {
+    let Found { identity, bytes } = found;
+    let Some(account) = accounts
+        .iter()
+        .find(|account| account.agent == kind && account.id == identity.id)
+    else {
+        return Ok((Live::Unknown(identity), false));
+    };
+    let Some(bytes) = bytes else {
+        return Ok((Live::Known(identity.id), false));
     };
     let data = engine.data();
-    let known = load(data)?
-        .accounts
-        .iter()
-        .any(|account| account.agent == kind && account.id == identity.id);
-    if !known {
-        return Ok(Live::Unknown(identity));
-    }
-    if let Some(bytes) = bytes {
+    let profile_changed = [
+        (&account.email, &identity.email),
+        (&account.plan, &identity.plan),
+    ]
+    .into_iter()
+    .any(|(field, value)| value.is_some() && field != value);
+    let stored = read_stored(data, home, kind, &identity.id)?;
+    let differs =
+        profile_changed || replaces(kind, &identity, stored.as_deref(), &bytes, Keep::Known);
+    let mut kept = false;
+    if differs {
         let _lock = engine.lock()?;
-        keep(data, home, kind, &identity, &bytes, Keep::Known)?;
+        kept = keep(data, home, kind, &identity, &bytes, Keep::Known)?;
     }
-    Ok(Live::Known(identity.id))
+    Ok((Live::Known(identity.id), kept))
+}
+
+/// 一次快照里的官方账号（[`crate::status`]）。
+#[derive(Debug, Default)]
+pub struct Accounts {
+    /// 存下的全部账号，先存的在前。
+    pub list: Vec<Account>,
+    /// 装了的、能存多个账号的 agent 的登录文件现在是谁。
+    pub live: HashMap<AgentKind, Live>,
+    /// Codex 的登录存在钥匙串里（`config.toml` 的 `cli_auth_credentials_store` 不是 `file`）：切不了。
+    pub blocked: HashSet<AgentKind>,
+    /// Claude Code 登着的官方账号的资料。存不了多个 Claude 账号（不是 macOS）时界面用它。
+    pub claude: Option<Profile>,
+    /// `accounts.json` 读不了、登录存不回去的原因（有好几个时是最后一个）。
+    pub error: Option<AccountError>,
+}
+
+/// 读官方账号：每个装了的、能存多个账号的 agent 的登录文件现在是谁；是存过的账号，顺带把 agent 新换的令牌存回去。
+/// `installed` 是装了的 agent；`codex` 是读好的 Codex `config.toml`（看登录是不是在钥匙串里）和 `auth.json`（登录文件）。
+/// `accounts.json`、`~/.claude.json` 各读一次。Claude Code 的只看 `~/.claude.json` 是谁，不读钥匙串：
+/// 它的令牌在切走的时候存（[`switch`]）。
+pub(crate) fn read_all(
+    engine: &Engine,
+    home: &Path,
+    installed: &[AgentKind],
+    codex: CodexFiles,
+) -> Accounts {
+    let mut accounts = Accounts::default();
+    let claude = installed
+        .contains(&AgentKind::ClaudeCode)
+        .then(|| claude::read_account(home))
+        .flatten();
+    accounts.claude = claude.as_ref().and_then(profile_of);
+    let book = list(engine.data());
+    let mut saved = false;
+    for kind in SUPPORTED {
+        if !supported(kind) || !installed.contains(&kind) {
+            continue;
+        }
+        if kind == AgentKind::Codex && codex_blocked(codex.config) {
+            accounts.blocked.insert(kind);
+            continue;
+        }
+        let Ok(book) = &book else {
+            continue;
+        };
+        let found = match kind {
+            AgentKind::ClaudeCode => {
+                Ok(claude
+                    .as_ref()
+                    .and_then(claude::live_identity)
+                    .map(|identity| Found {
+                        identity,
+                        bytes: None,
+                    }))
+            }
+            AgentKind::Codex => Ok(found_in(kind, codex.auth.map(<[u8]>::to_vec))),
+            _ => read_login(home, kind),
+        };
+        let live = found.and_then(|found| match found {
+            None => Ok((Live::LoggedOut, false)),
+            Some(found) => sync_found(engine, home, kind, book, found),
+        });
+        match live {
+            Ok((live, kept)) => {
+                saved |= kept;
+                accounts.live.insert(kind, live);
+            }
+            Err(err) => accounts.error = Some(err),
+        }
+    }
+    // 存回去的时候邮箱、套餐可能改了：再读一次。
+    let book = if saved { list(engine.data()) } else { book };
+    match book {
+        Ok(list) => accounts.list = list,
+        Err(err) => accounts.error = Some(err),
+    }
+    accounts
 }
 
 /// 切到一个存下的账号：先把登录文件现在的内容存好（没存过的账号存成新账号），再写入这个账号的登录。
@@ -645,7 +757,7 @@ pub fn remove(engine: &Engine, home: &Path, kind: AgentKind, id: &str) -> Result
         }
     };
     // 这个账号的额度查询设置不留（同 `apply::delete_provider`）。`set_check` 自己拿锁，放在锁外面。
-    let _ = engine.set_check(&quota::account_check_key(kind, id), Check::default());
+    let _ = engine.set_check(&CheckKey::Account(kind, id.to_string()), Check::default());
     Ok(removed?)
 }
 
@@ -950,7 +1062,7 @@ impl LoginHandle {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
@@ -969,7 +1081,7 @@ mod tests {
     }
 
     /// Codex 的 `auth.json`：`user` 和工作区决定是谁，`refresh` 是第几次换的令牌。
-    fn codex_auth(user: &str, workspace: &str, refresh: u32) -> Vec<u8> {
+    pub(crate) fn codex_auth(user: &str, workspace: &str, refresh: u32) -> Vec<u8> {
         let claims = json!({
             "email": format!("{user}@example.com"),
             "https://api.openai.com/auth": {
@@ -1024,6 +1136,24 @@ mod tests {
         identify(AgentKind::Codex, bytes).unwrap().id
     }
 
+    /// 快照读官方账号的那一步（`read_all`），Codex 的两个文件照快照那样先读好。
+    fn read(s: &Setup, kind: AgentKind) -> Accounts {
+        let config = fs::read(s.home.join(".codex/config.toml")).ok();
+        let auth = s.auth();
+        let codex = CodexFiles {
+            config: config.as_deref(),
+            auth: auth.as_deref(),
+        };
+        read_all(&s.engine, &s.home, &[kind], codex)
+    }
+
+    /// 登录文件现在是谁（[`read`]）。
+    fn live(s: &Setup, kind: AgentKind) -> Live {
+        let mut accounts = read(s, kind);
+        assert!(accounts.error.is_none(), "{:?}", accounts.error);
+        accounts.live.remove(&kind).expect("the agent is read")
+    }
+
     #[test]
     fn base64url_decodes_without_padding() {
         assert_eq!(base64url("aGk").unwrap(), b"hi");
@@ -1066,7 +1196,7 @@ mod tests {
         let bob = codex_auth("bob", "ws", 0);
         s.set_auth(&alice);
         assert_eq!(
-            sync(&s.engine, &s.home, AgentKind::Codex).unwrap(),
+            live(&s, AgentKind::Codex),
             Live::Unknown(identify(AgentKind::Codex, &alice).unwrap())
         );
         // 没存过的不存。
@@ -1100,15 +1230,34 @@ mod tests {
         // 平时也存：Codex 又换了一次令牌。
         let bob_latest = codex_auth("bob", "ws", 2);
         s.set_auth(&bob_latest);
-        assert_eq!(
-            sync(&s.engine, &s.home, AgentKind::Codex).unwrap(),
-            Live::Known(id_of(&bob))
-        );
+        assert_eq!(live(&s, AgentKind::Codex), Live::Known(id_of(&bob)));
         assert_eq!(s.stored(&id_of(&bob)), bob_latest);
         // 登录文件比存着的旧（比如从备份恢复了）：不往回存。
         s.set_auth(&bob);
-        sync(&s.engine, &s.home, AgentKind::Codex).unwrap();
+        live(&s, AgentKind::Codex);
         assert_eq!(s.stored(&id_of(&bob)), bob_latest);
+        // 这时存着的和文件不一样，但什么都没存回去：不算「存了」，不用重读 `accounts.json`。
+        let book = list(s.engine.data()).unwrap();
+        let found = found_in(AgentKind::Codex, s.auth()).unwrap();
+        let (_, kept) = sync_found(&s.engine, &s.home, AgentKind::Codex, &book, found).unwrap();
+        assert!(!kept);
+        // 拿锁之前就看出不用存：和 `keep` 用的是同一个判断。
+        let stored = s.stored(&id_of(&bob));
+        let identity = identify(AgentKind::Codex, &bob).unwrap();
+        assert!(!replaces(
+            AgentKind::Codex,
+            &identity,
+            Some(&stored),
+            &bob,
+            Keep::Known
+        ));
+        assert!(replaces(
+            AgentKind::Codex,
+            &identity,
+            Some(&stored),
+            &bob,
+            Keep::Fresh
+        ));
     }
 
     #[test]
@@ -1153,7 +1302,7 @@ mod tests {
         let s = setup();
         let alice = codex_auth("alice", "ws", 0);
         add(&s.engine, &s.home, AgentKind::Codex, &alice).unwrap();
-        let key = quota::account_check_key(AgentKind::Codex, &id_of(&alice));
+        let key = CheckKey::Account(AgentKind::Codex, id_of(&alice));
         let off = Check {
             off: true,
             ..Default::default()
@@ -1162,7 +1311,7 @@ mod tests {
         remove(&s.engine, &s.home, AgentKind::Codex, &id_of(&alice)).unwrap();
         assert!(list(s.engine.data()).unwrap().is_empty());
         // 额度查询的设置跟着删掉。
-        assert!(s.engine.checks().is_empty());
+        assert!(s.engine.local().check(&key).is_default());
         assert_eq!(s.auth().unwrap(), alice);
         assert!(matches!(
             remove(&s.engine, &s.home, AgentKind::Codex, &id_of(&alice)),
@@ -1218,21 +1367,22 @@ mod tests {
     #[test]
     fn keyring_store_blocks_switching() {
         let s = setup();
-        assert!(!blocked(&s.home, AgentKind::Codex));
+        let blocked = |kind| read(&s, kind).blocked.contains(&kind);
+        assert!(!blocked(AgentKind::Codex));
         fs::create_dir_all(s.home.join(".codex")).unwrap();
         fs::write(
             s.home.join(".codex/config.toml"),
             "cli_auth_credentials_store = \"file\"\n",
         )
         .unwrap();
-        assert!(!blocked(&s.home, AgentKind::Codex));
+        assert!(!blocked(AgentKind::Codex));
         fs::write(
             s.home.join(".codex/config.toml"),
             "cli_auth_credentials_store = \"keyring\"\n",
         )
         .unwrap();
-        assert!(blocked(&s.home, AgentKind::Codex));
-        assert!(!blocked(&s.home, AgentKind::GrokBuild));
+        assert!(blocked(AgentKind::Codex));
+        assert!(!blocked(AgentKind::GrokBuild));
     }
 
     #[cfg(unix)]
@@ -1332,22 +1482,24 @@ mod tests {
 
     #[test]
     fn claude_profile_reads_the_account_not_the_login() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(claude_profile(dir.path()), None);
+        let s = setup();
+        let profile = || read(&s, AgentKind::ClaudeCode).claude;
+        assert_eq!(profile(), None);
+        fs::create_dir_all(&s.home).unwrap();
         fs::write(
-            dir.path().join(".claude.json"),
+            s.home.join(".claude.json"),
             r#"{"numStartups": 3, "oauthAccount": {"emailAddress": " a@example.com ", "organizationType": "claude_max"}}"#,
         )
         .unwrap();
         assert_eq!(
-            claude_profile(dir.path()),
+            profile(),
             Some(Profile {
                 email: Some("a@example.com".into()),
                 plan: Some("max".into())
             })
         );
-        fs::write(dir.path().join(".claude.json"), r#"{"numStartups": 3}"#).unwrap();
-        assert_eq!(claude_profile(dir.path()), None);
+        fs::write(s.home.join(".claude.json"), r#"{"numStartups": 3}"#).unwrap();
+        assert_eq!(profile(), None);
     }
 
     /// Claude Code 的一份登录（[`claude::bundle`] 拼的样子）：`user` 决定是谁，`refresh` 是第几次换的令牌。
@@ -1379,7 +1531,7 @@ mod tests {
         let profile = || -> Value {
             serde_json::from_slice(&fs::read(s.home.join(".claude.json")).unwrap()).unwrap()
         };
-        assert_eq!(sync(&s.engine, &s.home, kind).unwrap(), Live::LoggedOut);
+        assert_eq!(live(&s, kind), Live::LoggedOut);
 
         // 登着 alice，钥匙串那条里还有 MCP 的登录。
         let (alice, alice_token) = claude_login("alice", 0);
@@ -1398,7 +1550,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let alice_id = match sync(&s.engine, &s.home, kind).unwrap() {
+        let alice_id = match live(&s, kind) {
             Live::Unknown(identity) => {
                 assert_eq!(identity.email.as_deref(), Some("alice@example.com"));
                 assert_eq!(identity.plan.as_deref(), Some("max"));
@@ -1425,10 +1577,7 @@ mod tests {
             profile(),
             json!({"numStartups": 3, "oauthAccount": bob, "projects": {}})
         );
-        assert_eq!(
-            sync(&s.engine, &s.home, kind).unwrap(),
-            Live::Known(added.id.clone())
-        );
+        assert_eq!(live(&s, kind), Live::Known(added.id.clone()));
         let stored = |id: &str| -> Value {
             serde_json::from_slice(&claude::read_stored(&keychain, id).unwrap().unwrap()).unwrap()
         };
@@ -1484,7 +1633,7 @@ mod tests {
             serde_json::to_vec(&json!({"oauthAccount": alice})).unwrap(),
         )
         .unwrap();
-        let alice_id = match sync(&s.engine, &s.home, kind).unwrap() {
+        let alice_id = match live(&s, kind) {
             Live::Unknown(identity) => identity.id,
             other => panic!("{other:?}"),
         };

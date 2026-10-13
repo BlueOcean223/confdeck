@@ -533,7 +533,7 @@ impl Editor {
         let id = provider.id.clone();
         let name = provider.name.clone();
         let saved = self.store.update(cx, |store, cx| {
-            let result = store.save_provider(&provider);
+            let result = store.save_provider(&provider, cx);
             cx.notify();
             result
         });
@@ -556,7 +556,7 @@ impl Editor {
         let id = self.initial.id.clone();
         let name = self.initial.name.clone();
         let deleted = self.store.update(cx, |store, cx| {
-            let result = store.delete_provider(&id);
+            let result = store.delete_provider(&id, cx);
             cx.notify();
             result
         });

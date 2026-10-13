@@ -8,19 +8,18 @@
 
 use confdeck_core::account::{self, Live};
 use confdeck_core::agent::AgentKind;
-use confdeck_core::current::Current;
-use confdeck_core::quota::QuotaError;
+use confdeck_core::quota::{CheckKey, QuotaError};
+use confdeck_core::status::AgentStatus;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::{self, Logo, Selection, Store};
+use crate::data::{self, Logo, Store};
 use crate::quota_view::{self, Reading, Shown};
 use crate::theme::Theme;
 use crate::ui::{self, Button};
-use crate::usage::CheckOf;
 
 /// 哪家的官方登录：预设 ID（图标）和名字。
 pub fn vendor(kind: AgentKind) -> Option<(&'static str, &'static str)> {
@@ -60,6 +59,8 @@ pub struct Entry<'a> {
     pub plan: Option<String>,
     /// 登录文件里就是它。
     pub live: bool,
+    /// 在用：登录文件里是它，而且这个 agent 用着官方登录（文件连的是别处时不算，B2）。打勾、高亮、「在用」都看它。
+    pub in_use: bool,
     pub reading: Option<Reading<'a>>,
 }
 
@@ -78,21 +79,20 @@ impl Store {
     /// 有官方卡片的 agent：装了的、有官方登录的。
     pub fn officials(&self) -> Vec<usize> {
         (0..self.agents.len())
-            .filter(|&i| self.agents[i].installed && vendor(self.agents[i].kind).is_some())
+            .filter(|&i| self.agents[i].installed() && vendor(self.agents[i].kind).is_some())
             .collect()
     }
 
     /// 这个 agent 现在用的是官方登录。
     pub fn uses_official(&self, agent: usize) -> bool {
-        let row = &self.agents[agent];
-        matches!(row.selection, Selection::Single(None))
-            && matches!(row.current, Some(Current::Default))
+        self.agents[agent].status == AgentStatus::Official
     }
 
     /// 这个 agent 的官方账号：存下的（先存的在前），再加登录文件里还没存的那个。
     /// 存不了多个账号的（不是 macOS 时的 Claude Code）只有登着的那个；Codex 的登录在钥匙串里时一个也没有（认不出）。
     pub fn official_entries(&self, agent: usize) -> Vec<Entry<'_>> {
         let kind = self.agents[agent].kind;
+        let official = self.uses_official(agent);
         if kind == AgentKind::ClaudeCode && !account::supported(kind) {
             return self
                 .accounts
@@ -106,6 +106,7 @@ impl Store {
                     email: profile.email.clone(),
                     plan: self.official_plan(agent),
                     live: true,
+                    in_use: official,
                     reading: self.official_reading(kind),
                 })
                 .into_iter()
@@ -128,6 +129,7 @@ impl Store {
                     email: account.email.clone(),
                     plan: account.plan.clone(),
                     live: is_live,
+                    in_use: is_live && official,
                     reading: if is_live {
                         self.official_reading(kind)
                     } else {
@@ -145,6 +147,7 @@ impl Store {
                 email: identity.email.clone(),
                 plan: identity.plan.clone(),
                 live: true,
+                in_use: official,
                 reading: self.official_reading(kind),
             });
         }
@@ -210,7 +213,7 @@ struct Editing {
 pub enum OfficialsEvent {
     /// 「⋯」里点了「额度查询」。
     Check {
-        target: CheckOf,
+        target: CheckKey,
         name: SharedString,
         logo: Logo,
     },
@@ -392,9 +395,8 @@ impl Officials {
                     .child(more_slot())
                     .into_any_element(),
             );
-            let official = store.uses_official(agent);
             for (n, entry) in entries.iter().enumerate() {
-                rows.push(self.account_row(agent, n, entry, official, t, window, cx));
+                rows.push(self.account_row(agent, n, entry, t, window, cx));
             }
         } else {
             rows.push(self.single_row(agent, first, entries.first(), t, window, cx));
@@ -527,7 +529,6 @@ impl Officials {
         agent: usize,
         n: usize,
         entry: &Entry,
-        official: bool,
         t: &Theme,
         window: &Window,
         cx: &Context<Self>,
@@ -553,7 +554,7 @@ impl Officials {
 
         let use_id = entry.stored.then(|| entry.id.clone()).flatten();
         // 「在用」和「使用」占同一栏、居中，上下几行对齐。
-        let state: AnyElement = if entry.live && official {
+        let state: AnyElement = if entry.in_use {
             div()
                 .flex_none()
                 .w(px(STATE_W))
@@ -679,7 +680,7 @@ impl Officials {
         let edit = key.clone();
         let remove = key.clone();
         let closed = key.clone();
-        let target = CheckOf::Account(key.0, key.1.clone());
+        let target = CheckKey::Account(key.0, key.1.clone());
         let checkable = self.store.read(cx).checkable(&target);
         ui::menu(t)
             .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
@@ -716,10 +717,10 @@ impl Officials {
     }
 
     /// 「额度查询」：交给主窗口盖一层（[`OfficialsEvent::Check`]），名字写账号的名字或邮箱。
-    fn open_check(&mut self, target: CheckOf, cx: &mut Context<Self>) {
+    fn open_check(&mut self, target: CheckKey, cx: &mut Context<Self>) {
         let (name, logo) = {
             let store = self.store.read(cx);
-            let CheckOf::Account(kind, id) = &target else {
+            let CheckKey::Account(kind, id) = &target else {
                 return;
             };
             let Some(agent) = store.agents.iter().position(|a| a.kind == *kind) else {

@@ -14,7 +14,7 @@ use crate::engine::{Engine, EngineError, LiveFile, Outcome};
 use crate::fsx;
 use crate::patch::{self, LivePatch, PatchError};
 use crate::provider::Provider;
-use crate::quota::{self, Check};
+use crate::quota::{Check, CheckKey};
 use crate::store::{self, StoreError};
 use crate::transfer;
 use crate::usage::history;
@@ -192,12 +192,14 @@ pub fn disable(
 
 /// `~/.codex/auth.json` 里有没有 ChatGPT 登录，决定 `requires_openai_auth`。
 fn codex_login(home: &Path) -> Result<bool, EngineError> {
-    let path = codex::auth_path(home);
-    let auth = fsx::read_optional(&path).map_err(|source| EngineError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    Ok(codex::login_on_disk(auth.as_deref()))
+    Ok(codex::login_on_disk(
+        read_file(codex::auth_path(home))?.as_deref(),
+    ))
+}
+
+/// 读一个文件，不存在是 `None`。
+fn read_file(path: PathBuf) -> Result<Option<Vec<u8>>, EngineError> {
+    fsx::read_optional(&path).map_err(|source| EngineError::Io { path, source })
 }
 
 /// 这个 agent 的配置文件，和「把某一家写进去」的补丁：单选 agent 是切到这家，多选 agent 是勾上这家。
@@ -209,20 +211,41 @@ pub(crate) struct Writer {
 pub(crate) type PatchFor = dyn Fn(&Provider) -> Result<Box<dyn LivePatch>, AdaptError>;
 
 pub(crate) fn writer(home: &Path, agent: AgentKind) -> Result<Writer, ApplyError> {
+    if agent != AgentKind::Codex {
+        return Ok(writer_with(home, agent, CodexFiles::default()));
+    }
+    let config = read_file(codex::live_file(home).path)?;
+    let auth = read_file(codex::auth_path(home))?;
+    Ok(writer_with(
+        home,
+        agent,
+        CodexFiles {
+            config: config.as_deref(),
+            auth: auth.as_deref(),
+        },
+    ))
+}
+
+/// Codex 的补丁要看的两个文件的内容（不存在是 `None`）：`config.toml` 现在指不指着 confdeck 的模型目录，
+/// `auth.json` 里有没有 ChatGPT 登录。
+#[derive(Default, Clone, Copy)]
+pub(crate) struct CodexFiles<'a> {
+    pub config: Option<&'a [u8]>,
+    pub auth: Option<&'a [u8]>,
+}
+
+/// [`writer`]，Codex 要看的文件已经读好了（[`crate::status`] 一次快照里每个文件只读一次）。
+pub(crate) fn writer_with(home: &Path, agent: AgentKind, codex_files: CodexFiles) -> Writer {
     let (file, patch): (LiveFile, Box<PatchFor>) = match agent {
         AgentKind::ClaudeCode => (
             claude::live_file(home),
             Box::new(|provider| Ok(Box::new(claude::patch(Some(provider), &[])?))),
         ),
         AgentKind::Codex => {
-            let login = codex_login(home)?;
+            let login = codex::login_on_disk(codex_files.auth);
             let file = codex::live_file(home);
             // 现在指着 confdeck 的模型目录就照样指着：认当前是哪家时逐字比较，改供应商时这一项不变。
-            let current = fsx::read_optional(&file.path).map_err(|source| EngineError::Io {
-                path: file.path.clone(),
-                source,
-            })?;
-            let catalog = codex::uses_catalog(&file.path, current.as_deref());
+            let catalog = codex::uses_catalog(&file.path, codex_files.config);
             (
                 file,
                 Box::new(move |provider| {
@@ -244,7 +267,7 @@ pub(crate) fn writer(home: &Path, agent: AgentKind) -> Result<Writer, ApplyError
             Box::new(|provider| Ok(Box::new(opencode::add(provider)?))),
         ),
     };
-    Ok(Writer { file, patch })
+    Writer { file, patch }
 }
 
 /// 改了一家供应商以后，一个在用它的 agent 的结果。
@@ -379,7 +402,7 @@ pub fn delete_provider(
     }
     store::save(engine, &after)?;
     // 这家的额度查询设置不留：以后新建同 ID 的供应商不该接着用（比如一建好查询就是关的）。清不掉只是留个废键。
-    let _ = engine.set_check(&quota::provider_check_key(id), Check::default());
+    let _ = engine.set_check(&CheckKey::Provider(id.to_string()), Check::default());
 
     let coexist = AgentKind::ALL
         .into_iter()
@@ -614,7 +637,7 @@ mod tests {
     #[test]
     fn switching_records_the_selection_only_after_a_successful_write() {
         let home = Home::new();
-        assert_eq!(home.engine.selection("claude-code"), None);
+        assert_eq!(home.engine.local().selection(AgentKind::ClaudeCode), None);
         switch(
             &home.engine,
             home.path(),
@@ -623,8 +646,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            home.engine.selection("claude-code"),
-            Some(Some("relay".into()))
+            home.engine.local().selection(AgentKind::ClaudeCode),
+            Some(Some("relay"))
         );
 
         let mut keyless = relay();
@@ -640,12 +663,15 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            home.engine.selection("claude-code"),
-            Some(Some("relay".into()))
+            home.engine.local().selection(AgentKind::ClaudeCode),
+            Some(Some("relay"))
         );
 
         switch(&home.engine, home.path(), AgentKind::ClaudeCode, None).unwrap();
-        assert_eq!(home.engine.selection("claude-code"), Some(None));
+        assert_eq!(
+            home.engine.local().selection(AgentKind::ClaudeCode),
+            Some(None)
+        );
 
         // 切换记录只有写成的两次。
         let targets: Vec<_> = history::load(home.engine.data())
@@ -1303,15 +1329,14 @@ mod tests {
             off: true,
             ..Default::default()
         };
+        let key = |id: &str| CheckKey::Provider(id.into());
         for id in ["relay", "other"] {
-            home.engine
-                .set_check(&quota::provider_check_key(id), off.clone())
-                .unwrap();
+            home.engine.set_check(&key(id), off.clone()).unwrap();
         }
         delete_provider(&home.engine, home.path(), &providers, "relay").unwrap();
-        let checks = home.engine.checks();
-        assert!(!checks.contains_key("provider:relay"));
-        assert_eq!(checks.get("provider:other"), Some(&off));
+        let local = home.engine.local();
+        assert!(local.check(&key("relay")).is_default());
+        assert_eq!(local.check(&key("other")), off);
     }
 
     #[test]

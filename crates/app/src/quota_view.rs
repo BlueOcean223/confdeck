@@ -6,21 +6,21 @@
 use chrono::{Local, TimeZone as _};
 use confdeck_core::agent::AgentKind;
 use confdeck_core::balance::{self, Balance, BalanceError, Currency};
-use confdeck_core::current::Current;
 use confdeck_core::provider::Provider;
-use confdeck_core::quota::{self, Quota, QuotaError, Span, Window};
+use confdeck_core::quota::{self, CheckKey, Quota, QuotaError, Span, Window};
+use confdeck_core::status::AgentStatus;
 use gpui_kit::component::*;
 use gpui_kit::*;
 use rust_i18n::t;
 
-use crate::data::{Selection, Store};
+use crate::data::Store;
 use crate::theme::Theme;
 use crate::ui;
-use crate::usage::{CheckOf, QuotaOf};
+use crate::usage::QuotaOf;
 
 /// 一家的读数：查的是谁、在不在查、查到了什么。
 pub struct Reading<'a> {
-    pub of: CheckOf,
+    pub of: CheckKey,
     /// 正在查：箭头转。
     pub checking: bool,
     pub shown: Shown<'a>,
@@ -56,7 +56,7 @@ pub const COLUMN: f32 = METERS + ARROW_GAP + ARROW;
 impl Store {
     /// 这家供应商的套餐额度或余额；两样都查不了、也没自己配查法的是 `None`。
     pub fn provider_reading(&self, provider: &Provider) -> Option<Reading<'_>> {
-        let target = CheckOf::Provider(provider.id.clone());
+        let target = CheckKey::Provider(provider.id.clone());
         let custom = self.custom_query(provider).is_some();
         if !custom && quota::plan_supported(provider) {
             return Some(self.quota_reading(target, &QuotaOf::Provider(provider.id.clone())));
@@ -82,10 +82,10 @@ impl Store {
     }
 
     /// 「⋯」里有没有「额度查询」：供应商都有（认不出的可以自己配），Claude 官方没有。
-    pub fn checkable(&self, target: &CheckOf) -> bool {
+    pub fn checkable(&self, target: &CheckKey) -> bool {
         match target {
-            CheckOf::Provider(_) => true,
-            CheckOf::Account(kind, _) | CheckOf::Login(kind) => *kind != AgentKind::ClaudeCode,
+            CheckKey::Provider(_) => true,
+            CheckKey::Account(kind, _) | CheckKey::Login(kind) => *kind != AgentKind::ClaudeCode,
         }
     }
 
@@ -99,39 +99,41 @@ impl Store {
     pub fn account_reading(&self, kind: AgentKind, id: &str) -> Option<Reading<'_>> {
         (kind != AgentKind::ClaudeCode).then(|| {
             self.quota_reading(
-                CheckOf::Account(kind, id.to_string()),
+                CheckKey::Account(kind, id.to_string()),
                 &QuotaOf::Account(kind, id.to_string()),
             )
         })
     }
 
     /// 「额度查询」卡片里那一家的读数。
-    pub fn reading_of(&self, target: &CheckOf) -> Option<Reading<'_>> {
+    pub fn reading_of(&self, target: &CheckKey) -> Option<Reading<'_>> {
         match target {
-            CheckOf::Provider(id) => self
+            CheckKey::Provider(id) => self
                 .providers
                 .iter()
                 .find(|p| &p.id == id)
                 .and_then(|p| self.provider_reading(p)),
-            CheckOf::Account(kind, _) if self.in_use(target) => self.official_reading(*kind),
-            CheckOf::Account(kind, id) => self.account_reading(*kind, id),
-            CheckOf::Login(kind) => self.official_reading(*kind),
+            CheckKey::Account(kind, _) if self.in_use(target) => self.official_reading(*kind),
+            CheckKey::Account(kind, id) => self.account_reading(*kind, id),
+            CheckKey::Login(kind) => self.official_reading(*kind),
         }
     }
 
     /// 这个 agent 现在选的那家：单选的、选的是列表里的哪家或者官方登录时才有。
     pub fn selection_reading(&self, agent: usize) -> Option<Reading<'_>> {
         let row = &self.agents[agent];
-        match (&row.selection, &row.current) {
-            (Selection::Single(Some(p)), _) => self.provider_reading(&self.providers[*p]),
-            (Selection::Single(None), Some(Current::Default)) => self.official_reading(row.kind),
+        match &row.status {
+            AgentStatus::Provider { .. } => {
+                self.provider_reading(&self.providers[self.picked(agent)?])
+            }
+            AgentStatus::Official => self.official_reading(row.kind),
             _ => None,
         }
         // 面板里关掉的、没查过的不写那一行。
         .filter(|reading| !matches!(reading.shown, Shown::Off | Shown::Unchecked))
     }
 
-    fn quota_reading(&self, target: CheckOf, of: &QuotaOf) -> Reading<'_> {
+    fn quota_reading(&self, target: CheckKey, of: &QuotaOf) -> Reading<'_> {
         let shown = if self.check_of(&target).off {
             Shown::Off
         } else {
@@ -144,7 +146,7 @@ impl Store {
         self.reading(target, shown)
     }
 
-    fn reading<'a>(&self, of: CheckOf, shown: Shown<'a>) -> Reading<'a> {
+    fn reading<'a>(&self, of: CheckKey, shown: Shown<'a>) -> Reading<'a> {
         Reading {
             checking: self.checking_target(&of),
             of,
@@ -153,7 +155,7 @@ impl Store {
     }
 
     /// 还没有读数：到点会自动查的是占位条，不自动查的只有箭头。
-    fn pending(&self, target: &CheckOf) -> Shown<'static> {
+    fn pending(&self, target: &CheckKey) -> Shown<'static> {
         if self.check_of(target).every(self.in_use(target)) > 0 {
             Shown::Waiting
         } else {

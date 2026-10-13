@@ -10,7 +10,7 @@
 //! - [`engine`]：写入引擎，改 agent 配置文件的唯一路径：备份、原子写入、写入期间被改了就重来。
 //! - [`apply`]：把上面串起来，「把这家供应商写进这个 agent」；改了、删了供应商以后更新在用它的 agent。
 //! - [`current`]：认出 agent 现在用的是哪家（单选连的哪家，多选勾了哪几家），只有 Key 不一样的算「Key 不一致」，
-//!   对不上的算「自定义」，可以拼成一家新供应商。
+//!   对不上的算「自定义」，可以拼成一家新供应商；[`status`]：一次读全各 agent 现在的样子（界面重读用）。
 //! - [`transfer`]：导入导出供应商（`providers.json` 的格式，可以不带 Key）。
 //! - [`toggles`]：设一次就不动的开关（跳过首次确认、VS Code 插件跟着切换、署名），和供应商无关，按键补丁直接写。
 //! - [`net`]：confdeck 自己发出去的请求（测连通、拉模型列表、下 models.dev），出站代理在这里生效；
@@ -46,6 +46,7 @@ pub mod query;
 pub mod quota;
 pub mod remote;
 pub mod session;
+pub mod status;
 pub mod store;
 pub mod toggles;
 pub mod transfer;

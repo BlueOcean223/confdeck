@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use confdeck_core::apply::Synced;
 use confdeck_core::provider::Provider;
+use confdeck_core::quota::CheckKey;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -22,7 +23,6 @@ use crate::sessions_page::SessionsPage;
 use crate::settings_page::SettingsPage;
 use crate::theme::Theme;
 use crate::ui;
-use crate::usage::CheckOf;
 use crate::usage_page::UsagePage;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -209,6 +209,12 @@ impl MainWindow {
             cx.observe_window_appearance(window, |_, window, cx| {
                 crate::theme::sync_component_theme(&Theme::window(window.appearance()), cx);
                 cx.notify();
+            }),
+            // 切回这个窗口时在后台重读一次：别处改了配置（编辑器里手改、agent 自己写），胶囊和配置页跟上。
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.store.update(cx, |store, cx| store.reload(cx));
+                }
             }),
         ];
         let officials = cx.new(|cx| Officials::new(store.clone(), window, cx));
@@ -478,7 +484,7 @@ impl MainWindow {
         let open = self.picker.as_ref().filter(|p| p.agent == i);
         let (logos, label) = store.pill(i);
         // 状态行只写文件在哪。连到哪、是不是 confdeck 写的，都在胶囊里（decisions「没有『接管』」）。
-        let status: SharedString = if agent.installed {
+        let status: SharedString = if agent.installed() {
             agent.config_path().into()
         } else {
             t!("agents.no_config").into()
@@ -1039,7 +1045,7 @@ impl MainWindow {
         if !open {
             return more.into_any_element();
         }
-        let target = CheckOf::Provider(provider.id.clone());
+        let target = CheckKey::Provider(provider.id.clone());
         let checkable = self.store.read(cx).checkable(&target);
         let (edit, remove) = (provider.clone(), provider.clone());
         let name: SharedString = provider.name.clone().into();
@@ -1094,7 +1100,7 @@ impl MainWindow {
     /// 「额度查询」：一家供应商或一个官方账号的查询设置，盖在页面上。
     fn open_check(
         &mut self,
-        target: CheckOf,
+        target: CheckKey,
         name: SharedString,
         logo: data::Logo,
         window: &mut Window,
