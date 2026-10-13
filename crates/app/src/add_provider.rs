@@ -1,5 +1,6 @@
-//! 添加供应商的预设卡片表（提案 10 第三节）：分国内 / 海外 / 中转 / 推理平台 / 自己填，带搜索。
-//! 加过的打勾，再点是「再加一家」（同一家的另一个 Key）。选一张就交给编辑器，只要填 Key。
+//! 添加供应商的预设卡片表（提案 10 第三节）：最上面一张「自定义」，下面分账号登录 / 模型厂商 / 第三方平台，带搜索。
+//! 加过的打勾，再点是「再加一家」（同一家的另一个 Key）。选一张预设就交给编辑器，只要填 Key；
+//! 选账号登录就打开那个 agent 的官方卡片，不起登录（10-13 用户定的顺序和做法）。
 
 use confdeck_core::preset::{self, Preset};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -9,17 +10,21 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{self, Logo, Store};
+use crate::official;
 use crate::theme::Theme;
 use crate::ui;
 
 pub enum AddEvent {
     /// 选了一张预设卡；`None` 是自定义。
     Chosen(Option<&'static Preset>),
+    /// 打开这个 agent 的官方卡片。
+    Official(usize),
     Closed,
 }
 
 /// 预设分组。每个预设必须在其中一组里（下面有测试），新加预设时在这里补一行。
-const DOMESTIC: &[&str] = &[
+/// 模型厂商：自己出模型的厂商的接口，国内的在前。
+const VENDORS_CN: &[&str] = &[
     "deepseek",
     "kimi",
     "kimi-coding",
@@ -33,9 +38,8 @@ const DOMESTIC: &[&str] = &[
     "xiaomi",
     "xiaomi-token-plan",
     "ant-ling",
-    "siliconflow",
 ];
-const OVERSEAS: &[&str] = &[
+const VENDORS_INTL: &[&str] = &[
     "anthropic",
     "openai",
     "google",
@@ -52,17 +56,16 @@ const OVERSEAS: &[&str] = &[
     "byteplus-coding",
     "xiaomi-token-plan-sgp",
     "xiaomi-token-plan-ams",
-    "siliconflow-intl",
 ];
-const RELAY: &[&str] = &[
+/// 第三方平台：中转和托管开源模型的推理平台。
+const PLATFORMS: &[&str] = &[
+    "siliconflow",
+    "siliconflow-intl",
     "openrouter",
     "vercel",
     "huggingface",
     "opencode-zen",
     "opencode-go",
-];
-/// 托管开源模型的推理平台。
-const HOSTING: &[&str] = &[
     "together",
     "fireworks",
     "groq",
@@ -117,20 +120,15 @@ impl AddProvider {
         }
     }
 
-    fn matches(&self, preset: &Preset, cx: &App) -> bool {
-        let query = self.search.read(cx).value().trim().to_lowercase();
-        if query.is_empty() {
-            return true;
-        }
-        let host = preset
-            .endpoints
-            .values()
-            .next()
-            .and_then(|url| confdeck_core::provider::host(url))
-            .unwrap_or_default();
-        preset.name.to_lowercase().contains(&query)
-            || preset.id.contains(&query)
-            || host.to_lowercase().contains(&query)
+    fn query(&self, cx: &App) -> String {
+        self.search.read(cx).value().trim().to_lowercase()
+    }
+
+    fn matches(query: &str, preset: &Preset) -> bool {
+        query.is_empty()
+            || preset.name.to_lowercase().contains(query)
+            || preset.id.contains(query)
+            || host(preset).to_lowercase().contains(query)
     }
 
     // 一张卡要的东西就是这些，拆成结构体也还是这些。
@@ -205,10 +203,11 @@ impl AddProvider {
             )
     }
 
-    fn group(
+    /// 一组预设卡片（搜索过滤后）；一张都不剩是 `None`。
+    fn presets(
         &self,
-        title: SharedString,
         ids: &[&str],
+        query: &str,
         t: &Theme,
         window: &Window,
         cx: &mut Context<Self>,
@@ -217,7 +216,7 @@ impl AddProvider {
             let store = self.store.read(cx);
             ids.iter()
                 .filter_map(|id| preset::get(id))
-                .filter(|preset| self.matches(preset, cx))
+                .filter(|preset| Self::matches(query, preset))
                 .map(|preset| (preset, store.has_preset(&preset.id)))
                 .collect()
         };
@@ -227,20 +226,13 @@ impl AddProvider {
         let cards: Vec<Stateful<Div>> = presets
             .into_iter()
             .map(|(preset, added)| {
-                let host = preset
-                    .endpoints
-                    .values()
-                    .next()
-                    .and_then(|url| confdeck_core::provider::host(url))
-                    .unwrap_or_default()
-                    .to_string();
                 let logo =
                     data::preset_logo(&preset.id).unwrap_or_else(|| Logo::letter(&preset.name));
                 self.card(
                     ElementId::Name(format!("preset-{}", preset.id).into()),
                     logo,
                     preset.name.clone().into(),
-                    host.into(),
+                    host(preset).to_string().into(),
                     added,
                     t,
                     window,
@@ -249,18 +241,95 @@ impl AddProvider {
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(AddEvent::Chosen(Some(preset)))))
             })
             .collect();
-        Some(self.section(title, t).child(grid(cards)))
+        Some(grid(cards))
     }
 
-    fn section(&self, title: SharedString, t: &Theme) -> Div {
-        div().v_flex().gap(px(8.)).child(
+    /// 账号登录：装了的、有官方登录的 agent（Claude Code、Codex、Grok Build）各一张。点了打开它的官方卡片，
+    /// 不起登录：账号跟着 agent 自己的登录走（10-13 用户说的：在官方应用里登录才放心）。
+    fn logins(
+        &self,
+        query: &str,
+        t: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let entries: Vec<(usize, Logo, SharedString, SharedString)> = {
+            let store = self.store.read(cx);
+            store
+                .officials()
+                .into_iter()
+                .map(|i| {
+                    let agent = &store.agents[i];
+                    (
+                        i,
+                        official::logo(store, i),
+                        official::name(agent.kind),
+                        SharedString::from(agent.name),
+                    )
+                })
+                .filter(|(_, _, name, sub)| {
+                    query.is_empty()
+                        || name.to_lowercase().contains(query)
+                        || sub.to_lowercase().contains(query)
+                })
+                .collect()
+        };
+        if entries.is_empty() {
+            return None;
+        }
+        let cards = entries
+            .into_iter()
+            .map(|(agent, logo, name, sub)| {
+                self.card(
+                    ElementId::named_usize("login", agent),
+                    logo,
+                    name,
+                    sub,
+                    false,
+                    t,
+                    window,
+                    cx,
+                )
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(AddEvent::Official(agent))))
+            })
+            .collect();
+        Some(grid(cards))
+    }
+}
+
+/// 一组：标题和下面的东西。
+fn section(title: SharedString, t: &Theme) -> Div {
+    div().v_flex().gap(px(8.)).child(
+        div()
+            .text_size(px(11.5))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(t.muted)
+            .child(title),
+    )
+}
+
+/// 组里再分的一小块（模型厂商的国内、海外）：小字标题。
+fn part(title: SharedString, t: &Theme, body: Div) -> Div {
+    div()
+        .v_flex()
+        .gap(px(6.))
+        .child(
             div()
-                .text_size(px(11.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(t.muted)
+                .text_size(px(10.5))
+                .text_color(t.faint)
                 .child(title),
         )
-    }
+        .child(body)
+}
+
+/// 卡片第二行的主机名：第一个接口地址的。
+fn host(preset: &Preset) -> &str {
+    preset
+        .endpoints
+        .values()
+        .next()
+        .and_then(|url| confdeck_core::provider::host(url))
+        .unwrap_or_default()
 }
 
 /// 三列的网格，最后一行不满也按三列分宽。
@@ -284,12 +353,7 @@ impl Render for AddProvider {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Theme::window(window.appearance());
         let max_h = f32::from(window.viewport_size().height) - 72.;
-        let groups = [
-            (t!("add.domestic"), DOMESTIC),
-            (t!("add.overseas"), OVERSEAS),
-            (t!("add.relay"), RELAY),
-            (t!("add.hosting"), HOSTING),
-        ];
+        let query = self.query(cx);
         let mut body = div()
             .id("add-body")
             .v_flex()
@@ -299,25 +363,10 @@ impl Render for AddProvider {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll();
-        let mut any = false;
-        for (title, ids) in groups {
-            if let Some(group) = self.group(title.into(), ids, &t, window, cx) {
-                any = true;
-                body = body.child(group);
-            }
-        }
-        if !any {
-            body = body.child(
-                div()
-                    .py(px(12.))
-                    .text_size(px(12.5))
-                    .text_color(t.muted)
-                    .text_center()
-                    .child(t!("add.empty")),
-            );
-        }
-        let custom = self
-            .card(
+
+        // 自定义单独一张，占满一行、虚线框，搜索时也在。
+        body = body.child(
+            self.card(
                 "custom".into(),
                 Logo::Letter('+'),
                 t!("add.custom").into(),
@@ -327,11 +376,40 @@ impl Render for AddProvider {
                 window,
                 cx,
             )
-            .on_click(cx.listener(|_, _, _, cx| cx.emit(AddEvent::Chosen(None))));
-        body = body.child(
-            self.section(t!("add.custom_group").into(), &t)
-                .child(grid(vec![custom])),
+            .border_dashed()
+            .border_color(t.faint.opacity(0.45))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(AddEvent::Chosen(None)))),
         );
+
+        let logins = self.logins(&query, &t, window, cx);
+        let cn = self.presets(VENDORS_CN, &query, &t, window, cx);
+        let intl = self.presets(VENDORS_INTL, &query, &t, window, cx);
+        let platforms = self.presets(PLATFORMS, &query, &t, window, cx);
+        let empty = logins.is_none() && cn.is_none() && intl.is_none() && platforms.is_none();
+        if let Some(logins) = logins {
+            body = body.child(section(t!("add.login").into(), &t).child(logins));
+        }
+        if cn.is_some() || intl.is_some() {
+            body = body.child(
+                section(t!("add.vendors").into(), &t)
+                    .gap(px(10.))
+                    .children(cn.map(|cn| part(t!("add.domestic").into(), &t, cn)))
+                    .children(intl.map(|intl| part(t!("add.overseas").into(), &t, intl))),
+            );
+        }
+        if let Some(platforms) = platforms {
+            body = body.child(section(t!("add.platforms").into(), &t).child(platforms));
+        }
+        if empty {
+            body = body.child(
+                div()
+                    .py(px(12.))
+                    .text_size(px(12.5))
+                    .text_color(t.muted)
+                    .text_center()
+                    .child(t!("add.empty")),
+            );
+        }
 
         div()
             .v_flex()
@@ -405,19 +483,19 @@ mod tests {
     // 不能 `use super::*`：gpui 也导出一个 `test` 属性宏，会把 `#[test]` 抢走。
     use confdeck_core::preset;
 
-    use super::{DOMESTIC, HOSTING, OVERSEAS, RELAY};
+    use super::{PLATFORMS, VENDORS_CN, VENDORS_INTL};
 
     /// 每个预设都要分到一组，不然卡片表里看不到它。
     #[test]
     fn every_preset_is_in_exactly_one_group() {
         for preset in preset::all() {
-            let groups = [DOMESTIC, OVERSEAS, RELAY, HOSTING]
+            let groups = [VENDORS_CN, VENDORS_INTL, PLATFORMS]
                 .iter()
                 .filter(|group| group.contains(&preset.id.as_str()))
                 .count();
             assert_eq!(groups, 1, "{} should be in exactly one group", preset.id);
         }
-        for id in DOMESTIC.iter().chain(OVERSEAS).chain(RELAY).chain(HOSTING) {
+        for id in VENDORS_CN.iter().chain(VENDORS_INTL).chain(PLATFORMS) {
             assert!(preset::get(id).is_some(), "{id} is not a preset");
         }
     }

@@ -958,6 +958,8 @@ impl MainWindow {
                     let editor = cx.new(|cx| Editor::create(store, preset, window, cx));
                     this.show_editor(editor, None, cx);
                 }
+                // 账号登录：换成这个 agent 的官方卡片。不起登录，账号跟着 agent 自己的登录走。
+                AddEvent::Official(agent) => this.open_official(*agent, cx),
                 AddEvent::Closed => {
                     this.overlay = None;
                     cx.notify();

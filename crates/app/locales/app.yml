@@ -530,21 +530,21 @@ add:
   search:
     en: Find a provider…
     zh-CN: 找一家…
+  login:
+    en: Sign in
+    zh-CN: 账号登录
+  vendors:
+    en: Model vendors
+    zh-CN: 模型厂商
   domestic:
     en: China
     zh-CN: 国内
   overseas:
     en: International
     zh-CN: 海外
-  relay:
-    en: Relays
-    zh-CN: 中转
-  hosting:
-    en: Inference platforms
-    zh-CN: 推理平台
-  custom_group:
-    en: Your own
-    zh-CN: 自己填
+  platforms:
+    en: Third-party platforms
+    zh-CN: 第三方平台
   custom:
     en: Custom
     zh-CN: 自定义
