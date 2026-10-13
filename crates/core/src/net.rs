@@ -50,6 +50,23 @@ impl Proxy {
         format!("{scheme}://{}", rest.trim_end_matches('/'))
     }
 
+    /// 子进程（Claude Code 的 `/usage`）该用的代理，作为 `HTTPS_PROXY` 传过去：自定义的地址；跟随系统时系统设置里的
+    /// （环境变量里有的本来就会传下去，不用再给）；直连是 `None`。
+    pub fn for_child(&self) -> Option<String> {
+        match self.mode {
+            ProxyMode::Custom => {
+                Some(Self::normalized_url(&self.url)).filter(|url| !url.is_empty())
+            }
+            ProxyMode::Direct => None,
+            ProxyMode::System => {
+                let set = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+                    .iter()
+                    .any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()));
+                if set { None } else { system_proxy() }
+            }
+        }
+    }
+
     /// 自定义的地址能不能用：协议对、有主机名。空的也不行。
     pub fn check_url(url: &str) -> Result<(), NetError> {
         let url = Self::normalized_url(url);

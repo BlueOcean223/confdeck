@@ -126,6 +126,37 @@ pub fn blocked(home: &Path, kind: AgentKind) -> bool {
         .is_some_and(|store| store.as_str() != Some("file"))
 }
 
+/// Claude Code 登着的官方账号的资料。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    pub email: Option<String>,
+    /// `max`、`pro`、`team`……
+    pub plan: Option<String>,
+}
+
+/// Claude Code 登着的官方账号：`~/.claude.json` 的 `oauthAccount`（邮箱 `emailAddress`；`organizationType` 去掉 `claude_`
+/// 是套餐）。这里只有资料，凭证在钥匙串里，confdeck 不读。没登录官方的是 `None`。Claude Code 不能存多个账号。
+pub fn claude_profile(home: &Path) -> Option<Profile> {
+    let bytes = fs::read(home.join(".claude.json")).ok()?;
+    let json: Value = serde_json::from_slice(&bytes).ok()?;
+    let account = json.get("oauthAccount").filter(|a| a.is_object())?;
+    let text = |key: &str| {
+        account[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    };
+    Some(Profile {
+        email: text("emailAddress"),
+        plan: text("organizationType").and_then(|kind| {
+            kind.strip_prefix("claude_")
+                .filter(|plan| !plan.is_empty())
+                .map(str::to_string)
+        }),
+    })
+}
+
 /// 认出一个登录文件是谁的；没有登录（Codex 只有 API Key 的也算）是 `None`。
 pub fn identify(kind: AgentKind, bytes: &[u8]) -> Option<Identity> {
     let json: Value = serde_json::from_slice(bytes).ok()?;
@@ -878,5 +909,25 @@ mod tests {
         let login = Login::start(&script, s.engine.data(), AgentKind::Codex).unwrap();
         login.handle().cancel();
         assert!(matches!(login.wait(), Err(AccountError::Login(_))));
+    }
+
+    #[test]
+    fn claude_profile_reads_the_account_not_the_login() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(claude_profile(dir.path()), None);
+        fs::write(
+            dir.path().join(".claude.json"),
+            r#"{"numStartups": 3, "oauthAccount": {"emailAddress": " a@example.com ", "organizationType": "claude_max"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            claude_profile(dir.path()),
+            Some(Profile {
+                email: Some("a@example.com".into()),
+                plan: Some("max".into())
+            })
+        );
+        fs::write(dir.path().join(".claude.json"), r#"{"numStartups": 3}"#).unwrap();
+        assert_eq!(claude_profile(dir.path()), None);
     }
 }

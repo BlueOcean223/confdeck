@@ -6,7 +6,8 @@
 //! - 价格用 models.dev 时只读磁盘上的缓存，不联网（供应商页拉列表、补全时会下）。
 //! - 余额（core 的 `balance`）和订阅额度（core 的 `quota`）：能查的每家一个后台任务，同时查；5 分钟内不重查，
 //!   点刷新按钮才重查。重查时先留着上次的数，查回来再换。
-//! - Claude 官方的登录在钥匙串里：只在家目录是真的时读（debug 构建用 `CONFDECK_HOME` 指到别处时不读）。
+//! - Claude 官方的额度跑 Claude Code 自己的 `/usage`：只在家目录是真的时跑（debug 构建用 `CONFDECK_HOME` 指到别处时不跑，
+//!   不然查的是本机用户的账号）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -200,8 +201,12 @@ impl Store {
     fn refresh_quotas(&mut self, cx: &mut Context<Self>) {
         let proxy = self.proxy();
         let home = self.home.clone();
-        // 测试时家目录指到别处，钥匙串里却是本机用户的登录，不能读。
-        let keychain = std::env::home_dir().as_ref() == Some(&home);
+        // 测试时家目录指到别处，Claude Code 查的却是本机用户的登录，不跑。
+        let real_home = std::env::home_dir().as_ref() == Some(&home);
+        let claude = real_home
+            .then(|| confdeck_core::program::find(&home, "claude"))
+            .flatten();
+        let child_proxy = proxy.for_child();
         let mut jobs: Vec<(QuotaOf, QuotaJob)> = Vec::new();
         for agent in &self.agents {
             if !agent.installed {
@@ -209,10 +214,20 @@ impl Store {
             }
             let home = home.clone();
             match agent.kind {
-                AgentKind::ClaudeCode => jobs.push((
-                    QuotaOf::Agent(agent.kind),
-                    Box::new(move |http| quota::claude(http, &home, keychain)),
-                )),
+                AgentKind::ClaudeCode => {
+                    let claude = claude.clone();
+                    let child_proxy = child_proxy.clone();
+                    jobs.push((
+                        QuotaOf::Agent(agent.kind),
+                        Box::new(move |_| match claude {
+                            Some(program) => {
+                                quota::claude(&program, &home, child_proxy.as_deref())
+                            }
+                            None if real_home => Err(QuotaError::NoProgram("claude")),
+                            None => Err(QuotaError::NotLoggedIn),
+                        }),
+                    ))
+                }
                 AgentKind::Codex => jobs.push((
                     QuotaOf::Agent(agent.kind),
                     Box::new(move |http| quota::codex(http, &home)),
