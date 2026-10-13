@@ -10,6 +10,7 @@ use gpui_kit::component::*;
 use gpui_kit::*;
 use rust_i18n::t;
 
+use crate::errors::Describe as _;
 use crate::readings::Readings;
 use crate::theme::Theme;
 use crate::ui;
@@ -301,12 +302,9 @@ fn money(t: &Theme, found: &Balance, size: f32) -> Div {
 /// 查额度出错时的一句：登录过期、Key 不对写红字，没有套餐、没登录写灰字，别的写「—」悬停说原因。
 fn status(t: &Theme, id: &str, err: &QuotaError) -> AnyElement {
     let (text, color): (SharedString, Hsla) = match err {
-        QuotaError::Expired => (t!("quota.expired").into(), t.danger),
-        QuotaError::Auth => (t!("quota.key_rejected").into(), t.danger),
-        QuotaError::NoPlan => (t!("quota.none").into(), t.muted),
-        QuotaError::NotLoggedIn => (t!("quota.signed_out").into(), t.muted),
-        QuotaError::Net(err) => return unknown(t, id, crate::net::describe(err)),
-        QuotaError::Parse(_) => return unknown(t, id, t!("quota.unknown").into()),
+        QuotaError::Expired | QuotaError::Auth => (err.describe().into(), t.danger),
+        QuotaError::NoPlan | QuotaError::NotLoggedIn => (err.describe().into(), t.muted),
+        QuotaError::Net(_) | QuotaError::Parse(_) => return unknown(t, id, err.describe().into()),
     };
     div()
         .text_size(px(12.))
@@ -320,10 +318,11 @@ fn balance_status(t: &Theme, id: &str, err: &BalanceError) -> AnyElement {
         BalanceError::Auth => div()
             .text_size(px(12.))
             .text_color(t.danger)
-            .child(t!("quota.key_rejected"))
+            .child(err.describe())
             .into_any_element(),
-        BalanceError::Net(err) => unknown(t, id, crate::net::describe(err)),
-        _ => unknown(t, id, t!("quota.unknown").into()),
+        BalanceError::NoKey | BalanceError::Net(_) | BalanceError::Parse(_) => {
+            unknown(t, id, err.describe().into())
+        }
     }
 }
 

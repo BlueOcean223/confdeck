@@ -14,10 +14,11 @@ use std::f32::consts::PI;
 use std::rc::Rc;
 use std::time::Duration;
 
-use confdeck_core::agent::{self, AgentKind, FileSetup, Mode, claude, slots};
+use confdeck_core::agent::slots::Slot;
+use confdeck_core::agent::{self, AgentKind, FileSetup, Mode, claude};
 use confdeck_core::engine::{EngineError, LiveFile, Snapshot};
-use confdeck_core::patch::{self, Format, PatchError};
-use confdeck_core::provider::{AgentOverride, Model, Protocol, Provider};
+use confdeck_core::patch::{self, Format};
+use confdeck_core::provider::{Model, Protocol, Provider};
 use confdeck_core::status::AgentStatus;
 use gpui_kit::component::input::{
     Editor as CodeEditor, EditorState, Input, InputEvent, InputState,
@@ -28,6 +29,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{self, Store};
+use crate::errors::{self, Describe as _};
 use crate::picker::{Picker, PickerEvent};
 use crate::theme::Theme;
 use crate::ui::{self, Button};
@@ -74,8 +76,8 @@ pub struct ConfigPage {
     picker: Option<OpenPicker>,
     /// 刚被「点外面」关掉的选择器或下拉框。点的正好是它的按钮时，不要立刻再打开。
     just_closed: bool,
-    /// 打开着的槽位下拉框（槽位名）。
-    menu: Option<&'static str>,
+    /// 打开着的槽位下拉框。
+    menu: Option<Slot>,
     /// 下拉框底下手填模型的输入框。
     custom: Entity<InputState>,
     /// 列表卡、多选 agent 每块底下手填模型的输入框。
@@ -360,7 +362,7 @@ impl ConfigPage {
                 };
                 store
                     .preview(self.agent, saved, draft, &text)
-                    .map_err(|err| err.to_string())
+                    .map_err(|err| err.describe())
             })
     }
 
@@ -463,7 +465,7 @@ impl ConfigPage {
                 raw.error = None;
                 set_text(raw, next, window, cx);
             }
-            Err(err) => raw.error = Some(err.to_string().into()),
+            Err(err) => raw.error = Some(err.describe().into()),
         }
         self.reparse(cx);
         cx.notify();
@@ -483,11 +485,11 @@ impl ConfigPage {
         let file = raw.file.clone();
         if hand_edited {
             let checked = patch::check(file.format, &file.path, text.as_bytes())
-                .map_err(|err| describe(&err))
+                .map_err(|err| errors::InRaw(&err).describe().into())
                 .and_then(|()| match self.store.read(cx).read_file(&file) {
                     Ok(now) if now.digest == raw.snapshot.digest => Ok(()),
                     Ok(_) => Err(t!("config.conflict").into()),
-                    Err(err) => Err(describe_write(&err)),
+                    Err(err) => Err(errors::InRawWrite(&err).describe().into()),
                 });
             if let Err(err) = checked {
                 self.failure = Some(err);
@@ -546,7 +548,9 @@ impl ConfigPage {
     fn reload(&mut self, failed: Option<EngineError>, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
         self.settled = store.settled(self.agent);
-        self.failure = failed.as_ref().map(describe_write);
+        self.failure = failed
+            .as_ref()
+            .map(|err| errors::InRawWrite(err).describe().into());
         let Some(raw) = &mut self.raw else {
             return;
         };
@@ -588,97 +592,69 @@ impl ConfigPage {
             .unwrap_or(saved)
     }
 
-    /// 槽位选了一个模型。目录里没有的先加进目录（decisions「模型」）。
-    /// 给一个槽位选模型；`None` 是「留空」，覆盖里存空串，这个环境变量就不写（core 的 `agent::slots`）。
-    /// 本来就默认留空的槽位（子代理）留空就是没填，从覆盖里删掉。
-    fn set_slot(
+    /// 改第 `p` 家的覆盖（规则在 core 的 `Provider` 上），改完放进草稿（没变的 [`Self::stage`] 不管）。
+    fn edit(
         &mut self,
-        key: &'static str,
-        model: Option<String>,
+        p: usize,
+        change: impl FnOnce(&mut Provider, AgentKind),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let store = self.store.read(cx);
-        let Some(p) = self.single(store) else {
-            return;
-        };
         let kind = self.kind(store);
         let mut provider = self.provider(store, p).clone();
-        if let Some(model) = &model {
-            ensure_model(&mut provider, model);
-        }
-        let auto = claude::SLOTS
-            .iter()
-            .any(|(slot, _)| slot.key == key && slot.auto);
-        let o = provider.overrides.entry(kind).or_default();
-        match model {
-            None if !auto => {
-                o.slots.remove(key);
-            }
-            model => {
-                o.slots.insert(key.to_string(), model.unwrap_or_default());
-            }
-        }
-        if *o == AgentOverride::default() {
-            provider.overrides.remove(&kind);
-        }
-        self.menu = None;
+        change(&mut provider, kind);
         self.stage(provider, window, cx);
+    }
+
+    /// 给槽位选模型；`None` 是「留空」。
+    fn set_slot(
+        &mut self,
+        slot: Slot,
+        model: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(p) = self.single(self.store.read(cx)) else {
+            return;
+        };
+        self.menu = None;
+        self.edit(
+            p,
+            |provider, kind| provider.set_slot(kind, slot, model.as_deref()),
+            window,
+            cx,
+        );
     }
 
     /// 「恢复默认」：清掉这个 agent 对这家的槽位，回到目录的默认模型。
     fn reset_slots(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let Some(p) = self.single(store) else {
+        let Some(p) = self.single(self.store.read(cx)) else {
             return;
         };
-        let kind = self.kind(store);
-        let mut provider = self.provider(store, p).clone();
-        if let Some(o) = provider.overrides.get_mut(&kind) {
-            o.slots.clear();
-            if *o == AgentOverride::default() {
-                provider.overrides.remove(&kind);
-            }
-        }
-        self.stage(provider, window, cx);
+        self.edit(p, |provider, kind| provider.clear_slots(kind), window, cx);
     }
 
     /// 列表型、多选 agent：勾上或取消一个模型。最后一个不能取消。
     fn toggle_model(&mut self, p: usize, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let kind = self.kind(store);
-        let mut provider = self.provider(store, p).clone();
-        let mut listed = listed(&provider, kind);
-        if listed.iter().any(|m| m == id) {
-            if listed.len() == 1 {
-                return;
-            }
-            listed.retain(|m| m != id);
-            // 取消的是默认模型：默认退回列表里排第一的。
-            if let Some(o) = provider.overrides.get_mut(&kind)
-                && o.default_model.as_deref() == Some(id)
-            {
-                o.default_model = None;
-            }
-        } else {
-            listed.push(id.to_string());
-        }
-        set_list(&mut provider, kind, listed);
-        self.stage(provider, window, cx);
+        self.edit(
+            p,
+            |provider, kind| {
+                provider.toggle_model(kind, id);
+            },
+            window,
+            cx,
+        );
     }
 
     /// 列表型 agent 的默认模型。不在列表里的先勾上。
     fn set_default(&mut self, p: usize, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let kind = self.kind(store);
-        let mut provider = self.provider(store, p).clone();
-        let mut listed = listed(&provider, kind);
-        if !listed.iter().any(|m| m == id) {
-            listed.push(id.to_string());
-            set_list(&mut provider, kind, listed);
-        }
-        provider.overrides.entry(kind).or_default().default_model = Some(id.to_string());
-        self.stage(provider, window, cx);
+        self.edit(
+            p,
+            |provider, kind| provider.set_default_model(kind, id),
+            window,
+            cx,
+        );
     }
 
     /// 多选 agent：这家走哪种接口。
@@ -689,16 +665,17 @@ impl ConfigPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let store = self.store.read(cx);
-        let kind = self.kind(store);
-        let mut provider = self.provider(store, p).clone();
-        provider.overrides.entry(kind).or_default().protocol = Some(protocol);
-        self.stage(provider, window, cx);
+        self.edit(
+            p,
+            |provider, kind| provider.set_protocol(kind, protocol),
+            window,
+            cx,
+        );
     }
 
     /// 槽位下拉框底下回车：手填的模型给这个槽位。
     fn add_custom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(key) = self.menu else {
+        let Some(slot) = self.menu else {
             return;
         };
         let value = self.custom.read(cx).value().trim().to_string();
@@ -707,7 +684,7 @@ impl ConfigPage {
         }
         self.custom
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.set_slot(key, Some(value), window, cx);
+        self.set_slot(slot, Some(value), window, cx);
     }
 
     /// 列表卡、多选块底下回车：手填的模型加进目录，也勾上。
@@ -716,31 +693,27 @@ impl ConfigPage {
         if value.is_empty() {
             return;
         }
-        let store = self.store.read(cx);
-        let Some(p) = self.target(store) else {
+        let Some(p) = self.target(self.store.read(cx)) else {
             return;
         };
-        let kind = self.kind(store);
-        let mut provider = self.provider(store, p).clone();
-        ensure_model(&mut provider, &value);
-        let mut listed = listed(&provider, kind);
-        if !listed.contains(&value) {
-            listed.push(value);
-            set_list(&mut provider, kind, listed);
-        }
         self.extra
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.stage(provider, window, cx);
+        self.edit(
+            p,
+            |provider, kind| provider.add_listed(kind, &value),
+            window,
+            cx,
+        );
     }
 
-    fn toggle_menu(&mut self, key: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_menu(&mut self, slot: Slot, window: &mut Window, cx: &mut Context<Self>) {
         if self.just_closed {
             return;
         }
-        if self.menu == Some(key) {
+        if self.menu == Some(slot) {
             self.menu = None;
         } else {
-            self.menu = Some(key);
+            self.menu = Some(slot);
             self.picker = None;
             self.custom.update(cx, |input, cx| {
                 input.set_value("", window, cx);
@@ -788,26 +761,19 @@ impl ConfigPage {
                     cx,
                 );
             }
-            Err(err) => raw.error = Some(describe(&err)),
+            Err(err) => raw.error = Some(errors::InRaw(&err).describe().into()),
         }
         self.reparse(cx);
         cx.notify();
     }
 
-    /// 这个槽位显示什么：编辑框里的（没有这个键就是留空）> 读不了时按目录算的。
-    fn slot_value(
-        &self,
-        provider: &Provider,
-        kind: AgentKind,
-        key: &'static str,
-    ) -> Option<String> {
+    /// 这个槽位显示什么：编辑框里的（没有这个键就是留空）> 读不了时按目录算的（和写进去的同一个算法）。
+    fn slot_value(&self, provider: &Provider, key: &'static str) -> Option<String> {
         // 读得了就以编辑框为准：没有这个键就是留空，不拿目录算的顶上。
         if let Some(setup) = &self.setup {
             return setup.slots.get(key).cloned();
         }
-        let all: Vec<slots::Slot> = claude::SLOTS.iter().map(|(slot, _)| *slot).collect();
-        let auto = !provider.is_anthropic_official();
-        slots::fill(provider, kind, &all, auto)
+        claude::slot_models(provider)
             .ok()?
             .into_iter()
             .find(|(slot, _)| slot.key == key)
@@ -966,10 +932,9 @@ impl ConfigPage {
                     )
                 }),
         );
-        for (n, (slot, env)) in claude::SLOTS.iter().enumerate() {
-            let key = slot.key;
-            let value = self.slot_value(provider, kind, key);
-            let open = self.menu == Some(key);
+        for (n, &(slot, env)) in claude::SLOTS.iter().enumerate() {
+            let value = self.slot_value(provider, slot.key);
+            let open = self.menu == Some(slot);
             let shown: SharedString = value.clone().unwrap_or_else(|| "—".into()).into();
             card = card.child(
                 div()
@@ -986,7 +951,7 @@ impl ConfigPage {
                             .flex_none()
                             .w(px(80.))
                             .text_size(px(12.5))
-                            .child(slot_label(key)),
+                            .child(slot_label(slot.key)),
                     )
                     .child(
                         div()
@@ -996,7 +961,7 @@ impl ConfigPage {
                             .font_family("Menlo")
                             .text_size(px(10.5))
                             .text_color(t.faint)
-                            .child(*env),
+                            .child(env),
                     )
                     .child(
                         div()
@@ -1006,14 +971,14 @@ impl ConfigPage {
                             .child(
                                 ui::menu_pill(ElementId::named_usize("slot", n), t, shown, open)
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.toggle_menu(key, window, cx)
+                                        this.toggle_menu(slot, window, cx)
                                     })),
                             )
                             .when(open, |d| {
                                 d.child(ui::dropdown(self.model_menu(
                                     provider,
                                     value.as_deref(),
-                                    key,
+                                    slot,
                                     t,
                                     cx,
                                 )))
@@ -1029,7 +994,7 @@ impl ConfigPage {
         &self,
         provider: &Provider,
         current: Option<&str>,
-        key: &'static str,
+        slot: Slot,
         t: &Theme,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -1054,7 +1019,7 @@ impl ConfigPage {
                         .cursor_pointer()
                         .hover(move |s| s.bg(hover))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.set_slot(key, None, window, cx)
+                            this.set_slot(slot, None, window, cx)
                         }))
                         .child(
                             div()
@@ -1082,7 +1047,7 @@ impl ConfigPage {
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_slot(key, Some(id.clone()), window, cx)
+                        this.set_slot(slot, Some(id.clone()), window, cx)
                     }))
                     .child(
                         div()
@@ -1163,7 +1128,7 @@ impl ConfigPage {
         cx: &Context<Self>,
     ) -> Div {
         let provider = self.provider(store, p);
-        let listed = listed(provider, kind);
+        let listed = provider.listed(kind);
         let default = self.default_value(provider, kind);
         let mut card = ui::list(t, false).child(ui::card_title(t, t!("config.models")));
         for (n, model) in provider.models.iter().enumerate() {
@@ -1192,7 +1157,7 @@ impl ConfigPage {
         for &p in enabled {
             let provider = self.provider(store, p);
             let expanded = self.expanded == Some(p);
-            let listed = listed(provider, kind);
+            let listed = provider.listed(kind);
             let protocol = kind
                 .adapter()
                 .usable(provider)
@@ -1608,39 +1573,6 @@ impl Render for ConfigPage {
 const SAVE_BAR_HEIGHT: f32 = 44.;
 pub const SAVE_BAR_SPACE: f32 = SAVE_BAR_HEIGHT + 14. + 10.;
 
-/// 解析不了时只说第几行第几列（编辑框里就是这个文件，不用再写路径）；别的照原话。
-fn describe(err: &PatchError) -> SharedString {
-    match err {
-        PatchError::Parse {
-            line,
-            column,
-            message,
-            ..
-        } => {
-            // serde_json 的原话末尾自带「at line 1 column 1」，前面已经说了。
-            let message = message
-                .strip_suffix(&format!(" at line {line} column {column}"))
-                .unwrap_or(message);
-            t!(
-                "config.parse_error",
-                line = line,
-                column = column,
-                message = message
-            )
-            .into()
-        }
-        other => other.to_string().into(),
-    }
-}
-
-fn describe_write(err: &EngineError) -> SharedString {
-    match err {
-        EngineError::Patch(err) => describe(err),
-        EngineError::Conflict { .. } => t!("config.conflict").into(),
-        other => other.to_string().into(),
-    }
-}
-
 /// 读这个文件：内容和读出来的文本；读不了时内容是空的，带上原因。
 fn read(store: &Store, file: &LiveFile) -> (Snapshot, String, Option<SharedString>) {
     match store.read_file(file) {
@@ -1658,7 +1590,7 @@ fn read(store: &Store, file: &LiveFile) -> (Snapshot, String, Option<SharedStrin
                 digest: None,
             },
             String::new(),
-            Some(err.to_string().into()),
+            Some(err.describe().into()),
         ),
     }
 }
@@ -1699,39 +1631,7 @@ fn slot_label(key: &str) -> SharedString {
     }
 }
 
-/// 列表型、多选 agent 现在写哪些模型（覆盖的，或整个目录）。
-fn listed(provider: &Provider, kind: AgentKind) -> Vec<String> {
-    agent::list_models(provider, kind)
-        .map(|models| models.iter().map(|model| model.id.clone()).collect())
-        .unwrap_or_default()
-}
-
-/// 目录里没有的模型加进目录（decisions「模型」：手填的加进目录）。
-fn ensure_model(provider: &mut Provider, id: &str) {
-    if provider.model(id).is_none() {
-        provider.models.push(Model {
-            id: id.to_string(),
-            ..Model::default()
-        });
-    }
-}
-
-/// 列表存进覆盖：和整个目录一样就不存，不然按目录的顺序存子集。覆盖空了就删掉。
-fn set_list(provider: &mut Provider, kind: AgentKind, listed: Vec<String>) {
-    let ordered: Vec<String> = provider
-        .models
-        .iter()
-        .map(|model| model.id.clone())
-        .filter(|id| listed.contains(id))
-        .collect();
-    let whole = ordered.len() == provider.models.len();
-    let o = provider.overrides.entry(kind).or_default();
-    o.models = if whole { None } else { Some(ordered) };
-    if *o == AgentOverride::default() {
-        provider.overrides.remove(&kind);
-    }
-}
-
+/// Claude Code 叫这个名字的槽位。
 #[cfg(test)]
 mod tests {
     use confdeck_core::agent::claude;

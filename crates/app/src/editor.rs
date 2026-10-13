@@ -28,6 +28,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{self, Store};
+use crate::errors::{self, Describe as _};
 use crate::net::{self, Reach};
 use crate::theme::Theme;
 use crate::ui::{self, Button};
@@ -528,12 +529,16 @@ impl Editor {
                 .iter()
                 .any(|p| p.id == provider.id)
         {
-            self.error = Some(describe(&ProviderError::DuplicateId { id: provider.id }));
+            self.error = Some(
+                errors::InEditor(&ProviderError::DuplicateId { id: provider.id })
+                    .describe()
+                    .into(),
+            );
             cx.notify();
             return;
         }
         if let Err(err) = provider.validate() {
-            self.error = Some(describe(&err));
+            self.error = Some(errors::InEditor(&err).describe().into());
             cx.notify();
             return;
         }
@@ -669,7 +674,11 @@ impl Editor {
         let mut draft = self.draft(cx);
         draft.normalize();
         if draft.endpoints.is_empty() {
-            self.error = Some(describe(&ProviderError::NoEndpoint { id: draft.id }));
+            self.error = Some(
+                errors::InEditor(&ProviderError::NoEndpoint { id: draft.id })
+                    .describe()
+                    .into(),
+            );
             cx.notify();
             return;
         }
@@ -685,7 +694,7 @@ impl Editor {
                 this.fetching = false;
                 match result {
                     Ok(models) => this.open_picker(models, window, cx),
-                    Err(err) => this.error = Some(net::describe_listing(&err)),
+                    Err(err) => this.error = Some(errors::Listing(&err).describe().into()),
                 }
                 cx.notify();
             })
@@ -781,7 +790,7 @@ impl Editor {
                             n => t!("editor.filled_other", count = n).into(),
                         });
                     }
-                    Err(err) => this.error = Some(net::describe(&err)),
+                    Err(err) => this.error = Some(err.describe().into()),
                 }
                 cx.notify();
             })
@@ -2055,7 +2064,7 @@ impl Editor {
                         card = card.child(div().text_size(px(11.)).text_color(t.danger).child(t!(
                             "editor.delete_unknown",
                             agent = kind.to_string(),
-                            error = err.to_string()
+                            error = err.describe()
                         )));
                     }
                 }
@@ -2209,32 +2218,6 @@ pub fn tokens(n: u64) -> String {
         return format!("{}K", n / KI);
     }
     n.to_string()
-}
-
-/// 校验错误的文案。
-fn describe(err: &ProviderError) -> SharedString {
-    match err {
-        ProviderError::BadId { .. } => t!("errors.bad_id"),
-        ProviderError::DuplicateId { id } => t!("errors.duplicate_id", id = id),
-        ProviderError::EmptyName { .. } => t!("errors.empty_name"),
-        ProviderError::NoEndpoint { .. } => t!("errors.no_endpoint"),
-        ProviderError::BadUrl { protocol, url, .. } => {
-            t!("errors.bad_url", protocol = protocol.to_string(), url = url)
-        }
-        ProviderError::EmptyModelId { .. } => t!("errors.empty_model_id"),
-        ProviderError::DuplicateModel { model, .. } => t!("errors.duplicate_model", model = model),
-        ProviderError::UnknownModel { agent, model, .. } => {
-            t!(
-                "errors.unknown_model",
-                agent = agent.to_string(),
-                model = model
-            )
-        }
-        ProviderError::UnknownDefaultModel { model, .. } => {
-            t!("errors.unknown_default_model", model = model)
-        }
-    }
-    .into()
 }
 
 /// 跟着公共地址走时，各协议接在它后面的那段：Anthropic、Gemini 的地址存的是不带版本的（`normalize_url` 会去掉

@@ -7,6 +7,7 @@ mod data;
 #[cfg(debug_assertions)]
 mod drive;
 mod editor;
+mod errors;
 mod files;
 mod i18n;
 mod icons;

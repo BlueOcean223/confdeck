@@ -18,6 +18,7 @@ use confdeck_core::usage::{Db, UsageError};
 use gpui_kit::*;
 
 use crate::data::Store;
+use crate::errors::Describe as _;
 
 pub const PERIODS: [Period; 4] = [Period::Today, Period::Week, Period::Month, Period::All];
 
@@ -110,7 +111,7 @@ impl Store {
                         store.usage.error = None;
                         store.net.keep_models_dev(fresh);
                     }
-                    Err(err) => store.usage.error = Some(err.to_string()),
+                    Err(err) => store.usage.error = Some(err.describe()),
                 }
                 cx.notify();
             })

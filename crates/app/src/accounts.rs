@@ -19,6 +19,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{Notice, Store};
+use crate::errors::Describe as _;
 use crate::write::{Done, Report, Written};
 
 #[derive(Default)]
@@ -118,7 +119,7 @@ impl Store {
         }
         self.reload(cx);
         if let Err(err) = result {
-            let notice = Notice::err(describe(&err));
+            let notice = Notice::err(err.describe());
             self.announce(&[notice], cx);
         } else {
             cx.notify();
@@ -133,7 +134,7 @@ impl Store {
         let program = match login_program(&self.home, kind) {
             Ok(program) => program,
             Err(err) => {
-                let notice = Notice::err(describe(&err));
+                let notice = Notice::err(err.describe());
                 self.announce(&[notice], cx);
                 return;
             }
@@ -141,7 +142,7 @@ impl Store {
         let login = match Login::start(&program, self.engine.data(), kind) {
             Ok(login) => login,
             Err(err) => {
-                let notice = Notice::err(describe(&err));
+                let notice = Notice::err(err.describe());
                 self.announce(&[notice], cx);
                 return;
             }
@@ -217,7 +218,7 @@ impl Store {
                         cx.notify();
                         return;
                     }
-                    Err(err) => Notice::err(describe(&err)),
+                    Err(err) => Notice::err(err.describe()),
                 };
                 store.announce(&[notice], cx);
             })
@@ -278,11 +279,11 @@ impl Store {
                     to: Some(email),
                 });
                 if to_default && let Err(err) = apply::switch(engine, home, kind, None) {
-                    return report.fail(err.to_string());
+                    return report.fail(err.describe());
                 }
                 match account::switch(engine, home, kind, &id) {
                     Ok(_) => report,
-                    Err(err) => report.fail(describe(&err)),
+                    Err(err) => report.fail(err.describe()),
                 }
             },
             cx,
@@ -300,7 +301,7 @@ impl Store {
         }
         self.reload(cx);
         if let Err(err) = result {
-            let notice = Notice::err(describe(&err));
+            let notice = Notice::err(err.describe());
             self.announce(&[notice], cx);
         } else {
             cx.notify();
@@ -318,14 +319,4 @@ fn login_program(
         return Ok(fake.into());
     }
     account::program(home, kind)
-}
-
-fn describe(err: &AccountError) -> String {
-    match err {
-        AccountError::NoProgram(name) => t!("accounts.no_program", program = name).to_string(),
-        AccountError::Login(output) => t!("accounts.login_failed", error = output).to_string(),
-        AccountError::LoginTimedOut => t!("accounts.login_timed_out").to_string(),
-        AccountError::Unrecognized => t!("accounts.unrecognized").to_string(),
-        other => other.to_string(),
-    }
 }

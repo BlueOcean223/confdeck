@@ -444,6 +444,120 @@ errors:
   unknown_default_model:
     en: "The default model %{model} is not in the catalog"
     zh-CN: "默认模型 %{model} 不在目录里"
+  # 下面是 core 的错误（`errors.rs`），中文和 core 的原话一样。path 是文件路径，error、message 是系统、解析器的原话（英文）。
+  io:
+    en: "Couldn't read or write %{path}: %{error}"
+    zh-CN: "读写 %{path} 失败：%{error}"
+  parse:
+    en: "Can't parse %{path} (line %{line}, column %{column}): %{message}"
+    zh-CN: "无法解析 %{path}（第 %{line} 行第 %{column} 列）：%{message}"
+  conflict:
+    en: "%{path} was changed by another program while it was being written, so nothing was written. Reopen it and try again"
+    zh-CN: "%{path} 在写入期间被别的程序改了，没有写入。请重新打开后再试"
+  shape:
+    en: "%{key} in %{path} is not %{expected}, so nothing was written to keep your config intact"
+    zh-CN: "%{path} 里的 %{key} 不是%{expected}，为避免覆盖你的配置，没有写入"
+  # shape、raw_shape 里的 expected。
+  an_object:
+    en: an object
+    zh-CN: 对象
+  a_table:
+    en: a table
+    zh-CN: 表
+  a_string:
+    en: a string
+    zh-CN: 字符串
+  empty_json:
+    en: "The new content of %{path} is empty. A JSON file needs at least {}, so nothing was written"
+    zh-CN: "%{path} 的新内容是空的，JSON 文件至少要写 {}，没有写入"
+  overridden:
+    en: "%{by} in %{path} overrides %{key}, so writing it would have no effect. Nothing was written"
+    zh-CN: "%{path} 里 %{by} 改了 %{key}，写进去也不生效，没有写入"
+  # overridden 里的 by：Codex 生效的 profile。
+  active_profile:
+    en: 'The active profile "%{name}"'
+    zh-CN: "生效的 profile「%{name}」"
+  # parse 里的 message：不是解析器的原话，是 core 自己写的。
+  not_utf8:
+    en: not UTF-8 text
+    zh-CN: 不是 UTF-8 文本
+  # 几种接口连起来写时的分隔。
+  list_separator:
+    en: ", "
+    zh-CN: "、"
+  incompatible:
+    en: "%{provider} has no endpoint %{agent} can use (%{agent} supports %{supported})"
+    zh-CN: "%{provider} 没有 %{agent} 能用的接口（%{agent} 支持：%{supported}）"
+  no_models:
+    en: "%{provider} has no models, and %{agent} needs at least one"
+    zh-CN: "%{provider} 的模型目录是空的，%{agent} 至少要一个模型"
+  missing_model:
+    en: "%{provider} has no model %{model}"
+    zh-CN: "%{provider} 的模型目录里没有 %{model}"
+  unknown_slot:
+    en: "%{agent} has no model slot named %{slot}"
+    zh-CN: "%{agent} 没有叫 %{slot} 的模型槽位"
+  missing_key:
+    en: "%{provider} has no key, and %{agent} needs one for a third-party endpoint"
+    zh-CN: "%{provider} 没有填 Key，%{agent} 连第三方地址必须有 Key"
+  raw_shape:
+    en: "In the raw snippet for %{agent}, %{key} should be %{expected}"
+    zh-CN: "%{agent} 的原始片段里 %{key} 应该是%{expected}"
+  raw_not_toml:
+    en: "In the raw snippet for %{agent}, %{key} contains null, which TOML can't hold"
+    zh-CN: "%{agent} 的原始片段里 %{key} 的值含有 null，TOML 里写不了"
+  raw_sends_login:
+    en: "The raw snippet for %{agent} sets requires_openai_auth to true, but the entry has no key of its own, so the ChatGPT login would be sent to a third-party endpoint"
+    zh-CN: "%{agent} 的原始片段把 requires_openai_auth 设成了 true，但路由表没有自己的 Key，ChatGPT 登录会被发给第三方地址"
+  anthropic_official:
+    en: "%{agent} would have to send the key in the x-api-key header to reach Anthropic directly, which isn't supported yet"
+    zh-CN: "%{agent} 连 Anthropic 官方要把 Key 放进 x-api-key 头，还不支持"
+  wrong_mode_switch:
+    en: "%{agent} uses one provider at a time and can't be written this way"
+    zh-CN: "%{agent} 是单选 agent，不能这样写"
+  wrong_mode_coexist:
+    en: "%{agent} uses several providers at once and can't be written this way"
+    zh-CN: "%{agent} 是多选 agent，不能这样写"
+  newer_version:
+    en: "%{path} was written by a newer confdeck (format version %{found}). Update confdeck first"
+    zh-CN: "%{path} 是更新版本的 confdeck 写的（格式版本 %{found}），请先升级"
+  invalid_data:
+    en: "%{path} has invalid data: %{error}"
+    zh-CN: "%{path} 里的数据有误：%{error}"
+  # 供应商的校验错误带上是哪家（在 providers.json 里、不在编辑器里时）。
+  provider_bad_id:
+    en: "The provider ID \"%{id}\" may only use lowercase letters, digits and hyphens, and may not start or end with a hyphen"
+    zh-CN: "供应商 ID「%{id}」只能用小写字母、数字和连字符，且不能以连字符开头或结尾"
+  provider_duplicate_id:
+    en: "Duplicate ID: %{id}"
+    zh-CN: "ID 重复：%{id}"
+  provider_empty_name:
+    en: "Provider %{id} has no name"
+    zh-CN: "供应商 %{id} 没有名字"
+  provider_no_endpoint:
+    en: "Provider %{id} has no endpoint"
+    zh-CN: "供应商 %{id} 一个接口地址都没有"
+  provider_bad_url:
+    en: "The %{protocol} endpoint of provider %{id} is not an http(s) URL: %{url}"
+    zh-CN: "供应商 %{id} 的 %{protocol} 地址不是 http(s) 地址：%{url}"
+  provider_empty_model_id:
+    en: "Provider %{id} has a model with an empty ID"
+    zh-CN: "供应商 %{id} 的模型目录里有空的模型 ID"
+  provider_duplicate_model:
+    en: "Provider %{id} lists %{model} more than once"
+    zh-CN: "供应商 %{id} 的模型目录里 %{model} 出现了不止一次"
+  provider_unknown_model:
+    en: "The %{agent} override of provider %{id} uses %{model}, which is not in the catalog"
+    zh-CN: "供应商 %{id} 给 %{agent} 的覆盖用了目录里没有的模型 %{model}"
+  provider_unknown_default_model:
+    en: "The default model %{model} of provider %{id} is not in the catalog"
+    zh-CN: "供应商 %{id} 的默认模型 %{model} 不在目录里"
+  account_unsupported:
+    en: This agent can't keep more than one account
+    zh-CN: 这个 agent 不能存多个账号
+  account_missing:
+    en: No such account
+    zh-CN: 没有这个账号
 
 # 保存、删除以后的提示。
 toast:

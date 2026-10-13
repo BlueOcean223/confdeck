@@ -12,6 +12,8 @@ use serde_json::{Map, Value};
 
 use crate::agent::AgentKind;
 
+mod edit;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Protocol {

@@ -127,26 +127,28 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("source file is readable");
-            for line in text.lines() {
-                // 注释里的 `t!("键")` 是举例，不算。
-                if line.trim_start().starts_with("//") {
+            // 注释里的 `t!("键")` 是举例，不算。rustfmt 会把长的 `t!(` 拆成几行，键在下一行。
+            let code: String = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut rest = code.as_str();
+            while let Some(start) = rest.find("t!(") {
+                // `format!(` 的尾巴也是 `t!(`，只认前面不是标识符、不在字符串里的。
+                let is_macro = !rest[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '"');
+                rest = rest[start + 3..].trim_start();
+                let Some(quoted) = rest.strip_prefix('"') else {
                     continue;
+                };
+                let Some(end) = quoted.find('"') else { break };
+                if is_macro {
+                    keys.insert(quoted[..end].to_string());
                 }
-                let mut rest = line;
-                while let Some(start) = rest.find("t!(\"") {
-                    // `format!("…")` 的尾巴也是 `t!("`，只认前面不是标识符的。
-                    let is_macro = start == 0
-                        || !rest[..start]
-                            .chars()
-                            .next_back()
-                            .is_some_and(|c| c.is_alphanumeric() || c == '_');
-                    rest = &rest[start + 4..];
-                    let Some(end) = rest.find('"') else { break };
-                    if is_macro {
-                        keys.insert(rest[..end].to_string());
-                    }
-                    rest = &rest[end..];
-                }
+                rest = &quoted[end..];
             }
         }
     }

@@ -169,8 +169,7 @@ pub fn patch(
         env("ANTHROPIC_AUTH_TOKEN", key);
     }
 
-    let slot_list: Vec<Slot> = SLOTS.iter().map(|(slot, _)| *slot).collect();
-    for (slot, id) in slots::fill(provider, AGENT, &slot_list, !official)? {
+    for (slot, id) in slot_models(provider)? {
         let (_, name) = SLOTS
             .iter()
             .find(|(known, _)| *known == slot)
@@ -194,6 +193,14 @@ pub fn patch(
         }
     }
     Ok(patch)
+}
+
+/// 这家在 Claude Code 里每个槽位写哪个模型（不加 `[1m]`），按 [`SLOTS`] 的顺序，不写的槽位不在里面。
+/// 原始片段里写了 `env.ANTHROPIC_DEFAULT_*_MODEL` 的，[`patch`] 最后按原始片段写，盖过这里算的。
+/// 连 Anthropic 官方时只有用户填了的。[`patch`] 和配置页都用它（arch-perf R6）。
+pub fn slot_models(provider: &Provider) -> Result<Vec<(Slot, &str)>, AdaptError> {
+    let all: Vec<Slot> = SLOTS.iter().map(|(slot, _)| *slot).collect();
+    slots::fill(provider, AGENT, &all, !provider.is_anthropic_official())
 }
 
 /// 原始片段写进去的键和值，切换后交给 `Engine::set_owned` 记下。`None` 和没有原始片段的是空的。
@@ -710,6 +717,45 @@ mod tests {
             apply(Some(&official), "{}")["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
             "glm-4.6"
         );
+    }
+
+    /// 配置页显示的槽位（`slot_models`）就是写进去的：第三方、官方，填了的、留空的、自动填的。
+    #[test]
+    fn slot_models_are_what_patch_writes() {
+        let mut third = relay();
+        third.models[1].context = Some(1_000_000);
+        third.overrides.insert(
+            AGENT,
+            AgentOverride {
+                slots: [
+                    ("haiku".into(), "glm-4.5".into()),
+                    ("fable".into(), String::new()),
+                    ("subagent".into(), "glm-4.5-air".into()),
+                ]
+                .into(),
+                ..AgentOverride::default()
+            },
+        );
+        let mut official = third.clone();
+        official.endpoints = [(Protocol::Anthropic, OFFICIAL_URL.to_string())].into();
+        for provider in [&third, &official] {
+            let env = apply(Some(provider), "{}")["env"].clone();
+            let written: Vec<(&str, &str)> = SLOTS
+                .iter()
+                .filter_map(|(slot, name)| {
+                    let id = env.get(*name)?.as_str()?;
+                    Some((slot.key, strip_one_m(id).0))
+                })
+                .collect();
+            let shown: Vec<(&str, &str)> = slot_models(provider)
+                .unwrap()
+                .into_iter()
+                .map(|(slot, id)| (slot.key, id))
+                .collect();
+            let url = &provider.endpoints[&Protocol::Anthropic];
+            assert_eq!(shown, written, "{url}");
+            assert!(!shown.is_empty());
+        }
     }
 
     #[test]

@@ -28,6 +28,8 @@ use confdeck_core::toggles::{self, ClaudeToggle};
 use gpui_kit::*;
 use rust_i18n::t;
 
+use crate::errors::Describe as _;
+
 /// 图标。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Logo {
@@ -406,7 +408,7 @@ impl Store {
             .into_iter()
             .map(|def| agent(def, snapshot.agent(def.0), &self.home, local))
             .collect();
-        self.load_error = snapshot.providers_error.map(|err| err.to_string());
+        self.load_error = snapshot.providers_error.map(|err| err.describe());
         self.providers = snapshot.providers;
         self.disk = self
             .agents
@@ -578,7 +580,7 @@ impl Store {
             Ok(_) if count == 1 => Some(Notice::ok(t!("write.cleaned_one"))),
             Ok(_) if count > 1 => Some(Notice::ok(t!("write.cleaned_other", count = count))),
             Ok(_) => None,
-            Err(err) => Some(Notice::err(err.to_string())),
+            Err(err) => Some(Notice::err(err.describe())),
         };
         // 备份列表变了：重读一份，设置页按新的代数重列。
         self.reload(cx);
@@ -634,11 +636,11 @@ impl Store {
                     Ok(Some(Err(Skipped::NotFound))) => None,
                     Ok(Some(Err(skipped))) => Some(Notice::err(t!(
                         "write.codex_catalog_refresh_failed",
-                        reason = crate::write::describe_skipped(skipped)
+                        reason = skipped.describe()
                     ))),
                     Err(err) => Some(Notice::err(t!(
                         "write.codex_catalog_refresh_failed",
-                        reason = err.to_string()
+                        reason = err.describe()
                     ))),
                     _ => None,
                 };

@@ -15,16 +15,16 @@ use confdeck_core::apply;
 use confdeck_core::data::DataDir;
 use confdeck_core::fsx::{self, Mode};
 use confdeck_core::models_dev::{self, ModelsDev};
-use confdeck_core::net::{Http, NetError, Proxy, SharedHttp, Unreachable};
+use confdeck_core::net::{Http, NetError, Proxy, SharedHttp};
 use confdeck_core::provider::{Model, Provider};
 use confdeck_core::remote;
-use confdeck_core::store::StoreError;
 use confdeck_core::transfer::{self, Plan};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{Notice, Store};
+use crate::errors::{self, Describe as _};
 use crate::theme::Theme;
 use crate::ui;
 use crate::write::{Done, Report};
@@ -108,7 +108,7 @@ impl Store {
             Err(err) => self.announce(
                 &[Notice::err(t!(
                     "net.proxy_not_saved",
-                    error = err.to_string()
+                    error = err.describe()
                 ))],
                 cx,
             ),
@@ -287,15 +287,16 @@ impl Store {
         let mode = if keys { Mode::Private } else { Mode::Keep };
         let notice = match fsx::write_atomic(path, &bytes, mode) {
             Ok(()) => Notice::ok(t!("transfer.exported", file = self.tilde(path))),
-            Err(err) => Notice::err(t!("transfer.export_failed", error = err.to_string())),
+            Err(err) => Notice::err(t!("transfer.export_failed", error = err.describe())),
         };
         self.announce(&[notice], cx);
     }
 
     /// 读一个要导入的文件，算出会改什么。
     pub fn read_import(&self, path: &Path) -> Result<(Vec<Provider>, Plan), String> {
-        let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
-        let incoming = transfer::read(&bytes, path).map_err(|err| describe_store(&err))?;
+        let bytes = std::fs::read(path).map_err(|err| err.describe())?;
+        let incoming =
+            transfer::read(&bytes, path).map_err(|err| errors::Importing(&err).describe())?;
         let plan = transfer::plan(&self.providers, &incoming);
         Ok((incoming, plan))
     }
@@ -311,53 +312,11 @@ impl Store {
                 let report = Report::new(Done::Imported { count });
                 match apply::import(engine, home, &before, &incoming) {
                     Ok(synced) => report.synced(synced),
-                    Err(err) => report.fail(describe_store(&err)),
+                    Err(err) => report.fail(errors::Importing(&err).describe()),
                 }
             },
             cx,
         );
-    }
-}
-
-fn describe_store(err: &StoreError) -> String {
-    match err {
-        StoreError::Parse { line, .. } => t!("transfer.bad_file", line = line).into(),
-        StoreError::Version { .. } => t!("transfer.too_new").into(),
-        other => other.to_string(),
-    }
-}
-
-/// 联网出错的一句话（连通结果、代理测试、拉列表都用它）。
-pub fn describe(err: &NetError) -> SharedString {
-    match err {
-        NetError::BadProxy { .. } => t!("net.bad_proxy"),
-        NetError::BadUrl { .. } => t!("net.bad_url"),
-        NetError::Timeout => t!("net.timeout"),
-        NetError::Unreachable(Unreachable::Dns) => t!("net.dns"),
-        NetError::Unreachable(Unreachable::Refused) => t!("net.refused"),
-        NetError::Unreachable(Unreachable::Tls) => t!("net.tls"),
-        NetError::Unreachable(Unreachable::Proxy) => t!("net.proxy"),
-        NetError::Unreachable(Unreachable::Closed) => t!("net.closed"),
-        NetError::Unreachable(Unreachable::Other(detail)) => {
-            t!("net.unreachable", detail = detail.clone())
-        }
-        NetError::Status {
-            status: status @ (401 | 403),
-            ..
-        } => t!("net.key_rejected", status = status),
-        NetError::Status { status, .. } => t!("net.status", status = status),
-        NetError::Parse { .. } => t!("net.parse"),
-    }
-    .into()
-}
-
-/// 拉模型列表出错：404 说的是「这家没有列表接口」，别的同 [`describe`]。
-pub fn describe_listing(err: &NetError) -> SharedString {
-    match err {
-        NetError::Status {
-            status: 404 | 405, ..
-        } => t!("net.no_model_list").into(),
-        other => describe(other),
     }
 }
 
@@ -376,7 +335,7 @@ pub fn reach_line(reach: &Reach) -> SharedString {
     match reach {
         Reach::Checking => "…".into(),
         Reach::Done(Ok(duration)) => latency(*duration).into(),
-        Reach::Done(Err(err)) => describe(err),
+        Reach::Done(Err(err)) => err.describe().into(),
     }
 }
 

@@ -16,6 +16,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{Logo, Notice, NoticeKind, Store};
+use crate::errors::Describe as _;
 use crate::theme::Theme;
 use crate::ui;
 
@@ -106,9 +107,9 @@ impl SessionsPage {
         let stop = Arc::new(AtomicBool::new(false));
         let reading = session.clone();
         let flag = stop.clone();
-        let task = cx.background_executor().spawn(async move {
-            session::messages(&reading, &flag).map_err(|err| err.to_string())
-        });
+        let task = cx
+            .background_executor()
+            .spawn(async move { session::messages(&reading, &flag).map_err(|err| err.describe()) });
         let (agent, id) = (session.agent, session.id.clone());
         let waiting = cx.spawn(async move |this, cx| {
             let result = task.await;

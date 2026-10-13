@@ -26,6 +26,7 @@ use confdeck_core::status::AgentStatus;
 use gpui_kit::*;
 
 use crate::data::Store;
+use crate::errors::Describe as _;
 use crate::quota_view::{Reading, Shown};
 
 /// 登着的账号查的时候已经不是登录文件里那个了：Store 该重读。
@@ -187,7 +188,7 @@ impl Store {
         match self.engine.set_check(target, check) {
             Ok(local) => self.set_local(local),
             Err(err) => {
-                let notice = crate::data::Notice::err(err.to_string());
+                let notice = crate::data::Notice::err(err.describe());
                 self.announce(&[notice], cx);
                 return;
             }

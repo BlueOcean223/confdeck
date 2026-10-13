@@ -30,6 +30,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{BackupOwner, FileBackups, Logo, Store};
+use crate::errors::Describe as _;
 use crate::theme::Theme;
 use crate::ui::{self, Button};
 use crate::{files, net};
@@ -548,7 +549,7 @@ impl SettingsPage {
                 t.success,
             )),
             (None, Some(ProxyTest::Done(Err(error)))) => {
-                Some(small(net::describe(error), t.danger))
+                Some(small(error.describe().into(), t.danger))
             }
             (None, None) => None,
         };

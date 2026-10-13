@@ -130,14 +130,13 @@ impl ModelsDev {
         Self::build(&mut serde_json::Deserializer::from_slice(bytes))
     }
 
-    /// 从文件读（缓存）：边读边解析，不先把 5 MB 读进内存。
-    pub fn read(path: &Path) -> Result<Self, NetError> {
-        let file = std::fs::File::open(path).map_err(|err| NetError::Parse {
-            detail: err.to_string(),
-        })?;
+    /// 从文件读（缓存）：边读边解析，不先把 5 MB 读进内存。解析不了的是 [`std::io::ErrorKind::InvalidData`]。
+    pub fn read(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
         Self::build(&mut serde_json::Deserializer::from_reader(
             std::io::BufReader::new(file),
         ))
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
     }
 
     fn build<'de, R: serde_json::de::Read<'de>>(

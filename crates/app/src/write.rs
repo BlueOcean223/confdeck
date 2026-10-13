@@ -24,6 +24,7 @@ use gpui_kit::*;
 use rust_i18n::t;
 
 use crate::data::{Notice, Store, file_name};
+use crate::errors::Describe as _;
 
 /// 一次写操作做的是什么：[`Report::notices`] 照它挑头一句、整个没写成时那句。
 pub(crate) enum Done {
@@ -102,7 +103,7 @@ impl Report {
         for entry in synced {
             match entry.result {
                 Ok(outcome) => self = self.wrote(entry.agent, &outcome),
-                Err(err) => self.unwritten.push((entry.agent, err.to_string())),
+                Err(err) => self.unwritten.push((entry.agent, err.describe())),
             }
         }
         self
@@ -140,7 +141,7 @@ impl Report {
         if let Some(skipped) = self.catalog {
             notices.push(Notice::err(t!(
                 "write.codex_catalog_skipped",
-                reason = describe_skipped(skipped)
+                reason = skipped.describe()
             )));
         }
         notices.extend(
@@ -241,15 +242,6 @@ fn sync_failed(agent: AgentKind, error: &str) -> Cow<'static, str> {
     )
 }
 
-/// Codex 模型目录没生成出来的原因，按界面语言说（core 的 `Skipped` 只有中文）。
-pub(crate) fn describe_skipped(skipped: Skipped) -> Cow<'static, str> {
-    match skipped {
-        Skipped::NotFound => t!("codex.not_found"),
-        Skipped::Failed => t!("codex.failed"),
-        Skipped::NoTemplate => t!("codex.no_template"),
-    }
-}
-
 /// 一次写操作的结果，写完、提示发出去以后才有（后面还排着别的时，快照还没换上：换的是最后排的那份）。
 /// 不等它也行：换快照、发提示都不靠它。
 pub(crate) struct Written(Option<async_channel::Receiver<Report>>);
@@ -316,7 +308,7 @@ impl Store {
                 });
                 match apply::switch(engine, home, kind, picked.as_ref()) {
                     Ok(switched) => report.catalog(switched.catalog),
-                    Err(err) => report.fail(err.to_string()),
+                    Err(err) => report.fail(err.describe()),
                 }
             },
             cx,
@@ -356,7 +348,7 @@ impl Store {
                 });
                 match result {
                     Ok(_) => report,
-                    Err(err) => report.fail(err.to_string()),
+                    Err(err) => report.fail(err.describe()),
                 }
             },
             cx,
@@ -397,7 +389,7 @@ impl Store {
                     });
                 match synced {
                     Ok(synced) => report.synced(synced),
-                    Err(err) => report.fail(err.to_string()),
+                    Err(err) => report.fail(err.describe()),
                 }
             },
             cx,
@@ -423,7 +415,7 @@ impl Store {
                 let report = Report::new(Done::Updated { agent: kind });
                 match apply::save_provider(engine, home, &before, &provider) {
                     Ok(synced) => report.synced(synced),
-                    Err(err) => report.fail(err.to_string()),
+                    Err(err) => report.fail(err.describe()),
                 }
             },
             cx,
@@ -444,7 +436,7 @@ impl Store {
                 });
                 match apply::save_provider(engine, home, &before, &provider) {
                     Ok(synced) => report.synced(synced),
-                    Err(err) => report.fail(err.to_string()),
+                    Err(err) => report.fail(err.describe()),
                 }
             },
             cx,
@@ -460,7 +452,7 @@ impl Store {
                 let report = Report::new(Done::Deleted { provider: name });
                 match apply::delete_provider(engine, home, &before, &id) {
                     Ok(synced) => report.synced(synced),
-                    Err(err) => report.fail(err.to_string()),
+                    Err(err) => report.fail(err.describe()),
                 }
             },
             cx,
@@ -485,7 +477,7 @@ impl Store {
                 let report = Report::new(Done::Hidden { agent: kind });
                 match engine.set_hidden(place, kind.id(), hidden) {
                     Ok(_) => report,
-                    Err(err) => report.fail(err.to_string()),
+                    Err(err) => report.fail(err.describe()),
                 }
             },
             cx,
@@ -500,7 +492,7 @@ impl Store {
                 let report = Report::new(Done::Updated { agent });
                 match toggle.set(engine, home, on) {
                     Ok(outcome) => report.wrote(agent, &outcome),
-                    Err(err) => report.fail(err.to_string()),
+                    Err(err) => report.fail(err.describe()),
                 }
             },
             cx,
@@ -517,7 +509,7 @@ impl Store {
                 });
                 match engine.restore(&file, &backup) {
                     Ok(_) => report,
-                    Err(err) => report.fail(err.to_string()),
+                    Err(err) => report.fail(err.describe()),
                 }
             },
             cx,
@@ -538,8 +530,9 @@ mod tests {
     use rust_i18n::t;
 
     // 不用 `super::*`：那样会把 gpui 的 `test` 宏一起引进来。
-    use super::{Done, Report, describe_skipped, sync_failed};
+    use super::{Done, Report, sync_failed};
     use crate::data::NoticeKind;
+    use crate::errors::Describe as _;
 
     fn synced(agent: AgentKind, changed: Option<bool>) -> Synced {
         Synced {
@@ -578,7 +571,7 @@ mod tests {
             to: Some("Relay".into()),
         })
         .catalog(Some(Err(Skipped::Failed)));
-        let reason = describe_skipped(Skipped::Failed);
+        let reason = Skipped::Failed.describe();
         let switched = t!("write.switched", agent = "Codex", provider = "Relay");
         let skipped = t!("write.codex_catalog_skipped", reason = reason);
         assert_eq!(texts(&report), [ok(switched), err(skipped)]);
@@ -610,7 +603,7 @@ mod tests {
         let error = ApplyError::WrongMode {
             agent: AgentKind::Pi,
         }
-        .to_string();
+        .describe();
         let saved = t!("toast.saved_synced", agents = "Claude Code");
         let failed = sync_failed(AgentKind::Pi, &error);
         assert_eq!(texts(&report), [ok(saved), err(failed)]);
