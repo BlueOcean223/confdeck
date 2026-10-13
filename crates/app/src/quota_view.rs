@@ -95,12 +95,14 @@ impl Store {
             .then(|| self.quota_reading(self.live_target(kind), &QuotaOf::Agent(kind)))
     }
 
-    /// 存下的一个官方账号（不是登着的那个）的额度。
-    pub fn account_reading(&self, kind: AgentKind, id: &str) -> Reading<'_> {
-        self.quota_reading(
-            CheckOf::Account(kind, id.to_string()),
-            &QuotaOf::Account(kind, id.to_string()),
-        )
+    /// 存下的一个官方账号（不是登着的那个）的额度。Claude 的同上，是 `None`。
+    pub fn account_reading(&self, kind: AgentKind, id: &str) -> Option<Reading<'_>> {
+        (kind != AgentKind::ClaudeCode).then(|| {
+            self.quota_reading(
+                CheckOf::Account(kind, id.to_string()),
+                &QuotaOf::Account(kind, id.to_string()),
+            )
+        })
     }
 
     /// 「额度查询」卡片里那一家的读数。
@@ -112,7 +114,7 @@ impl Store {
                 .find(|p| &p.id == id)
                 .and_then(|p| self.provider_reading(p)),
             CheckOf::Account(kind, _) if self.in_use(target) => self.official_reading(*kind),
-            CheckOf::Account(kind, id) => Some(self.account_reading(*kind, id)),
+            CheckOf::Account(kind, id) => self.account_reading(*kind, id),
             CheckOf::Login(kind) => self.official_reading(*kind),
         }
     }

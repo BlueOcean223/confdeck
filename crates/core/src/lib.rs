@@ -35,6 +35,7 @@ pub mod data;
 pub mod diff;
 pub mod engine;
 pub mod fsx;
+pub mod keychain;
 pub mod models_dev;
 pub mod net;
 pub mod patch;

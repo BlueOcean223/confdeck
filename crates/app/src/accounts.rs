@@ -1,4 +1,4 @@
-//! `Store` 的官方账号部分（10-13，阶段 4）：Codex、Grok Build 存下的几个官方登录、登录文件现在是谁、正在跑的登录。
+//! `Store` 的官方账号部分（10-13，阶段 4）：Codex、Grok Build、Claude Code 存下的几个官方登录、登录文件现在是谁、正在跑的登录。
 //! core 那边见 `confdeck_core::account`。
 //!
 //! - 每次 `Store::reload` 都 `sync` 一遍：登录文件是存过的账号，就把 agent 新换的令牌存回去。
@@ -30,7 +30,7 @@ pub(crate) struct AccountState {
     pub logins: HashMap<AgentKind, Pending>,
     /// `accounts.json` 读不了的原因。
     pub error: Option<String>,
-    /// Claude Code 登着的官方账号的资料（邮箱、套餐）。它存不了多个账号。
+    /// Claude Code 登着的官方账号的资料（邮箱、套餐）。存不了多个 Claude 账号（不是 macOS）时用。
     pub claude: Option<account::Profile>,
 }
 
@@ -320,7 +320,7 @@ impl Store {
 
     /// 删掉一个存下的账号。登录文件不动。
     pub fn remove_account(&mut self, kind: AgentKind, id: &str, cx: &mut Context<Self>) {
-        let result = account::remove(&self.engine, kind, id);
+        let result = account::remove(&self.engine, &self.home, kind, id);
         self.reload();
         if let Err(err) = result {
             let notice = Notice::err(describe(&err));

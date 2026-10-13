@@ -4,7 +4,7 @@
 //!   和别的供应商一样写额度。Agent 页、菜单栏的胶囊和选择器里原来的「默认」也写成这个名字、用厂商的图标。
 //! - 账号摊在这一组里（10-13 提案 13，原来要点开一层弹层才看得到）：一个 agent 有两个以上账号时，它那行变成小标题，
 //!   账号一行一个：名字、额度、「在用」或「使用」，行尾「⋯」里是编辑（名字和备注）、删除。只有一个账号时还是一行。
-//!   Claude Code 存不了多个账号，只有登着的那个。
+//!   Claude Code 的账号（只在 macOS）不查额度：行里没有额度，「⋯」里没有「额度查询」。
 
 use confdeck_core::account::{self, Live};
 use confdeck_core::agent::AgentKind;
@@ -90,10 +90,10 @@ impl Store {
     }
 
     /// 这个 agent 的官方账号：存下的（先存的在前），再加登录文件里还没存的那个。
-    /// Claude Code 只有登着的那个；Codex 的登录在钥匙串里时一个也没有（认不出）。
+    /// 存不了多个账号的（不是 macOS 时的 Claude Code）只有登着的那个；Codex 的登录在钥匙串里时一个也没有（认不出）。
     pub fn official_entries(&self, agent: usize) -> Vec<Entry<'_>> {
         let kind = self.agents[agent].kind;
-        if kind == AgentKind::ClaudeCode {
+        if kind == AgentKind::ClaudeCode && !account::supported(kind) {
             return self
                 .accounts
                 .claude
@@ -131,7 +131,7 @@ impl Store {
                     reading: if is_live {
                         self.official_reading(kind)
                     } else {
-                        Some(self.account_reading(kind, &account.id))
+                        self.account_reading(kind, &account.id)
                     },
                 }
             })
@@ -151,10 +151,10 @@ impl Store {
         entries
     }
 
-    /// 登着的官方账号的邮箱：Codex、Grok Build 看登录文件，Claude Code 看 `~/.claude.json`。
+    /// 登着的官方账号的邮箱：存不了多个账号的 Claude Code 看 `~/.claude.json`，别的看登录文件现在是谁。
     pub fn official_email(&self, agent: usize) -> Option<String> {
         let kind = self.agents[agent].kind;
-        if kind == AgentKind::ClaudeCode {
+        if kind == AgentKind::ClaudeCode && !account::supported(kind) {
             return self.accounts.claude.as_ref()?.email.clone();
         }
         match self.live_account(kind)? {
@@ -180,7 +180,7 @@ impl Store {
         {
             return Some(plan.clone());
         }
-        if kind == AgentKind::ClaudeCode {
+        if kind == AgentKind::ClaudeCode && !account::supported(kind) {
             return self.accounts.claude.as_ref()?.plan.clone();
         }
         match self.live_account(kind)? {

@@ -292,7 +292,7 @@ impl Store {
         self.run_checks(cx, |_, t| t == target);
     }
 
-    /// 能查的每一个：供应商的套餐额度或余额、官方登录、存下的账号。Claude 官方的先不查（10-13 用户说先不做）。
+    /// 能查的每一个：供应商的套餐额度或余额、官方登录、存下的账号。Claude 官方的（登着的、存下的）先不查（10-13 用户说先不做）。
     fn jobs(&self) -> Vec<(CheckOf, Job)> {
         let mut jobs: Vec<(CheckOf, Job)> = Vec::new();
         for agent in self.agents.iter().filter(|a| a.installed) {
@@ -313,7 +313,12 @@ impl Store {
             let installed = self.agents.iter().any(|a| a.kind == kind && a.installed);
             let live =
                 matches!(self.live_account(kind), Some(Live::Known(id)) if *id == account.id);
-            if !installed || live || self.account_blocked(kind) || !account::supported(kind) {
+            if !installed
+                || live
+                || self.account_blocked(kind)
+                || !account::supported(kind)
+                || kind == AgentKind::ClaudeCode
+            {
                 continue;
             }
             let data = self.engine.data().clone();
