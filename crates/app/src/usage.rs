@@ -200,7 +200,8 @@ impl Store {
         cx.notify();
     }
 
-    fn refresh_quotas(&mut self, cx: &mut Context<Self>) {
+    /// 重查所有额度（不管 5 分钟内查没查过）。加了账号以后用：新账号还没有读数。
+    pub(crate) fn refresh_quotas(&mut self, cx: &mut Context<Self>) {
         let proxy = self.proxy();
         let home = self.home.clone();
         // Claude 官方的额度先不查（10-13 用户说还没想好怎么做）。

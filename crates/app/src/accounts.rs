@@ -206,6 +206,8 @@ impl Store {
                     Err(err) => Notice::err(describe(&err)),
                 };
                 store.announce(&[notice], cx);
+                // 新加的账号还没有额度读数，不查的话一直是占位条，要等下一次刷新（10-13 用户截图里看到的）。
+                store.refresh_quotas(cx);
             })
             .ok();
         })
