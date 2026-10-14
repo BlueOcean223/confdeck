@@ -1,4 +1,4 @@
-//! macOS 钥匙串里的通用密码（Claude Code 的登录在这里，10-13 Claude 多账号）。
+//! macOS 钥匙串里的通用密码（Claude Code 的登录在这里）。
 //!
 //! - **用系统的 `security` 命令**，不链 Security.framework：Claude Code 自己就是这么读写的，它建的条目的访问控制里有 `security`，
 //!   读写都不弹窗。confdeck 用 `security` 建的条目也一样。

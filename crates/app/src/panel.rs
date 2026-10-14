@@ -116,7 +116,7 @@ pub fn toggle(icon: Bounds<Pixels>, store: Entity<Store>, cx: &mut App) {
     main_window::stay_behind(cx);
     crate::activate(cx);
     // 激活是异步的：从后台打开时等激活完成再显示。面板先拿到焦点的话，激活时系统把焦点还给主窗口，
-    // 面板一失焦就关了，主窗口还会闪一下（10-13 用户发现）。
+    // 面板一失焦就关了，主窗口还会闪一下。
     if background {
         cx.global_mut::<PanelState>().opening = true;
         #[cfg(target_os = "macos")]
@@ -226,7 +226,7 @@ struct OpenPicker {
     agent: usize,
     row: usize,
     picker: Entity<Picker>,
-    /// 窗口长到装得下选择器以后才画它。窗口高度要下一轮主线程任务才改得动（notes/panel-resize.md），
+    /// 窗口长到装得下选择器以后才画它。窗口高度要下一轮主线程任务才改得动（见 `mac::set_height_keep_top`），
     /// 先画的话第一帧窗口还是矮的，选择器会被挤到上面盖住列表，下一帧才落回原位，看着就是闪一下。
     drawn: bool,
     _subscriptions: Vec<Subscription>,
@@ -512,7 +512,7 @@ impl Panel {
 }
 
 /// 关掉面板：只藏起来，不销毁窗口（`mac::hide` 说了为什么）。失焦回调里也会调到，
-/// 所以真正 `orderOut` 放在下一轮主线程任务（notes/panel-focus-crash.md）。
+/// 所以真正 `orderOut` 放在下一轮主线程任务（在 AppKit 的窗口回调里同步关窗口会崩）。
 /// 从后台打开的（Esc、再点托盘图标关掉时）把前台还给原来的应用，不然 AppKit 把焦点交给主窗口、把它提到前面。
 fn close(window: &mut Window, cx: &mut App) {
     let state = cx.default_global::<PanelState>();

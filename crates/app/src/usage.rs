@@ -6,7 +6,7 @@
 //!   没有还没算进汇总的请求、供应商、切换记录、models.dev、日期和时区都没变时，沿用上次的汇总，不再读请求。
 //! - 会话页的会话列表也从这里来：扫的时候顺带记下的（core 的 `session`），文件已经不在的不要。
 //! - 价格用 models.dev 时只读磁盘上的缓存，不联网（供应商页拉列表、补全时会下）。
-//! - 余额和订阅额度（10-13 起不在用量页）见 `readings.rs`。
+//! - 余额和订阅额度不在用量页，见 `readings.rs`。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};

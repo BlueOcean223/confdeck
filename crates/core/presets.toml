@@ -697,7 +697,7 @@ protocol = "anthropic"
 [presets.agents.opencode]
 protocol = "anthropic"
 
-# ────────── 10-12 按 Pi 1.1.0 的 /login 列表加的（用户：内置供应商按 Pi 的列表，加上现有的国内几家） ──────────
+# ────────── 10-12 按 Pi 1.1.0 的 /login 列表加的（内置供应商是 Pi 的列表加上原有的国内几家） ──────────
 
 # Anthropic 官方 API（按量，用 API Key；Claude Code 的「默认」是官方登录，这个是另一回事）。模型取 Pi 的目录，
 # 槽位照 OpenRouter 的写法：Sonnet、Haiku、Fable 用各自的。

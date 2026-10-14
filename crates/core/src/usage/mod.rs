@@ -1,8 +1,7 @@
 //! 用量：扫各 agent 的本地会话记录，每次请求存一行进 SQLite（[`Db`]，`~/.confdeck/cache/usage.db`，丢了能重算），
 //! 查的时候再认是哪家供应商、按现在的价格算花费（[`summary`]）。
 //!
-//! - [`scan`]：增量扫，记着每个文件读到哪。各家记录的格式在 `claude`、`codex`、`pi`、`grok`、`opencode` 里，
-//!   踩过的坑见 notes/usage-sources.md。
+//! - [`scan`]：增量扫，记着每个文件读到哪。各家记录的格式在 `claude`、`codex`、`pi`、`grok`、`opencode` 里。
 //! - [`history`]：confdeck 把单选 agent 切到哪家的记录。Claude Code、Codex、Grok Build 的会话记录里没有接口地址，
 //!   靠它认一段时间里连的是哪家；它不能重算，所以放数据目录、不放缓存。
 //! - [`summary`]：认供应商、算花费，一段时间的总量和按天、按供应商 / agent / 模型的分组。

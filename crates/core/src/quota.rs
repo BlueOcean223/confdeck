@@ -27,7 +27,7 @@ use crate::provider::{self, Provider};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 一家供应商、一个官方账号的额度或余额查不查、多久自动查一次（10-13 提案 13 之后用户定的：按供应商配置，参考 cc-switch 的
+/// 一家供应商、一个官方账号的额度或余额查不查、多久自动查一次（按供应商配置，参考 cc-switch 的
 /// 「配置用量查询」）。存在 `state.json`（[`crate::engine::Engine::checks`]），只属于这台设备；没存过的是默认值。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Check {

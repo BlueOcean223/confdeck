@@ -1,5 +1,5 @@
 //! models.dev（<https://models.dev/api.json>，OpenCode 用的就是它）：补模型目录里没填的上下文、输出上限、
-//! 图像输入、推理档位、价格（decisions「功能范围」）。
+//! 图像输入、推理档位、价格。
 //!
 //! - **缓存**：下下来的原文存在 `~/.confdeck/cache/models.dev.json`，一天内不重下（[`load`]）；
 //!   下不下来时用旧的，旧的也没有才报错。
@@ -58,7 +58,7 @@ pub fn load(data: &DataDir, http: &Http) -> Result<ModelsDev, NetError> {
 
 /// 解析好、建好索引的 models.dev。
 ///
-/// 常驻内存要小（10-13 arch-perf R0）：文件 5 MB 多，整份解析成 `Value` 树要 60 MB，drop 以后进程的常驻内存也不降
+/// 常驻内存要小：文件 5 MB 多，整份解析成 `Value` 树要 60 MB，drop 以后进程的常驻内存也不降
 /// （macOS 的分配器不还页）；8 千多个模型各存一个 [`Model`]、再建几张以字符串为键的表，也要 6、7 MB。所以：
 /// - 边读边取（[`Builder`]），每个模型只读用得到的几个键，描述这类长字段读过去就丢；
 /// - 模型的 ID、名字、`canonical_model_id` 首尾相接存在 `text` 里，条目只记位置（[`Span`]）；推理档位只有几种写法，记下标；

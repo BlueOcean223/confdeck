@@ -1,12 +1,12 @@
 //! Codex 的模型目录文件 `~/.codex/confdeck-models.json`，`config.toml` 的 `model_catalog_json` 指向它。
 //! 写了它，Codex 的 `/model` 列出这家的模型，按目录里的窗口压缩；不写的话第三方模型按兜底数据算 272K 窗口。
 //!
-//! 目录里每个模型都要带系统提示词，Codex 原样拿它换掉自带的。提示词从用户装的 Codex 取（用户 10-10 定的）：
+//! 目录里每个模型都要带系统提示词，Codex 原样拿它换掉自带的。提示词从用户装的 Codex 取：
 //! 跑 `codex debug models --bundled`，克隆一个普通 Responses 的内置模型（不是 code mode、不走 Responses Lite 的，
 //! 0.153.4 上是 gpt-5.5），把提示词里的「based on GPT-5」换成这家的模型名。工具设置用 Codex 对不认识的模型的那一套：
 //! 不声明 freeform `apply_patch`（第三方网关不一定支持这种工具），模型经 `exec_command` 调 `apply_patch` 照样能改文件。
 //! 找不到 `codex`、跑不成、挑不出模板时不写目录，和以前一样，原因（[`Skipped`]）交给界面说一声。
-//! Codex 升级以后由 [`crate::apply::refresh_codex_catalog`] 重写。核实过程见 notes/codex-catalog-prompt.md。
+//! Codex 升级以后由 [`crate::apply::refresh_codex_catalog`] 重写。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

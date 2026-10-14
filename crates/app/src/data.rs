@@ -80,7 +80,7 @@ impl Agent {
     }
 }
 
-/// 界面上列的 agent 和图标，按这个顺序：只有 core 里有适配器的（decisions「Agent 页」：还没接上的不列）。
+/// 界面上列的 agent 和图标，按这个顺序：只有 core 里有适配器的（还没接上的不列）。
 const AGENTS: [(AgentKind, Logo); 5] = [
     (
         AgentKind::ClaudeCode,
@@ -587,7 +587,7 @@ impl Store {
         self.announce(notice.as_slice(), cx);
     }
 
-    /// 胶囊画成虚线边框：文件连的和列表里哪家都对不上（decisions「『自定义』的样子」）。
+    /// 胶囊画成虚线边框：文件连的和列表里哪家都对不上。
     pub fn pill_dashed(&self, agent: usize) -> bool {
         matches!(self.agents[agent].status, AgentStatus::Custom { .. })
     }
@@ -792,7 +792,7 @@ pub fn logo(provider: &Provider) -> Logo {
 }
 
 /// 预设的图标。同一家的国内站、海外站、Coding Plan 共用一个（ID 的第一段）。
-/// 火山、硅基流动、BytePlus 还没有图标，用首字（提案 10）。
+/// 火山、硅基流动、BytePlus 还没有图标，用首字。
 pub fn preset_logo(preset_id: &str) -> Option<Logo> {
     let family = preset_id.split('-').next()?;
     Some(match family {

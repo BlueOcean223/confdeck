@@ -1,7 +1,7 @@
-//! 官方账号多账号（10-13，阶段 4）：Codex、Grok Build、Claude Code（10-13 后加，只在 macOS）各存几个官方登录，
+//! 官方账号多账号：Codex、Grok Build、Claude Code（只在 macOS）各存几个官方登录，
 //! 切换时把选中的那个写回 agent 的登录。
 //!
-//! - **存在哪**（`Storage`，arch-perf R5 按存储方式分两种）：Codex、Grok Build 的登录是一个文件（`files`），
+//! - **存在哪**（`Storage`，按存储方式分两种）：Codex、Grok Build 的登录是一个文件（`files`），
 //!   Claude Code 的令牌在钥匙串里、是谁在 `~/.claude.json`（[`claude`]）。`~/.confdeck/accounts.json` 记有哪些账号（[`Account`]），
 //!   每个账号的登录原样存在 `~/.confdeck/accounts/<agent>/<id>.json`（只有自己能读；Claude Code 的存在钥匙串里）。不同步、不导出。
 //!   下面存、切、加、改名、删的算法不分 agent，只经 `Storage` 碰登录；按 agent 挑 `Storage` 只在 `storage` 一处。
@@ -15,7 +15,7 @@
 //! - **认账号**（[`identify`]）：Codex 看 `id_token` 里的用户和工作区（同一个人的个人、团队工作区算两个），
 //!   Grok 看 `user_id` 和 `team_id`，Claude Code 看 `oauthAccount` 的账号和组织。账号 ID 是这两样的 hash。
 //! - **不换令牌**：confdeck 不用刷新令牌（同「订阅额度」）。存着不用的账号放久了令牌可能失效，到时候重新登录。
-//! - **名字和备注**（[`label`]，10-13 提案 13）：用户自己起的，只存在 `accounts.json`，不碰登录文件。
+//! - **名字和备注**（[`label`]）：用户自己起的，只存在 `accounts.json`，不碰登录文件。
 
 pub mod claude;
 mod files;

@@ -60,7 +60,7 @@ pub fn round_corners(window: &Window, radius: f64) {
 /// 藏起窗口：马上变透明，下一轮主线程任务再 `orderOut`（不在 AppKit 的回调里同步改 key 窗口）。
 /// 面板关掉时不销毁窗口，只藏起来，下次 `show_at` 再用：销毁时 GPUI 会释放窗口的 content view，
 /// AppKit 的 TouchBar 观察者要是还没挪走，下一次刷新就会对已经没了的 view 解注册，抛 `NSRangeException`
-/// 让整个应用崩溃（notes/panel-focus-crash.md）。
+/// 让整个应用崩溃。
 pub fn hide(window: &Window, cx: &App) {
     let Some(ns_window) = ns_window(window) else {
         return;
@@ -70,7 +70,7 @@ pub fn hide(window: &Window, cx: &App) {
 }
 
 /// 收起窗口、不销毁：交出第一响应者，下一轮主线程任务再 `orderOut`。主窗口点关闭按钮时用它，
-/// 理由和 `hide` 一样（notes/panel-focus-crash.md「第四次」）。之后 `activate_window` 就能再显示出来。
+/// 理由和 `hide` 一样。之后 `activate_window` 就能再显示出来。
 pub fn order_out(window: &Window, cx: &App) {
     let Some(ns_window) = ns_window(window) else {
         return;
@@ -98,7 +98,7 @@ pub fn perform_close(window: &Window, cx: &App) {
 ///
 /// 窗口这时还是透明的，里面是上次藏起来时那一帧：`reveal` 为真时马上同步画一帧（走 GPUI 的 `displayLayer:`），
 /// 画完再变回不透明。不等 GPUI 的下一帧：透明的窗口刚拿出来，系统要过一会儿才算它看得见，
-/// 在那之前 GPUI 的 display link 不跑，面板有时要等很久才出来（10-13 用户发现）。
+/// 在那之前 GPUI 的 display link 不跑，面板有时要等很久才出来。
 pub fn show_at(window: &Window, origin: Point<Pixels>, height: f64, reveal: bool, cx: &App) {
     let Some(view) = gpui_view(window) else {
         return;
@@ -164,7 +164,7 @@ const ACTIVATION_WAIT: Duration = Duration::from_secs(1);
 /// 「刚关又点」的 300 毫秒短：再打开面板时，上一次延后的收起一定已经做完。
 const HAND_BACK_WAIT: Duration = Duration::from_millis(250);
 
-/// 应用在后台时打开面板要先激活应用（notes/panel-focus-crash.md），而激活会把开着的主窗口一起提到前面
+/// 应用在后台时打开面板要先激活应用（不然 GPUI 会收走面板刚拿到的焦点），而激活会把开着的主窗口一起提到前面
 /// （默认带上 main 和 key 窗口）。激活之前记下压在主窗口上面、离它最近的别的应用的窗口，
 /// 在 `didBecomeActive` 通知里（和提窗口是同一轮事件）把主窗口放回它下面。
 /// 应用已在前台、主窗口没显示或最小化、上面没有别的窗口时什么也不做。要在激活之前调。

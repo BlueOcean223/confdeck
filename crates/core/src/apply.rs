@@ -109,7 +109,7 @@ pub struct Synced {
 ///   换个 Key 不会顺带清掉 Claude Code 里 `/model` 选的模型、Codex 的推理档位、手加的设置。
 /// - **先存后写**：`providers.json` 存不了就报错，什么都不写；之后每个 agent 单独写，
 ///   一个失败（文件解析不了、这家改完以后这个 agent 用不了了）不影响别的，结果逐个返回。
-///   界面据此提示「已同步到 Claude Code、Pi」，写失败的单独标出来（提案 02）。
+///   界面据此提示「已同步到 Claude Code、Pi」，写失败的单独标出来。
 ///
 /// 新建的、内容没变的，返回空列表。
 pub fn save_provider(
@@ -199,7 +199,7 @@ pub fn used_by(engine: &Engine, home: &Path, providers: &[Provider], id: &str) -
     used_by
 }
 
-/// 删掉一家供应商（10-10 用户定的）。先存，存不了就什么都不写。
+/// 删掉一家供应商。先存，存不了就什么都不写。
 ///
 /// - 单选 agent 的文件不动：之后显示「自定义 · 主机名」，还能「存成供应商」找回来。
 /// - 多选 agent 删掉勾的这一项，不然会留下一项 confdeck 再也管不到的配置。每个写了的（或该写没写成的）返回一项。

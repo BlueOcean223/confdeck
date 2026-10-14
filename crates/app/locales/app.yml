@@ -157,7 +157,7 @@ picker:
     en: No matching providers
     zh-CN: 没有匹配的供应商
   # 配置不是 confdeck 写的时候（「自定义 · 主机名」「Key 不一致」），列表最上面的一组：
-  # 第一行写现在连到哪，下面挂着能做的动作（decisions「『自定义』的样子」）。有过滤词时不显示。
+  # 第一行写现在连到哪，下面挂着能做的动作。有过滤词时不显示。
   now:
     en: Current config
     zh-CN: 当前配置
@@ -241,7 +241,7 @@ editor:
   key_hint_in_use:
     en: "Changes sync to %{agents}"
     zh-CN: "改了会同步到 %{agents}"
-  # 接口：一个公共地址，各协议的地址默认按它填，收在「协议」一行里（用户 10-12）。
+  # 接口：一个公共地址，各协议的地址默认按它填，收在「协议」一行里。
   endpoints:
     en: Endpoints
     zh-CN: 接口
@@ -577,7 +577,7 @@ toast:
     en: "%{agent} was not written: %{error}"
     zh-CN: "%{agent} 没写成：%{error}"
 
-# 选了一家以后的提示（主窗口的提示条、面板的底栏）：只说换成了什么，不说写了哪个文件（用户 10-11：太啰嗦）。
+# 选了一家以后的提示（主窗口的提示条、面板的底栏）：只说换成了什么，不说写了哪个文件。
 write:
   switched:
     en: "%{agent} now uses %{provider}"
@@ -676,7 +676,7 @@ add:
     en: No matching presets
     zh-CN: 没有匹配的预设
 
-# 「配置 ›」页（decisions「配置页」）：一个 agent 用当前这家时写什么。卡片标题一个词，没有说明条。
+# 「配置 ›」页：一个 agent 用当前这家时写什么。卡片标题一个词，没有说明条。
 config:
   models:
     en: Models
@@ -715,14 +715,14 @@ config:
   protocol:
     en: Protocol
     zh-CN: 接口
-  # 槽位下拉框的第一项：不写这个环境变量（用户 10-12：模型不是必填的）。
+  # 槽位下拉框的第一项：不写这个环境变量（模型不是必填的）。
   leave_empty:
     en: None
     zh-CN: 留空
   raw_file:
     en: Raw file
     zh-CN: 原始文件
-  # 有改动还没保存时底栏的字（用户 10-12：改了先不写，点保存才写）。
+  # 有改动还没保存时底栏的字（改了先不写，点保存才写）。
   unsaved:
     en: Unsaved changes
     zh-CN: 有改动还没保存
@@ -739,19 +739,19 @@ config:
     en: Format
     zh-CN: 格式化
 
-# 设置页（顶栏的齿轮）：设一次就不动的开关，按 agent 分组，现在只有 Claude Code 一组（decisions「配置页」）。
+# 设置页（顶栏的齿轮）：设一次就不动的开关，按 agent 分组，现在只有 Claude Code 一组。
 settings:
   title:
     en: Settings
     zh-CN: 设置
-  # 设置页的三段（提案 12 画的分段，10-12 阶段 3 加了代理、导入导出以后才分）。
+  # 设置页的三段（加了代理、导入导出以后才分）。
   general:
     en: General
     zh-CN: 通用
   data:
     en: Data
     zh-CN: 数据
-  # 设置 › 显示哪些 agent：每个 agent 两个开关，Agent 页和菜单栏面板各一个（用户 10-12）。
+  # 设置 › 显示哪些 agent：每个 agent 两个开关，Agent 页和菜单栏面板各一个。
   agents:
     en: Which agents to show
     zh-CN: 显示哪些 agent
@@ -770,11 +770,11 @@ settings:
     en: Switch the VS Code extension too
     zh-CN: VS Code 插件跟着切换
   # settings.json 的 includeCoAuthoredBy = false：提交里不带「Co-Authored-By: Claude」。
-  # 开关说「隐藏」（用户 10-12：Claude Code 默认带着，开关是改默认，和另外两个一样）。
+  # 开关说「隐藏」（Claude Code 默认带着，开关是改默认，和另外两个一样）。
   hide_attribution:
     en: Hide the AI byline in commits
     zh-CN: 隐藏 AI 署名
-  # 设置 › 备份（decisions「备份」）。
+  # 设置 › 备份。
   backups:
     en: Backups
     zh-CN: 备份
@@ -1167,7 +1167,7 @@ check:
   run:
     en: Check now
     zh-CN: 现在查
-  # 怎么查（供应商才有，10-13 用户：照 cc-switch 做模板）。
+  # 怎么查（供应商才有，模板照 cc-switch 做）。
   template:
     en: Method
     zh-CN: 方式

@@ -99,7 +99,7 @@ pub fn show(store: Entity<Store>, cx: &mut App) {
 
     let (handle, view) = gpui_kit::open_window(MainWindow::options(cx), cx, |window, cx| {
         // 点关闭按钮只收起窗口、不销毁，下次 `show` 原样拿出来：销毁时 GPUI 释放窗口的 content view，
-        // AppKit 的 TouchBar 观察者还挂在上面，下一次刷新就崩（notes/panel-focus-crash.md「第四次」）。
+        // AppKit 的 TouchBar 观察者还挂在上面，下一次刷新就崩。
         #[cfg(target_os = "macos")]
         window.on_window_should_close(cx, |window, cx| {
             crate::mac::order_out(window, cx);
@@ -489,7 +489,7 @@ impl MainWindow {
         let agent = &store.agents[i];
         let open = self.picker.as_ref().filter(|p| p.agent == i);
         let (logos, label) = store.pill(i);
-        // 状态行只写文件在哪。连到哪、是不是 confdeck 写的，都在胶囊里（decisions「没有『接管』」）。
+        // 状态行只写文件在哪。连到哪、是不是 confdeck 写的，都在胶囊里。
         let status: SharedString = if agent.installed() {
             agent.config_path().into()
         } else {
@@ -841,7 +841,7 @@ impl MainWindow {
                         })
                         .child(div().flex_1())
                     })
-                    // 在用的 agent 只画小图标，悬停显示「Claude Code · 模型名」，不响应点击（提案 10）。
+                    // 在用的 agent 只画小图标，悬停显示「Claude Code · 模型名」，不响应点击。
                     .when(!users.is_empty(), |row| {
                         row.child(
                             div()

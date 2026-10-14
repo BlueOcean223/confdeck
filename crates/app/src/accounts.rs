@@ -1,11 +1,11 @@
-//! `Store` 的官方账号部分（10-13，阶段 4）：Codex、Grok Build、Claude Code 存下的几个官方登录、登录文件现在是谁、正在跑的登录。
+//! `Store` 的官方账号部分：Codex、Grok Build、Claude Code 存下的几个官方登录、登录文件现在是谁、正在跑的登录。
 //! core 那边见 `confdeck_core::account`。
 //!
 //! - 每次 `Store::reload` 读快照时 core 都 `sync` 一遍：登录文件是存过的账号，就把 agent 新换的令牌存回去。
 //! - 加账号：在后台跑 agent 自己的 `login` 命令（家目录指到临时目录），它自己开浏览器；登录完存下来。
 //!   等太久 core 会停掉它（`Login::wait`）；应用退出时停掉在跑的登录、删掉临时目录，强退留下的下次启动时收拾。
 //! - 选择器或供应商页上选一个账号：这个 agent 不在「默认」就先切回默认，再换登录文件。
-//! - 账号的名字和备注（提案 13）只存在 confdeck 的 `accounts.json`。
+//! - 账号的名字和备注只存在 confdeck 的 `accounts.json`。
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -198,7 +198,7 @@ impl Store {
                     .remove(&kind)
                     .is_some_and(|pending| pending.cancelled);
                 let added = result.as_ref().ok().map(|account| account.id.clone());
-                // 新加的账号还没有额度读数，不查的话一直是占位条，要等下一次刷新（10-13 用户截图里看到的）。
+                // 新加的账号还没有额度读数，不查的话一直是占位条，要等下一次刷新。
                 // 按读回来的账号查：新账号要在列表里，登录文件现在是谁也要是新的。
                 store.reload_then(cx, move |store, cx| {
                     let live = store.live_target(kind);

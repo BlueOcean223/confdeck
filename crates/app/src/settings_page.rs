@@ -1,14 +1,14 @@
-//! 设置页（顶栏的齿轮）：设一次就不动的东西，一块一张卡，按提案 12 分成三段：通用、Claude Code、数据。
+//! 设置页（顶栏的齿轮）：设一次就不动的东西，一块一张卡，分成三段：通用、Claude Code、数据。
 //!
 //! - 通用 › 显示哪些 agent：每个 agent 两个开关，Agent 页一个、菜单栏面板一个（`Store::set_agent_hidden`，记在 `state.json`）。
 //!   默认都开；关掉只是不列，配置文件和选择都不动。
-//! - 通用 › 出站代理（decisions「功能范围」：默认跟随系统，可以单独设置）：跟随系统 / 不用代理 / 自定义，
+//! - 通用 › 出站代理（默认跟随系统，可以单独设置）：跟随系统 / 不用代理 / 自定义，
 //!   记在 `state.json`；「测试」连一次 models.dev。confdeck 自己联网（测连通、拉模型列表、models.dev）都走它。
-//! - Claude Code：跳过首次确认、VS Code 插件跟着切换、隐藏 AI 署名（decisions「配置页」：一次性的设置放设置页，
+//! - Claude Code：跳过首次确认、VS Code 插件跟着切换、隐藏 AI 署名（一次性的设置放设置页，
 //!   署名先做成全局开关）。点一下写一次（`Store::set_claude_toggle`），不攒着等保存。行里的小字是文件和键名，查问题时用。
 //!   开关的状态打开设置页、点了开关以后各读一次文件，画的时候只看读好的（悬停、动画都会重画）。
 //! - 数据 › 导入导出：供应商导出成 `providers.json` 格式的文件（可以不带 Key），从这样的文件导入（先列出新增、覆盖哪几家再确认）。
-//! - 数据 › 备份（decisions「备份」）：右上角的下拉框选文件归谁（默认 Claude Code），只列这一家有备份的文件，
+//! - 数据 › 备份：右上角的下拉框选文件归谁（默认 Claude Code），只列这一家有备份的文件，
 //!   一个文件一行（几份、多大、最近一次），点开列每一份的时间和原因，可以看和现在的差异、恢复、「清理」（删原件以外的）。
 
 use std::path::PathBuf;
@@ -138,7 +138,7 @@ impl SettingsPage {
         let owners = store.read(cx).backup_owners();
         let claude_toggles = read_toggles(&store, cx);
         let seen = store.read(cx).generation();
-        // 默认看 Claude Code 的（用户 10-12）。
+        // 默认看 Claude Code 的。
         let owner = owners
             .iter()
             .find(|owner| owner.id == AgentKind::ClaudeCode.id())

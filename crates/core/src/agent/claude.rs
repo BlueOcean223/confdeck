@@ -109,7 +109,7 @@ pub fn is_floor_top(key: &str) -> bool {
 /// 五个槽位和它们写进 `env` 的键。
 ///
 /// 不写 `ANTHROPIC_MODEL`：它每次启动都压过 `/model` 存下的选择。启动用哪个模型交给 Claude Code 和 `/model`，
-/// 第三方的别名都指到这家的模型（用户 10-13 定的）。子代理默认留空，用户填了才写。
+/// 第三方的别名都指到这家的模型。子代理默认留空，用户填了才写。
 pub const SLOTS: &[(Slot, &str)] = &[
     (slot("opus", true), "ANTHROPIC_DEFAULT_OPUS_MODEL"),
     (slot("sonnet", true), "ANTHROPIC_DEFAULT_SONNET_MODEL"),
@@ -197,7 +197,7 @@ pub fn patch(
 
 /// 这家在 Claude Code 里每个槽位写哪个模型（不加 `[1m]`），按 [`SLOTS`] 的顺序，不写的槽位不在里面。
 /// 原始片段里写了 `env.ANTHROPIC_DEFAULT_*_MODEL` 的，[`patch`] 最后按原始片段写，盖过这里算的。
-/// 连 Anthropic 官方时只有用户填了的。[`patch`] 和配置页都用它（arch-perf R6）。
+/// 连 Anthropic 官方时只有用户填了的。[`patch`] 和配置页都用它。
 pub fn slot_models(provider: &Provider) -> Result<Vec<(Slot, &str)>, AdaptError> {
     let all: Vec<Slot> = SLOTS.iter().map(|(slot, _)| *slot).collect();
     slots::fill(provider, AGENT, &all, !provider.is_anthropic_official())

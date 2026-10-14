@@ -1,8 +1,8 @@
-//! 额度、余额的读数（arch-perf R3）：查谁（[`CheckKey`]）、用哪种查法（[`reader_for`]）、怎么查（[`Reader`]，正式的是 [`Web`]），
+//! 额度、余额的读数：查谁（[`CheckKey`]）、用哪种查法（[`reader_for`]）、怎么查（[`Reader`]，正式的是 [`Web`]），
 //! 什么时候查、查回来的收不收（[`Schedule`]：只记状态、不碰网络和文件，界面拿它排）。
 //!
 //! - **查法**按这个顺序挑：供应商自己配的（余额，[`crate::query`]）> 认得的套餐额度（[`quota::plan`]）> 认得的余额
-//!   （[`balance::query`]）；官方账号用登录查，登着的用登录文件里的，存下的用存着的。Claude 官方的额度先不查（10-13 用户说先不做）。
+//!   （[`balance::query`]）；官方账号用登录查，登着的用登录文件里的，存下的用存着的。Claude 官方的额度先不查。
 //! - **登着的账号的读数按账号存**（和存下的一样是 `CheckKey::Account`）：切了账号，新账号的读数不会是上一个的。
 //!   登录文件查的时候已经换了人，查到的不算（[`Reader::read`] 返回 `None`）。
 //! - **代数**：一个查询对象的查法变了（改了自己配的查法、地址、Key，账号从登着的变成存下的），代数加一。之前开始的查询回来不收，
@@ -147,7 +147,7 @@ pub fn reader_for(subject: Subject, check: &Check) -> Option<Method> {
     }
 }
 
-/// 这个 agent 的官方账号查不查额度：Codex、Grok Build 查；Claude 官方先不查（10-13 用户说先不做）。
+/// 这个 agent 的官方账号查不查额度：Codex、Grok Build 查；Claude 官方先不查。
 pub fn official(kind: AgentKind) -> bool {
     matches!(kind, AgentKind::Codex | AgentKind::GrokBuild)
 }
@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(state.last, Some(&left(1.)));
     }
 
-    /// B5：查询在飞时切了账号。
+    /// 查询在飞时切了账号。
     #[test]
     fn switching_accounts_while_a_check_is_out() {
         let now = Instant::now();

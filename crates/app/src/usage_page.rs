@@ -989,7 +989,7 @@ fn stat_list<'a>(
     for (i, (line, totals)) in lines.enumerate() {
         let tokens = &totals.tokens;
         let share = tokens.in_out() as f32 / whole;
-        // 名字下面只写「官方」这样的注；调用次数 10-13 用户说没意义，去掉了。
+        // 名字下面只写「官方」这样的注，不写调用次数。
         let note = line.note.clone();
         list = list.child(
             ui::row(t, false, i == 0)

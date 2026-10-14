@@ -1,9 +1,9 @@
 //! 选供应商的浮层，照 magpie 的 model picker：顶部是过滤框，下面是选项列表。
 //!
 //! - 单选 agent：「默认」在最前，选一项就关。
-//! - 多选 agent：每行前面有勾选框，勾一下写一次、浮层不关，可以连着勾（提案 01）。
+//! - 多选 agent：每行前面有勾选框，勾一下写一次、浮层不关，可以连着勾。
 //!   打开时勾着的排在「写进 X 的配置」一组，其余在「可添加」；之后勾、取消只改勾选框，不重新排，行不会在鼠标底下跳。
-//! - 接口对不上的供应商排在最后、置灰、写明缺哪种接口，选不了（提案 01）。
+//! - 接口对不上的供应商排在最后、置灰、写明缺哪种接口，选不了。
 //!
 //! - 配置不是 confdeck 写的（「自定义 · 主机名」「Key 不一致」，预览 09）：最上面多一组「现在 · 不是 confdeck 写的」，
 //!   第一行写文件连到哪，下面挂着动作行：自定义时「把当前配置存成供应商…」，Key 不一致时「用 confdeck 里的 Key 重写」
@@ -581,7 +581,7 @@ impl Picker {
                 let host = data::host(provider).unwrap_or_default();
                 let sub = match (&reason, store.protocol_for(self.agent, p)) {
                     (Some(reason), _) => reason.clone(),
-                    // 多协议的 agent 才需要说明走哪种协议（decisions「供应商和 agent 的关系」）。
+                    // 多协议的 agent 才需要说明走哪种协议。
                     (None, Some(protocol)) if agent.kind.adapter().protocols().len() > 1 => {
                         format!("{host} · {protocol}").into()
                     }

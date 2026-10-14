@@ -195,7 +195,7 @@ fn grok_identity(login: &Value) -> Option<Identity> {
 }
 
 /// Grok Build 的登录用哪一条：文件按登录的范围分条，有令牌（`key`）的 `https://auth.x.ai::` 开头那条，没有再用老的 `…/sign-in`。
-/// 认账号和查额度（[`crate::quota::grok_login`]）都用它（R5 之前认账号不看有没有令牌、最后还会随便拿一条，和查额度用的可能不是同一条）。
+/// 认账号和查额度（[`crate::quota::grok_login`]）都用它，两边拿的是同一条。
 pub(crate) fn grok_entry(login: &Value) -> Option<&Value> {
     let entries = login.as_object()?;
     let usable = |entry: &Value| entry["key"].as_str().is_some_and(|key| !key.is_empty());

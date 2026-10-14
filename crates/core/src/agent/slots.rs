@@ -2,7 +2,7 @@
 //!
 //! 用户填的 > 预设推荐的 > 全填这家的默认模型（[`Provider::default_or_first`]）。
 //! 推荐的模型不在目录里了就当没推荐。用户填成空串的槽位是「留空」：不写，agent 用它自己的默认
-//! （用户 10-12 定的：槽位不是必填的）。不自动填的槽位（[`Slot::auto`] 为假）用户填了才写。
+//! （槽位不是必填的）。不自动填的槽位（[`Slot::auto`] 为假）用户填了才写。
 
 use std::collections::BTreeMap;
 
@@ -14,7 +14,7 @@ use super::{AdaptError, AgentKind, recommended};
 pub struct Slot {
     /// 覆盖里 `slots` 用的名字。
     pub key: &'static str,
-    /// 用户没填时按预设推荐、默认模型填上。为假的默认留空（Claude Code 的子代理，用户 10-13 定的）。
+    /// 用户没填时按预设推荐、默认模型填上。为假的默认留空（Claude Code 的子代理）。
     pub auto: bool,
 }
 

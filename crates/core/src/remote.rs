@@ -17,7 +17,7 @@ pub struct Reach {
     pub result: Result<Duration, NetError>,
 }
 
-/// 测这家每个接口地址连不连得上（decisions「功能范围」：只测可达和延迟，不发模型请求）。
+/// 测这家每个接口地址连不连得上（只测可达和延迟，不发模型请求）。
 /// 收到任何 HTTP 响应都算连得上，404、401 也算：这一步不管 Key 对不对。
 pub fn check(http: &Http, provider: &Provider) -> Vec<Reach> {
     let mut reaches: Vec<Reach> = Vec::new();

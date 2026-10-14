@@ -1,4 +1,4 @@
-//! core 的错误在界面上怎么说（arch-perf R6）。core 的错误只有中文的 `Display`，界面上不用它：每种错误的每个变体都在这里
+//! core 的错误在界面上怎么说。core 的错误只有中文的 `Display`，界面上不用它：每种错误的每个变体都在这里
 //! 按界面语言说。`match` 不写 `_`，core 加了变体这里编不过。路径、行列、解析器和系统的原话照旧带上。
 //!
 //! 中文和 core 的原话一样；联网、额度、余额、登录、Codex 模型目录几种原来就用 app 自己的说法，照旧。
@@ -969,7 +969,7 @@ mod tests {
         })
     }
 
-    /// 英文界面整句是英文（B6）；中文的没有漏翻成键名。
+    /// 英文界面整句是英文；中文的没有漏翻成键名。
     fn translated<E: Describe + std::fmt::Debug>(errors: &[E]) {
         for err in errors {
             let (en, zh) = (err.describe_in(EN), err.describe_in(ZH));

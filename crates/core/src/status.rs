@@ -1,4 +1,4 @@
-//! 各 agent 现在的样子，一次读全（10-13，arch-perf R1）：[`snapshot`]。
+//! 各 agent 现在的样子，一次读全：[`snapshot`]。
 //!
 //! 界面每次重读都要的几样放在一起读：`providers.json`、`state.json`、每个 agent 的配置文件、
 //! `~/.claude.json`、`accounts.json`，每个文件只读一次。每个 agent 认成一个 [`AgentStatus`]，

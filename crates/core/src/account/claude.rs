@@ -1,4 +1,4 @@
-//! Claude Code 的官方账号（10-13 用户：「Claude 先做登录和切换吧，额度空着」）。
+//! Claude Code 的官方账号：登录和切换。
 //!
 //! Claude Code 的登录分两处，都要换：
 //! - **令牌**在钥匙串 `Claude Code-credentials`（账户名见 [`user`]）那一条里，是一份 JSON，`claudeAiOauth` 是令牌，
@@ -16,7 +16,7 @@
 //! 这时它把令牌存在钥匙串的另一条（[`service_for`]：服务名后面加 `-` 和目录 SHA-256 的前 8 位，2.1.296 实测的写法），
 //! `oauthAccount` 写在临时目录的 `.claude.json`。读出来拼好以后删掉那一条和临时目录。
 //!
-//! 额度先不查（用户说先不做）。
+//! 额度先不查。
 
 use std::fs;
 use std::path::Path;

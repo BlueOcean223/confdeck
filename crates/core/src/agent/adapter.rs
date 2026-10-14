@@ -1,4 +1,4 @@
-//! 每个 agent 一个适配器（arch-perf R4）：配置文件在哪、单选还是多选、说哪几种协议、要不要 Key、能不能用某一家、
+//! 每个 agent 一个适配器：配置文件在哪、单选还是多选、说哪几种协议、要不要 Key、能不能用某一家、
 //! 写进去的补丁、读文件认连着谁、写前写后要做的事。补丁和读文件的算法还在各 agent 自己的 module 里。
 //!
 //! 分两半：界面也用的 [`Adapter`]（经 [`AgentKind::adapter`]），和只在 core 里用的 `Writes`（经 `AgentKind::writes`，
@@ -670,7 +670,7 @@ mod tests {
         }
     }
 
-    /// B1：界面说的协议（`usable`）就是写进文件的协议，全部预设 × 五个 agent，预设本身和用户在配置页给这个 agent 选了每一种协议的。
+    /// 界面说的协议（`usable`）就是写进文件的协议，全部预设 × 五个 agent，预设本身和用户在配置页给这个 agent 选了每一种协议的。
     /// 用不了的写也写不进去。
     #[test]
     fn the_protocol_shown_is_the_protocol_written() {

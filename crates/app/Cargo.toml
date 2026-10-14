@@ -7,7 +7,7 @@ publish.workspace = true
 
 [features]
 # 开发用：`drive` 脚本的 `shot` 命令改用 GPUI 自己把当前帧渲染成图片（gpui 的 test-support），
-# 不依赖系统的屏幕录制权限。平时的构建不开。见 notes/ui-testing.md。
+# 不依赖系统的屏幕录制权限。平时的构建不开。用法见 `src/drive.rs`。
 shots = ["gpui-kit/test-support"]
 
 [dependencies]
