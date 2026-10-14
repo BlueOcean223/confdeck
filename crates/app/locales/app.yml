@@ -1260,9 +1260,6 @@ sessions:
   no_match:
     en: No matching sessions
     zh-CN: 没有匹配的会话
-  more:
-    en: "Show %{count} more"
-    zh-CN: "再显示 %{count} 个"
   # 复制按钮的提示：复制的是 `cd 目录 && claude --resume …` 这样的命令。
   copy:
     en: Copy resume command

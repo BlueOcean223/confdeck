@@ -2,8 +2,11 @@
 //! 会话列表和用量一起扫（`Store::refresh_usage`，`Loaded::sessions`），点开一个会话时才在后台读那个文件（core 的 `session::messages`）。
 //! 返回列表、点开别的会话时，没读完的那次读取就停掉，读回来的结果也只给读的那个会话。
 //! 搜索：每份会话列表把要搜的几样转好小写存一份，筛出来的结果按搜索词和 agent 留着，画的时候不再一个个转。
+//! 列表只排版、只画看得见的那十几行（`visible_rows`）：一行要排两段文字，以前一次画 50 行，
+//! 会话多的时候切到这页、搜索时每敲一个键都要十几到三十几毫秒。
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,9 +24,10 @@ use crate::errors::Describe as _;
 use crate::theme::Theme;
 use crate::ui;
 use crate::usage::Loaded;
+use crate::visible_rows::visible_rows;
 
-/// 列表一次多画多少条（「再显示」一次加这么多）。
-const PAGE: usize = 50;
+/// 列表一行多高：上下边距 9、两行字 41.5、上边线 1。
+const ROW: Pixels = px(60.5);
 /// 对话一次多画多少条（从最后往前）。
 const MESSAGES_PAGE: usize = 100;
 
@@ -34,8 +38,6 @@ pub struct SessionsPage {
     agent: Option<AgentKind>,
     agent_from: Option<(usize, u64)>,
     clicks: u64,
-    /// 列表画到第几条。
-    shown: usize,
     open: Option<Opened>,
     search_cache: Option<Searched>,
     _subscriptions: Vec<Subscription>,
@@ -78,9 +80,8 @@ impl SessionsPage {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(t!("sessions.search")));
         let _subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
-            cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
+            cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
                 if let InputEvent::Change = event {
-                    this.shown = PAGE;
                     cx.notify();
                 }
             }),
@@ -92,7 +93,6 @@ impl SessionsPage {
             agent: None,
             agent_from: None,
             clicks: 0,
-            shown: PAGE,
             open: None,
             search_cache: None,
             _subscriptions,
@@ -117,7 +117,6 @@ impl SessionsPage {
         self.clicks += 1;
         self.agent_from = Some((from, self.clicks));
         self.agent = agent;
-        self.shown = PAGE;
         cx.notify();
     }
 
@@ -194,17 +193,8 @@ impl SessionsPage {
                 (*agent, name)
             })
             .collect();
-        let shown = self.shown;
-        let hits = Searched::hits(&mut self.search_cache, loaded, (query, self.agent));
+        let hits = Searched::hits(&mut self.search_cache, loaded, (query, self.agent)).to_vec();
         let total = hits.len();
-        let hits: Vec<usize> = hits.iter().take(shown).copied().collect();
-        let home = self.store.read(cx).home.to_string_lossy().into_owned();
-        let now = Local::now().timestamp_millis();
-        let rows: Vec<AnyElement> = hits
-            .iter()
-            .enumerate()
-            .map(|(i, &n)| self.row(t, i, &sessions[n], &home, now, window, cx))
-            .collect();
         let agents_for_click = agents.clone();
         let head = div()
             .h_flex()
@@ -259,7 +249,7 @@ impl SessionsPage {
                         t!("sessions.count_other", count = total).to_string()
                     }),
             );
-        let body = if rows.is_empty() {
+        let body = if hits.is_empty() {
             card(t)
                 .py(px(18.))
                 .px(px(16.))
@@ -272,19 +262,24 @@ impl SessionsPage {
                     t!("sessions.no_match")
                 })
         } else {
-            card(t).v_flex().children(rows)
+            let home = self.store.read(cx).home.to_string_lossy().into_owned();
+            let now = Local::now().timestamp_millis();
+            let loaded = loaded.clone();
+            card(t).child(visible_rows(
+                hits.len(),
+                ROW,
+                cx.processor(move |this, range: Range<usize>, window, cx| {
+                    let t = Theme::window(window.appearance());
+                    range
+                        .map(|i| {
+                            let session = &loaded.sessions[hits[i]];
+                            this.row(&t, i, session, &home, now, window, cx)
+                        })
+                        .collect()
+                }),
+            ))
         };
-        let more = (total > self.shown).then(|| {
-            div().flex().justify_center().mt(px(10.)).child(
-                ui::button("more", t, ui::Button::Secondary)
-                    .child(t!("sessions.more", count = (total - self.shown).min(PAGE)).to_string())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.shown += PAGE;
-                        cx.notify();
-                    })),
-            )
-        });
-        div().v_flex().child(head).child(body).children(more)
+        div().v_flex().child(head).child(body)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -307,9 +302,12 @@ impl SessionsPage {
             .h_flex()
             .items_center()
             .gap(px(12.))
+            .h(ROW)
             .px(px(14.))
             .py(px(9.))
-            .when(i > 0, |row| row.border_t_1().border_color(t.line_2))
+            // 第一行的线透明：每行一样高，只排看得见的几行时才算得出每行在哪。
+            .border_t_1()
+            .border_color(if i > 0 { t.line_2 } else { transparent_black() })
             .cursor_pointer()
             .hover(move |row| row.bg(hover))
             .on_click(cx.listener(move |this, _, _, cx| this.open(open.clone(), cx)))
