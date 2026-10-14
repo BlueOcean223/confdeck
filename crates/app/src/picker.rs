@@ -636,10 +636,9 @@ impl Picker {
                     .child(
                         div()
                             .min_w_0()
-                            .truncate()
                             .text_size(px(10.5))
                             .text_color(t.muted)
-                            .child(sub),
+                            .child(ui::one_line(sub)),
                     ),
             )
             .when(!self.multi && checked, |row| {
@@ -690,21 +689,16 @@ impl Picker {
                     .gap(px(9.))
                     .min_w_0()
                     .flex_1()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.5))
-                            .child(choice.name.clone().unwrap_or_else(|| choice.email.clone())),
-                    )
+                    .child(div().min_w_0().text_size(px(12.5)).child(ui::one_line(
+                        choice.name.clone().unwrap_or_else(|| choice.email.clone()),
+                    )))
                     // 起了名字时邮箱写在后面的小字里。
                     .children(choice.name.as_ref().map(|_| {
                         div()
                             .min_w_0()
-                            .truncate()
                             .text_size(px(10.5))
                             .text_color(t.muted)
-                            .child(choice.email.clone())
+                            .child(ui::one_line(choice.email.clone()))
                     }))
                     .children(choice.plan.clone().map(|plan| {
                         div()
@@ -736,16 +730,14 @@ impl Picker {
                     .flex_1()
                     .child(
                         div()
-                            .truncate()
                             .text_size(px(12.5))
-                            .child(now.title.clone()),
+                            .child(ui::one_line(now.title.clone())),
                     )
                     .child(
                         div()
-                            .truncate()
                             .text_size(px(10.5))
                             .text_color(t.muted)
-                            .child(now.sub.clone()),
+                            .child(ui::one_line(now.sub.clone())),
                     ),
             )
     }
@@ -793,10 +785,9 @@ impl Picker {
             .child(
                 div()
                     .min_w_0()
-                    .truncate()
                     .text_size(px(12.5))
                     .text_color(t.accent)
-                    .child(label),
+                    .child(ui::one_line(label)),
             )
     }
 }

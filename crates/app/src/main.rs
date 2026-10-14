@@ -16,6 +16,7 @@ mod mac;
 mod main_window;
 mod net;
 mod official;
+mod one_line;
 mod panel;
 mod picker;
 mod quota_view;

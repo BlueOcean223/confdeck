@@ -506,16 +506,14 @@ impl MainWindow {
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(agent.name),
+                            .child(ui::one_line(agent.name)),
                     )
                     .child(
                         div()
                             .mt(px(1.))
                             .text_size(px(11.5))
                             .text_color(t.muted)
-                            .truncate()
-                            .child(status),
+                            .child(ui::one_line(status)),
                     ),
             )
             .when(agent.selectable(), |row| {
@@ -817,16 +815,14 @@ impl MainWindow {
                             .child(
                                 div()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .truncate()
-                                    .child(provider.name.clone()),
+                                    .child(ui::one_line(provider.name.clone())),
                             )
                             .child(
                                 div()
                                     .mt(px(1.))
                                     .text_size(px(11.5))
                                     .text_color(t.muted)
-                                    .truncate()
-                                    .child(sub),
+                                    .child(ui::one_line(sub)),
                             ),
                     )
                     .when(meters, |row| {

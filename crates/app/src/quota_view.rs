@@ -202,9 +202,8 @@ fn cell(t: &Theme, id: &str, w: &Window, now: i64) -> Stateful<Div> {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
                         .text_color(t.muted)
-                        .child(span_label(&w.span, false)),
+                        .child(ui::one_line(span_label(&w.span, false))),
                 )
                 .child(
                     div()

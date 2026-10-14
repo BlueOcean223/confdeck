@@ -484,8 +484,7 @@ fn tile(
                     .mt(px(3.))
                     .text_size(px(11.))
                     .text_color(t.muted)
-                    .truncate()
-                    .child(SharedString::from(sub)),
+                    .child(ui::one_line(SharedString::from(sub))),
             )
         })
         .when_some(tip, |d, tip| {
@@ -1002,18 +1001,16 @@ fn stat_list<'a>(
                         .min_w_0()
                         .child(
                             div()
-                                .truncate()
                                 .when(line.faint, |d| d.text_color(t.faint))
                                 .when(!line.faint, |d| d.font_weight(FontWeight::MEDIUM))
-                                .child(line.name),
+                                .child(ui::one_line(line.name)),
                         )
                         .children(note.map(|note| {
                             div()
                                 .mt(px(1.))
                                 .text_size(px(11.5))
                                 .text_color(t.muted)
-                                .truncate()
-                                .child(note)
+                                .child(ui::one_line(note))
                         })),
                 )
                 .child(

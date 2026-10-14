@@ -318,13 +318,12 @@ impl SessionsPage {
                     .min_w_0()
                     .v_flex()
                     .gap(px(2.))
-                    .child(div().truncate().child(s.label()))
+                    .child(ui::one_line(s.label()))
                     .child(
                         div()
-                            .truncate()
                             .text_size(px(11.5))
                             .text_color(t.muted)
-                            .child(folder_text(s.cwd.as_deref(), home)),
+                            .child(ui::one_line(folder_text(s.cwd.as_deref(), home))),
                     ),
             )
             .child(
@@ -404,10 +403,9 @@ impl SessionsPage {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .truncate()
                                     .font_family("Menlo")
                                     .text_size(px(11.5))
-                                    .child(s.resume_command()),
+                                    .child(ui::one_line(s.resume_command())),
                             ),
                     )
                     .child(
@@ -569,7 +567,12 @@ fn tool_line(t: &Theme, text: SharedString) -> AnyElement {
         .text_size(px(11.5))
         .text_color(t.muted)
         .child(ui::icon("terminal", 12., t.faint))
-        .child(div().min_w_0().truncate().font_family("Menlo").child(text))
+        .child(
+            div()
+                .min_w_0()
+                .font_family("Menlo")
+                .child(ui::one_line(text)),
+        )
         .into_any_element()
 }
 

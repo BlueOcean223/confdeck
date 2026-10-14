@@ -352,9 +352,8 @@ pub fn reach_text(t: &Theme, id: impl Into<ElementId>, reach: &Reach) -> Statefu
         .id(id)
         .flex_none()
         .max_w(px(180.))
-        .truncate()
         .text_size(px(11.5))
         .text_color(color)
         .when(failed, |d| d.tooltip(ui::tooltip(text.clone())))
-        .child(text)
+        .child(ui::one_line(text))
 }

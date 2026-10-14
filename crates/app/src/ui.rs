@@ -13,6 +13,8 @@ use crate::data::Logo;
 use crate::icons;
 use crate::theme::Theme;
 
+pub use crate::one_line::one_line;
+
 pub fn logo(logo: Logo, size: f32, t: &Theme, window: &Window, cx: &App) -> AnyElement {
     match logo {
         Logo::Color(path) => {
@@ -145,10 +147,9 @@ pub fn select_pill(
         .child(
             div()
                 .min_w_0()
-                .truncate()
                 .text_size(px(if panel { 12. } else { 12.5 }))
                 .font_weight(FontWeight::MEDIUM)
-                .child(label.into()),
+                .child(one_line(label)),
         )
         .child(div().flex_1())
         .child(icon("chevron-down", 10., if open { t.muted } else { t.faint }).ml(px(1.)))
@@ -584,10 +585,9 @@ pub fn menu_pill(
         .child(
             div()
                 .min_w_0()
-                .truncate()
                 .font_family("Menlo")
                 .text_size(px(12.))
-                .child(label.into()),
+                .child(one_line(label)),
         )
         .child(div().flex_1())
         .child(icon("chevron-down", 10., if open { t.muted } else { t.faint }).ml(px(1.)))

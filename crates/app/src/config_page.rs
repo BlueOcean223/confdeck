@@ -834,8 +834,7 @@ impl ConfigPage {
                             .mt(px(1.))
                             .text_size(px(11.5))
                             .text_color(t.muted)
-                            .truncate()
-                            .child(agent.config_path()),
+                            .child(ui::one_line(agent.config_path())),
                     ),
             )
             .child(
@@ -957,11 +956,10 @@ impl ConfigPage {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
                             .font_family("Menlo")
                             .text_size(px(10.5))
                             .text_color(t.faint)
-                            .child(env),
+                            .child(ui::one_line(env)),
                     )
                     .child(
                         div()
@@ -1060,10 +1058,9 @@ impl ConfigPage {
                         row.child(
                             div()
                                 .min_w_0()
-                                .truncate()
                                 .text_size(px(10.5))
                                 .text_color(t.muted)
-                                .child(name),
+                                .child(ui::one_line(name)),
                         )
                     })
                     .child(div().flex_1())
@@ -1202,10 +1199,9 @@ impl ConfigPage {
                     .child(
                         div()
                             .min_w_0()
-                            .truncate()
                             .text_size(px(11.5))
                             .text_color(t.muted)
-                            .child(sub),
+                            .child(ui::one_line(sub)),
                     )
                     .child(div().flex_1())
                     .child(ui::icon(
@@ -1317,10 +1313,9 @@ impl ConfigPage {
                 row.child(
                     div()
                         .min_w_0()
-                        .truncate()
                         .text_size(px(11.))
                         .text_color(t.muted)
-                        .child(name),
+                        .child(ui::one_line(name)),
                 )
             })
             .child(div().flex_1())
@@ -1399,11 +1394,10 @@ impl ConfigPage {
                         .child(
                             div()
                                 .min_w_0()
-                                .truncate()
                                 .font_weight(FontWeight::NORMAL)
                                 .text_size(px(11.5))
                                 .text_color(t.muted)
-                                .child(path),
+                                .child(ui::one_line(path)),
                         )
                         .child(div().flex_1())
                         .when(formattable, |row| {
@@ -1453,7 +1447,7 @@ impl ConfigPage {
                             .text_size(px(11.5))
                             .text_color(t.danger)
                             .child(ui::icon("circle-alert", 13., t.danger))
-                            .child(div().min_w_0().truncate().child(error)),
+                            .child(div().min_w_0().child(ui::one_line(error))),
                     )
                 }),
         )
@@ -1493,12 +1487,11 @@ impl ConfigPage {
                     .flex_1()
                     .min_w_0()
                     .mr(px(8.))
-                    .truncate()
                     .text_color(color)
                     .when(self.failure.is_some(), |d| {
                         d.tooltip(ui::tooltip(text.clone()))
                     })
-                    .child(text.clone()),
+                    .child(ui::one_line(text.clone())),
             )
             .child(
                 ui::button("save-bar-cancel", t, Button::Secondary)

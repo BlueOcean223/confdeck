@@ -967,8 +967,7 @@ impl Editor {
                 div()
                     .text_size(px(15.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .truncate()
-                    .child(shown_name),
+                    .child(ui::one_line(shown_name)),
             )
             .when_some(website, |header, website| {
                 let host = confdeck_core::provider::host(&website)
@@ -1090,11 +1089,10 @@ impl Editor {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
                             .text_size(px(12.5))
                             .when(!empty, |d| d.font_family("Menlo"))
                             .text_color(if empty { t.faint } else { t.fg })
-                            .child(label),
+                            .child(ui::one_line(label)),
                     )
                     .child(ui::icon(
                         "chevron-down",
@@ -1264,31 +1262,28 @@ impl Editor {
                     div()
                         .flex_none()
                         .max_w(px(300.))
-                        .truncate()
                         .font_family("Menlo")
                         .text_size(px(12.))
-                        .child(if id_text.is_empty() {
+                        .child(ui::one_line(if id_text.is_empty() {
                             t!("editor.model_unnamed").to_string()
                         } else {
                             id_text
-                        }),
+                        })),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
                         .text_size(px(11.5))
                         .text_color(t.muted)
-                        .child(name_text),
+                        .child(ui::one_line(name_text)),
                 )
                 .child(
                     div()
                         .min_w_0()
-                        .truncate()
                         .text_size(px(11.))
                         .text_color(t.muted)
-                        .child(self.model_line(row, cx)),
+                        .child(ui::one_line(self.model_line(row, cx))),
                 )
                 .child(ui::icon(
                     if expanded {
@@ -1704,7 +1699,7 @@ impl Editor {
                     .text_size(px(11.5))
                     .text_color(t.danger)
                     .child(ui::icon("circle-alert", 13., t.danger))
-                    .child(div().min_w_0().truncate().child(error.clone())),
+                    .child(div().min_w_0().child(ui::one_line(error.clone()))),
                 None => div()
                     .flex_1()
                     .min_w_0()
@@ -1715,7 +1710,7 @@ impl Editor {
                     .text_color(t.muted)
                     .when_some(self.notice.clone(), |d, notice| {
                         d.child(ui::icon("check", 13., t.success))
-                            .child(div().min_w_0().truncate().child(notice))
+                            .child(div().min_w_0().child(ui::one_line(notice)))
                     })
                     .when(self.notice.is_none(), |d| d.child(t!("editor.footer_hint"))),
             })
@@ -1849,10 +1844,9 @@ impl Editor {
                     .child(
                         div()
                             .min_w_0()
-                            .truncate()
                             .font_family("Menlo")
                             .text_size(px(12.))
-                            .child(model.id.clone()),
+                            .child(ui::one_line(model.id.clone())),
                     )
                     .when_some(
                         model.name.clone().filter(|name| *name != model.id),
@@ -1860,10 +1854,9 @@ impl Editor {
                             d.child(
                                 div()
                                     .min_w_0()
-                                    .truncate()
                                     .text_size(px(11.5))
                                     .text_color(t.muted)
-                                    .child(name),
+                                    .child(ui::one_line(name)),
                             )
                         },
                     ),

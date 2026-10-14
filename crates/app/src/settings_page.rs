@@ -511,10 +511,9 @@ impl SettingsPage {
         let small = |text: SharedString, color: Hsla| {
             div()
                 .min_w_0()
-                .truncate()
                 .text_size(px(12.))
                 .text_color(color)
-                .child(text)
+                .child(ui::one_line(text))
         };
         let left = match self.proxy.mode {
             ProxyMode::System => match &self.system_proxy {
@@ -527,10 +526,9 @@ impl SettingsPage {
                     .child(
                         div()
                             .min_w_0()
-                            .truncate()
                             .font_family("Menlo")
                             .text_size(px(12.))
-                            .child(url.clone()),
+                            .child(ui::one_line(url.clone())),
                     ),
                 None => small(t!("proxy.no_system").into(), t.muted),
             },
@@ -751,8 +749,7 @@ impl SettingsPage {
                             .flex_1()
                             .min_w_0()
                             .text_size(px(12.5))
-                            .truncate()
-                            .child(agent.name),
+                            .child(ui::one_line(agent.name)),
                     )
                     .child(switch(Place::Page, !agent.hidden_on_page, "page"))
                     .child(switch(Place::Panel, !agent.hidden_in_panel, "panel")),
@@ -808,15 +805,14 @@ impl SettingsPage {
                             .child(
                                 div()
                                     .mt(px(2.))
-                                    .truncate()
                                     .font_family("Menlo")
                                     .text_size(px(10.5))
                                     .text_color(t.faint)
-                                    .child(format!(
+                                    .child(ui::one_line(format!(
                                         "{} · {}",
                                         store.claude_toggle_path(toggle),
                                         toggle.key()
-                                    )),
+                                    ))),
                             ),
                     )
                     .child(ui::toggle(t, on)),
@@ -837,11 +833,10 @@ impl SettingsPage {
                 .child(
                     div()
                         .min_w_0()
-                        .truncate()
                         .font_weight(FontWeight::NORMAL)
                         .text_size(px(11.5))
                         .text_color(t.muted)
-                        .child(store.tilde(&store.backups_dir())),
+                        .child(ui::one_line(store.tilde(&store.backups_dir()))),
                 )
                 .child(div().flex_1())
                 .when_some(owner, |row, owner| {
@@ -919,21 +914,19 @@ impl SettingsPage {
                             .min_w_0()
                             .child(
                                 div()
-                                    .truncate()
                                     .text_size(px(12.5))
-                                    .child(store.tilde(&entry.file.path)),
+                                    .child(ui::one_line(store.tilde(&entry.file.path))),
                             )
                             .child(
                                 div()
                                     .mt(px(2.))
-                                    .truncate()
                                     .text_size(px(10.5))
                                     .text_color(t.muted)
-                                    .child(format!(
+                                    .child(ui::one_line(format!(
                                         "{} · {} · {latest}",
                                         count_text(entry.backups.len()),
                                         size_text(total)
-                                    )),
+                                    ))),
                             ),
                     )
                     .child(ui::icon(

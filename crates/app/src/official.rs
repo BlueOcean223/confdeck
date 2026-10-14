@@ -583,8 +583,7 @@ impl Officials {
                                 .min_w_0()
                                 .text_size(px(11.5))
                                 .text_color(t.muted)
-                                .truncate()
-                                .child(sub)
+                                .child(ui::one_line(sub))
                         })),
                 ),
                 format!("who-{agent}-{n}"),
@@ -841,7 +840,7 @@ fn note_title(t: &Theme, title: impl Into<SharedString>, noted: bool) -> Div {
         .items_center()
         .gap(px(5.))
         .min_w_0()
-        .child(div().min_w_0().truncate().child(title.into()))
+        .child(div().min_w_0().child(ui::one_line(title.into())))
         .when(noted, |d| d.child(ui::icon("sticky-note", 11., t.faint)))
 }
 
@@ -862,8 +861,7 @@ fn title_column(
                     .mt(px(1.))
                     .text_size(px(11.5))
                     .text_color(t.muted)
-                    .truncate()
-                    .child(sub),
+                    .child(ui::one_line(sub)),
             ),
         id,
         note,

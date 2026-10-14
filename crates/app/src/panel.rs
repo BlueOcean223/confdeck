@@ -437,8 +437,7 @@ impl Panel {
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(agent.name),
+                            .child(ui::one_line(agent.name)),
                     )
                     .children(
                         reading.map(|reading| quota_view::line(t, &format!("panel-{i}"), &reading)),
@@ -503,8 +502,7 @@ impl Panel {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        .child(notice.text.clone()),
+                        .child(ui::one_line(notice.text.clone())),
                 )
                 .tooltip(ui::tooltip(notice.text.clone())),
         )

@@ -395,8 +395,7 @@ impl CheckSheet {
                         div()
                             .text_size(px(11.5))
                             .text_color(t.muted)
-                            .truncate()
-                            .child(self.name.clone()),
+                            .child(ui::one_line(self.name.clone())),
                     ),
             )
             .child(div().flex_1())

@@ -168,8 +168,7 @@ impl AddProvider {
                         div()
                             .text_size(px(12.5))
                             .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(name),
+                            .child(ui::one_line(name)),
                     )
                     .child(
                         // 「已加」放在第二行主机名旁边：放名字那行会把 Kimi For Coding 挤成省略号。
@@ -183,8 +182,7 @@ impl AddProvider {
                                     .min_w_0()
                                     .text_size(px(10.5))
                                     .text_color(t.muted)
-                                    .truncate()
-                                    .child(sub),
+                                    .child(ui::one_line(sub)),
                             )
                             .when(added, |line| {
                                 line.child(
