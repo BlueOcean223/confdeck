@@ -2,7 +2,7 @@
 //!
 //! - 打开用量页、点顶栏的刷新时扫一次；扫的时候再点不重复扫。第一次要读全部历史（本机 release 约 6 秒），之后几十毫秒。
 //!   用量库第一次扫时打开，之后一直开着（文件被删了重新打开）。
-//! - 汇总一遍算好四个时间段和热力图，切时间段不用等。算完把请求丢掉，只留汇总。
+//! - 汇总一遍算好四个时间段和热力图，切时间段不用等。请求从用量库一条条读、边读边算，不攒起来，只留汇总。
 //!   没有还没算进汇总的请求、供应商、切换记录、models.dev、日期和时区都没变时，沿用上次的汇总，不再读请求。
 //! - 会话页的会话列表也从这里来：扫的时候顺带记下的（core 的 `session`），文件已经不在的不要。
 //! - 价格用 models.dev 时只读磁盘上的缓存，不联网（供应商页拉列表、补全时会下）。
@@ -18,7 +18,9 @@ use confdeck_core::models_dev::{self, ModelsDev};
 use confdeck_core::provider::Provider;
 use confdeck_core::session::Session;
 use confdeck_core::usage::history::{self, Switch};
-use confdeck_core::usage::summary::{self, Context as Pricing, Heatmap, Period, Source, Summary};
+use confdeck_core::usage::summary::{
+    Context as Pricing, Heatmap, Overviewing, Period, Source, Summary,
+};
 use confdeck_core::usage::{Db, UsageError};
 use gpui_kit::*;
 
@@ -187,13 +189,19 @@ impl Store {
                     basis,
                 }),
                 _ => {
-                    let requests = opened.db.requests(None)?;
                     let pricing = Pricing {
                         providers: &basis.providers,
                         history: &basis.switches,
                         dev: basis.dev.as_deref(),
                     };
-                    let overview = summary::overview(&requests, &pricing, &PERIODS, &now);
+                    let earliest = opened.db.first_request_at()?;
+                    let mut overviewing = Overviewing::new(&pricing, earliest, &PERIODS, &now);
+                    opened
+                        .db
+                        .each_request(Some(overviewing.since()), |request| {
+                            overviewing.add(request)
+                        })?;
+                    let overview = overviewing.finish();
                     let names = overview
                         .summaries
                         .iter()

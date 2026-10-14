@@ -10,7 +10,9 @@
 //! **花费**，依次：供应商模型目录里的价格 → agent 自己算的（Pi、Grok Build）→ 内置预设和 models.dev 查到的价格
 //! （官方和认不出的按 agent 自家的官方标价）。都没有的请求不计花费，单独数出来（`unpriced`）。
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::hash::Hash;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone};
 
@@ -305,35 +307,79 @@ pub struct Overview {
     pub heatmap: Heatmap,
 }
 
-/// 汇总 `requests` 里落在各个 `periods` 的部分，再按天汇总最近 [`HEATMAP_WEEKS`] 周。`now` 定「今天」和时区。
-/// 一遍算完：每个请求只认一次供应商、算一次花费。`requests` 按时间先后排（[`super::Db::requests`] 就是）。
+/// 汇总 `requests` 里落在各个 `periods` 的部分，见 [`Overviewing`]。`requests` 按时间先后排。
 pub fn overview<Tz: TimeZone>(
     requests: &[Request],
     context: &Context,
     periods: &[Period],
     now: &DateTime<Tz>,
 ) -> Overview {
-    let mut tallies: Vec<Tally> = periods
-        .iter()
-        .map(|period| Tally::new(requests.first(), *period, now))
-        .collect();
-    let mut days = Days::new(now);
-    let since = tallies
-        .iter()
-        .map(|tally| tally.since)
-        .fold(days.since(), i64::min);
-    let mut prices = Prices::new();
-    for request in requests.iter().filter(|r| r.at >= since) {
-        let source = context.source(request);
-        let cost = context.cost(&mut prices, &source, request);
-        for tally in &mut tallies {
+    let mut overviewing = Overviewing::new(context, requests.first().map(|r| r.at), periods, now);
+    for request in requests {
+        overviewing.add(request);
+    }
+    overviewing.finish()
+}
+
+/// 边读边汇总：各个时间段一份，再按天汇总最近 [`HEATMAP_WEEKS`] 周。请求按时间先后一条条 [`add`](Self::add)
+/// （[`super::Db::each_request`] 就是这样给的），不用先攒起来。每个请求只认一次供应商、算一次花费。
+pub struct Overviewing<'a> {
+    context: &'a Context<'a>,
+    tallies: Vec<Tally>,
+    days: Days,
+    since: i64,
+    prices: Prices,
+}
+
+impl<'a> Overviewing<'a> {
+    /// `earliest` 是最早一条请求的时间（毫秒，「全部」的柱子从那天画起），没有请求是 `None`。
+    /// `now` 定「今天」和时区。
+    pub fn new<Tz: TimeZone>(
+        context: &'a Context<'a>,
+        earliest: Option<i64>,
+        periods: &[Period],
+        now: &DateTime<Tz>,
+    ) -> Self {
+        let tallies: Vec<Tally> = periods
+            .iter()
+            .map(|period| Tally::new(earliest, *period, now))
+            .collect();
+        let days = Days::new(now);
+        let since = tallies
+            .iter()
+            .map(|tally| tally.since)
+            .fold(days.since(), i64::min);
+        Self {
+            context,
+            tallies,
+            days,
+            since,
+            prices: Prices::new(),
+        }
+    }
+
+    /// 要这个时间（毫秒）以后的请求；更早的加进来也不算。
+    pub fn since(&self) -> i64 {
+        self.since
+    }
+
+    pub fn add(&mut self, request: &Request) {
+        if request.at < self.since {
+            return;
+        }
+        let source = self.context.source(request);
+        let cost = self.context.cost(&mut self.prices, &source, request);
+        for tally in &mut self.tallies {
             tally.add(request, &source, cost);
         }
-        days.add(request, cost);
+        self.days.add(request, cost);
     }
-    Overview {
-        summaries: tallies.into_iter().map(Tally::finish).collect(),
-        heatmap: days.finish(),
+
+    pub fn finish(self) -> Overview {
+        Overview {
+            summaries: self.tallies.into_iter().map(Tally::finish).collect(),
+            heatmap: self.days.finish(),
+        }
     }
 }
 
@@ -347,8 +393,8 @@ struct Tally {
 }
 
 impl Tally {
-    /// `earliest` 是最早的一条请求（「全部」的柱子从那天起）。
-    fn new<Tz: TimeZone>(earliest: Option<&Request>, period: Period, now: &DateTime<Tz>) -> Self {
+    /// `earliest` 是最早一条请求的时间（「全部」的柱子从那天起）。
+    fn new<Tz: TimeZone>(earliest: Option<i64>, period: Period, now: &DateTime<Tz>) -> Self {
         let (step, buckets) = buckets(earliest, period, now);
         Self {
             since: period.since(now).unwrap_or(i64::MIN),
@@ -377,18 +423,9 @@ impl Tally {
         if let Some(bucket) = self.summary.buckets.get_mut(index) {
             bucket.totals.add(tokens, cost);
         }
-        self.sources
-            .entry(source.clone())
-            .or_default()
-            .add(tokens, cost);
-        self.agents
-            .entry(request.agent)
-            .or_default()
-            .add(tokens, cost);
-        self.models
-            .entry(request.model.clone())
-            .or_default()
-            .add(tokens, cost);
+        bump(&mut self.sources, source, tokens, cost);
+        bump(&mut self.agents, &request.agent, tokens, cost);
+        bump(&mut self.models, request.model.as_str(), tokens, cost);
     }
 
     fn finish(self) -> Summary {
@@ -447,6 +484,18 @@ impl Days {
     }
 }
 
+/// `groups` 里 `key` 那一组加上一次请求。已经有这一组时不复制 `key`（每个请求都要加三组、四个时间段）。
+fn bump<K, Q>(groups: &mut HashMap<K, Totals>, key: &Q, tokens: &Tokens, cost: Option<f64>)
+where
+    K: Borrow<Q> + Hash + Eq,
+    Q: ToOwned<Owned = K> + Hash + Eq + ?Sized,
+{
+    match groups.get_mut(key) {
+        Some(totals) => totals.add(tokens, cost),
+        None => groups.entry(key.to_owned()).or_default().add(tokens, cost),
+    }
+}
+
 fn ranked<K: Ord>(groups: HashMap<K, Totals>) -> Vec<(K, Totals)> {
     let mut groups: Vec<_> = groups.into_iter().collect();
     groups.sort_by(|(a, x), (b, y)| {
@@ -459,9 +508,9 @@ fn ranked<K: Ord>(groups: HashMap<K, Totals>) -> Vec<(K, Totals)> {
     groups
 }
 
-/// 柱子的起点。`earliest` 是最早的一条请求（「全部」从那天画起）。
+/// 柱子的起点。`earliest` 是最早一条请求的时间（「全部」从那天画起）。
 fn buckets<Tz: TimeZone>(
-    earliest: Option<&Request>,
+    earliest: Option<i64>,
     period: Period,
     now: &DateTime<Tz>,
 ) -> (Step, Vec<Bucket>) {
@@ -478,7 +527,7 @@ fn buckets<Tz: TimeZone>(
     }
     let first = match period.since(now) {
         Some(since) => zone.timestamp_millis_opt(since).earliest(),
-        None => earliest.and_then(|r| zone.timestamp_millis_opt(r.at).earliest()),
+        None => earliest.and_then(|at| zone.timestamp_millis_opt(at).earliest()),
     }
     .map_or(today, |time| time.date_naive())
     .min(today);

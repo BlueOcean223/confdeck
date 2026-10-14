@@ -233,8 +233,8 @@ impl Db {
             .map_err(db_error(&self.path))?;
         let mut sessions = Vec::new();
         for row in rows {
-            let (agent, mut session) = row.map_err(db_error(&self.path))?;
-            let Some(kind) = AgentKind::ALL.into_iter().find(|kind| kind.id() == agent) else {
+            let (id, mut session) = row.map_err(db_error(&self.path))?;
+            let Some(kind) = agent(&id) else {
                 continue;
             };
             session.agent = kind;
@@ -243,8 +243,15 @@ impl Db {
         Ok(sessions)
     }
 
-    /// `since`（毫秒）以后的请求，按时间排；`None` 是全部。
-    pub fn requests(&self, since: Option<i64>) -> Result<Vec<Request>, UsageError> {
+    /// `since`（毫秒）以后的请求，按时间先后一条条交给 `each`；`None` 是全部。以后去掉了的 agent 的跳过，不报错。
+    ///
+    /// 不攒成一个 `Vec`：本机 18 万条攒起来要几十 MB 的大块内存，释放以后 macOS 的 malloc 留着不还给系统，
+    /// 连着重算几次，活动监视器里就有几百 MB。交出去的一直是同一个 `Request`，每行覆盖一遍，字符串用原来的空间。
+    pub fn each_request(
+        &self,
+        since: Option<i64>,
+        mut each: impl FnMut(&Request),
+    ) -> Result<(), UsageError> {
         let mut query = self
             .conn
             .prepare_cached(
@@ -252,42 +259,81 @@ impl Db {
                  FROM requests WHERE at >= ?1 ORDER BY at",
             )
             .map_err(db_error(&self.path))?;
-        let rows = query
-            .query_map([since.unwrap_or(i64::MIN)], |row| {
-                let agent: String = row.get(1)?;
-                Ok((
-                    agent,
-                    Request {
-                        key: row.get(0)?,
-                        agent: AgentKind::ClaudeCode,
-                        at: row.get(2)?,
-                        session: row.get(3)?,
-                        model: row.get(4)?,
-                        provider: row.get(5)?,
-                        tokens: Tokens {
-                            input: row.get::<_, i64>(6)? as u64,
-                            cache_read: row.get::<_, i64>(7)? as u64,
-                            cache_write: row.get::<_, i64>(8)? as u64,
-                            output: row.get::<_, i64>(9)? as u64,
-                            reasoning: row.get::<_, i64>(10)? as u64,
-                        },
-                        cost: row.get(11)?,
-                    },
-                ))
-            })
+        let mut rows = query
+            .query([since.unwrap_or(i64::MIN)])
             .map_err(db_error(&self.path))?;
-        let mut requests = Vec::new();
-        for row in rows {
-            let (agent, mut request) = row.map_err(db_error(&self.path))?;
-            // 以后去掉了的 agent：跳过，不报错。
-            let Some(kind) = AgentKind::ALL.into_iter().find(|kind| kind.id() == agent) else {
-                continue;
+        let mut request = Request {
+            key: String::new(),
+            agent: AgentKind::ClaudeCode,
+            at: 0,
+            session: String::new(),
+            model: String::new(),
+            provider: None,
+            tokens: Tokens::default(),
+            cost: None,
+        };
+        while let Some(row) = rows.next().map_err(db_error(&self.path))? {
+            let read = |request: &mut Request| -> rusqlite::Result<bool> {
+                let Some(agent) = agent(row.get_ref(1)?.as_str()?) else {
+                    return Ok(false);
+                };
+                request.agent = agent;
+                overwrite(&mut request.key, row.get_ref(0)?.as_str()?);
+                request.at = row.get(2)?;
+                overwrite(&mut request.session, row.get_ref(3)?.as_str()?);
+                overwrite(&mut request.model, row.get_ref(4)?.as_str()?);
+                match (row.get_ref(5)?.as_str_or_null()?, &mut request.provider) {
+                    (Some(text), Some(provider)) => overwrite(provider, text),
+                    (text, provider) => *provider = text.map(str::to_string),
+                }
+                request.tokens = Tokens {
+                    input: row.get::<_, i64>(6)? as u64,
+                    cache_read: row.get::<_, i64>(7)? as u64,
+                    cache_write: row.get::<_, i64>(8)? as u64,
+                    output: row.get::<_, i64>(9)? as u64,
+                    reasoning: row.get::<_, i64>(10)? as u64,
+                };
+                request.cost = row.get(11)?;
+                Ok(true)
             };
-            request.agent = kind;
-            requests.push(request);
+            if read(&mut request).map_err(db_error(&self.path))? {
+                each(&request);
+            }
         }
-        Ok(requests)
+        Ok(())
     }
+
+    /// 最早一条请求的时间（毫秒），没有请求是 `None`。和 [`Db::each_request`] 一样不算以后去掉了的 agent。
+    pub fn first_request_at(&self) -> Result<Option<i64>, UsageError> {
+        let mut query = self
+            .conn
+            .prepare_cached("SELECT agent, at FROM requests ORDER BY at")
+            .map_err(db_error(&self.path))?;
+        let mut rows = query.query([]).map_err(db_error(&self.path))?;
+        while let Some(row) = rows.next().map_err(db_error(&self.path))? {
+            let at = |row: &rusqlite::Row| -> rusqlite::Result<Option<i64>> {
+                match agent(row.get_ref(0)?.as_str()?) {
+                    Some(_) => row.get(1).map(Some),
+                    None => Ok(None),
+                }
+            };
+            if let Some(at) = at(row).map_err(db_error(&self.path))? {
+                return Ok(Some(at));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// 库里存的 agent ID 是哪个；以后去掉了的是 `None`。
+fn agent(id: &str) -> Option<AgentKind> {
+    AgentKind::ALL.into_iter().find(|kind| kind.id() == id)
+}
+
+/// 把 `text` 写进 `into`，用它原来的空间。
+fn overwrite(into: &mut String, text: &str) {
+    into.clear();
+    into.push_str(text);
 }
 
 fn db_error(path: &Path) -> impl Fn(rusqlite::Error) -> UsageError + '_ {
@@ -342,10 +388,56 @@ mod tests {
         let added = db.commit("b", &row(5), &[request("k1", 10)], None).unwrap();
         assert_eq!(added, 0);
 
-        let all = db.requests(None).unwrap();
-        assert_eq!(all, vec![request("k1", 10), request("k2", 20)]);
-        assert_eq!(db.requests(Some(15)).unwrap(), vec![request("k2", 20)]);
+        assert_eq!(
+            requests(&db, None),
+            vec![request("k1", 10), request("k2", 20)]
+        );
+        assert_eq!(requests(&db, Some(15)), vec![request("k2", 20)]);
         assert_eq!(db.file("a").unwrap(), Some(row(10)));
         assert_eq!(db.file("c").unwrap(), None);
+    }
+
+    fn requests(db: &Db, since: Option<i64>) -> Vec<Request> {
+        let mut requests = Vec::new();
+        db.each_request(since, |request| requests.push(request.clone()))
+            .unwrap();
+        requests
+    }
+
+    #[test]
+    fn each_request_overwrites_every_field() {
+        // 交出去的是同一个 `Request`：上一行的字段（尤其是有没有供应商）不能留到下一行。
+        let mut db = Db::in_memory();
+        let mut long = request("a-much-longer-key", 10);
+        long.session = "a much longer session".into();
+        long.model = "a-much-longer-model".into();
+        let mut bare = request("k", 20);
+        bare.provider = None;
+        bare.cost = None;
+        bare.agent = AgentKind::Pi;
+        let back = request("k3", 30);
+        db.commit(
+            "a",
+            &row(1),
+            &[long.clone(), bare.clone(), back.clone()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(requests(&db, None), vec![long, bare, back]);
+    }
+
+    #[test]
+    fn removed_agents_are_skipped() {
+        let mut db = Db::in_memory();
+        assert_eq!(db.first_request_at().unwrap(), None);
+        db.commit("a", &row(1), &[request("k2", 20)], None).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO requests VALUES ('old', 'gone', 5, 's', 'm', NULL, 1, 0, 0, 1, 0, NULL)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.first_request_at().unwrap(), Some(20));
+        assert_eq!(requests(&db, None), vec![request("k2", 20)]);
     }
 }
