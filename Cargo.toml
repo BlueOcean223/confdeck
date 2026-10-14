@@ -56,3 +56,18 @@ http = "1"
 # 只管依赖，自己的几个 crate 照常不优化，改完重编还是快的。
 [profile.dev.package."*"]
 opt-level = 2
+
+# 发布用的构建：`cargo build --profile dist -p confdeck-app`，产物在 target/dist/，旁边是 confdeck-app.dSYM。
+# 比 release 小一半多，量过的页面响应、滚动、内存都不比 release 差；代价是改一个文件重编要近两分钟，所以平时的 release 不动。
+# panic = "abort"：GPUI 的任务、AppKit 的回调里 panic 本来就会让整个应用退出（展开穿不过 C 函数），
+# 区别只在 core 自己开的几个线程。
+# 符号：带上行号级的调试信息，链接后 rustc 先用 dsymutil 抽成 .dSYM，再去掉二进制里的符号；崩溃报告靠 .dSYM 还原函数名和行号。
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
+panic = "abort"
+debug = "line-tables-only"
+split-debuginfo = "packed"
+strip = true
